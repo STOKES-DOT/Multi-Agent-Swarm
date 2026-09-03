@@ -475,6 +475,7 @@ def test_records_are_frozen_deeply_immutable_and_json_serializable() -> None:
         (lambda: ToolContext("run", "particle", 0, AgentStage.EXECUTING, -1, WORKSPACE), "attempt"),
         (lambda: ToolContext("", "particle", 0, AgentStage.EXECUTING, 0, WORKSPACE), "run_id"),
         (lambda: ToolContext("run", "", 0, AgentStage.EXECUTING, 0, WORKSPACE), "particle_id"),
+        (lambda: ToolContext("run", "particle", 0, AgentStage.EXECUTING, 0, Path("relative")), "workspace"),
         (lambda: CandidateRef("", HASH), "reference"),
         (lambda: CandidateRef("candidate", "A" * 64), "candidate_hash"),
         (lambda: EvaluationContext("run", "particle", -1, WORKSPACE, HASH), "iteration_id"),
