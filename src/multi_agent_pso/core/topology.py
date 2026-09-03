@@ -23,7 +23,7 @@ def _validate_selection_inputs(
     particle_id: str,
     particle_order: tuple[str, ...],
     bests: Mapping[str, float | None],
-) -> dict[str, float | None]:
+) -> dict[str, Real | None]:
     if not isinstance(particle_id, str) or not particle_id:
         raise ValueError("particle_id must be a non-empty string")
     if not isinstance(particle_order, tuple) or not particle_order:
@@ -36,36 +36,42 @@ def _validate_selection_inputs(
         raise ValueError("particle_id must appear in particle_order")
     if not isinstance(bests, Mapping) or set(bests) != set(particle_order):
         raise ValueError("bests keys must exactly match particle_order")
-    normalized_bests: dict[str, float | None] = {}
+    validated_bests: dict[str, Real | None] = {}
     for candidate_id in particle_order:
         fitness = bests[candidate_id]
         if fitness is None:
-            normalized_bests[candidate_id] = None
+            validated_bests[candidate_id] = None
             continue
         if isinstance(fitness, bool) or not isinstance(fitness, Real):
             raise ValueError("best fitness values must be finite real numbers or None")
         try:
-            normalized_fitness = float(fitness)
+            float_fitness = float(fitness)
         except (TypeError, ValueError, OverflowError) as error:
             raise ValueError("best fitness values must be finite real numbers or None") from error
-        if not math.isfinite(normalized_fitness):
+        if not math.isfinite(float_fitness):
             raise ValueError("best fitness values must be finite real numbers or None")
-        normalized_bests[candidate_id] = normalized_fitness
-    return normalized_bests
+        validated_bests[candidate_id] = fitness
+    return validated_bests
 
 
 def _select_best(
-    candidate_ids: tuple[str, ...], bests: Mapping[str, float | None]
+    candidate_ids: tuple[str, ...], bests: Mapping[str, Real | None]
 ) -> str | None:
-    eligible_ids = tuple(candidate_id for candidate_id in candidate_ids if bests[candidate_id] is not None)
-    if not eligible_ids:
-        return None
-    highest_fitness = max(bests[candidate_id] for candidate_id in eligible_ids)
-    return min(
-        candidate_id
-        for candidate_id in eligible_ids
-        if bests[candidate_id] == highest_fitness
-    )
+    selected_id: str | None = None
+    selected_fitness: Real | None = None
+    for candidate_id in candidate_ids:
+        fitness = bests[candidate_id]
+        if fitness is None:
+            continue
+        if (
+            selected_id is None
+            or selected_fitness is None
+            or fitness > selected_fitness
+            or (fitness == selected_fitness and candidate_id < selected_id)
+        ):
+            selected_id = candidate_id
+            selected_fitness = fitness
+    return selected_id
 
 
 @dataclass(frozen=True)

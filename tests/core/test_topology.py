@@ -111,6 +111,18 @@ def test_equal_fitness_uses_lexicographically_smallest_id_independent_of_mapping
     assert topology.select_social_best("p2", ("p0", "p1", "p2"), bests) == "p1"
 
 
+@pytest.mark.parametrize("topology", [RingTopology(1), GlobalBestTopology()])
+def test_topologies_preserve_large_integer_fitness_precision(topology: SocialTopology) -> None:
+    bests = {"p0": 2**53, "p1": 2**53 + 1}
+    assert topology.select_social_best("p0", ("p0", "p1"), bests) == "p1"
+
+
+@pytest.mark.parametrize("topology", [RingTopology(1), GlobalBestTopology()])
+def test_topologies_preserve_large_fraction_fitness_precision(topology: SocialTopology) -> None:
+    bests = {"p0": Fraction(2**53, 1), "p1": Fraction(2**53 + 1, 1)}
+    assert topology.select_social_best("p0", ("p0", "p1"), bests) == "p1"
+
+
 @pytest.mark.parametrize("radius", [True, False, 1.5, "1", -1])
 def test_ring_rejects_invalid_radius(radius: object) -> None:
     with pytest.raises(ValueError):
