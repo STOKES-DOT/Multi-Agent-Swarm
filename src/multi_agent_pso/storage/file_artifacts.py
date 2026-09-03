@@ -19,7 +19,9 @@ from multi_agent_pso.core import ArtifactRef
 def _require_root(value: object) -> Path:
     if not isinstance(value, Path):
         raise TypeError("root must be a Path")
-    root = value if value.is_absolute() else Path.cwd() / value
+    if value.is_symlink():
+        raise ValueError("artifact root must not be a symlink")
+    root = (value if value.is_absolute() else Path.cwd() / value).resolve(strict=False)
     root_fd = os.open(root.parts[0], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     current_fd = root_fd
     try:
@@ -144,18 +146,27 @@ class FileArtifactStore:
                 raise RuntimeError("artifact path changed during publication")
             temporary_name = None
             os.fsync(parent_fd)
-        except BaseException:
+        except BaseException as primary_error:
+            cleanup_errors: list[BaseException] = []
             if temporary_identity is not None:
                 # Only unlink entries after matching their inode to our owned file.
                 # A hostile replacement at either name remains untouched.
                 if target_created:
-                    self._unlink_if_owned(parent_fd, parts[-1], temporary_identity)
+                    try:
+                        self._unlink_if_owned(parent_fd, parts[-1], temporary_identity)
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(cleanup_error)
                 if temporary_name is not None:
-                    self._unlink_if_owned(parent_fd, temporary_name, temporary_identity)
+                    try:
+                        self._unlink_if_owned(parent_fd, temporary_name, temporary_identity)
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(cleanup_error)
                 try:
                     os.fsync(parent_fd)
-                except OSError:
-                    pass
+                except OSError as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            for cleanup_error in cleanup_errors:
+                primary_error.add_note(f"artifact cleanup failed: {cleanup_error}")
             raise
         finally:
             if parent_fd != root_fd:

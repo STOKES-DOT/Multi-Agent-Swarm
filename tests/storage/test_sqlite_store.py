@@ -10,6 +10,7 @@ import pytest
 from multi_agent_pso.core import AgentStage, ArtifactRef, StageEvent
 from multi_agent_pso.protocols import ToolResult, ToolStatus
 from multi_agent_pso.storage import SQLiteRunStore
+from multi_agent_pso.storage.sqlite_store import _SCHEMA
 
 
 def test_iteration_transaction_rolls_back_all_state(tmp_path: Path) -> None:
@@ -180,6 +181,43 @@ def test_store_reopen_rejects_v1_database_missing_required_table(tmp_path: Path)
 
     with pytest.raises(RuntimeError, match="schema layout"):
         SQLiteRunStore(path)
+
+
+def test_store_rejects_v1_schema_with_wrong_inline_constraint(tmp_path: Path) -> None:
+    path = tmp_path / "runs.sqlite"
+    malformed_schema = _SCHEMA.replace("snapshot_hash TEXT NOT NULL", "snapshot_hash TEXT", 1)
+    with sqlite3.connect(path) as connection:
+        connection.executescript(malformed_schema)
+        connection.execute("INSERT INTO schema_metadata VALUES (1, 1)")
+
+    with pytest.raises(RuntimeError, match="unsupported schema layout"):
+        SQLiteRunStore(path)
+
+
+def test_store_rejects_existing_directory_without_changing_mode(tmp_path: Path) -> None:
+    path = tmp_path / "not-a-database"
+    path.mkdir()
+    path.chmod(0o750)
+
+    with pytest.raises((IsADirectoryError, ValueError)):
+        SQLiteRunStore(path)
+
+    assert path.stat().st_mode & 0o777 == 0o750
+
+
+def test_store_rejects_unversioned_database_without_mode_or_journal_mutation(tmp_path: Path) -> None:
+    path = tmp_path / "runs.sqlite"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE unrelated (value TEXT)")
+        assert connection.execute("PRAGMA journal_mode=DELETE").fetchone() == ("delete",)
+    path.chmod(0o640)
+
+    with pytest.raises(RuntimeError, match="schema metadata"):
+        SQLiteRunStore(path)
+
+    assert path.stat().st_mode & 0o777 == 0o640
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone() == ("delete",)
 
 
 def test_database_and_existing_wal_sidecars_are_owner_only(tmp_path: Path) -> None:

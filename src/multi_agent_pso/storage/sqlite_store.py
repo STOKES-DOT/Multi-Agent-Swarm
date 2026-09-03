@@ -6,6 +6,7 @@ import json
 import math
 import os
 import sqlite3
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Self
@@ -21,6 +22,8 @@ def _require_path(value: object) -> Path:
         raise TypeError("database_path must be a Path")
     if value.exists() and value.is_symlink():
         raise ValueError("database_path must not be a symlink")
+    if value.exists() and value.is_dir():
+        raise ValueError("database_path must be a regular file")
     value.parent.mkdir(parents=True, exist_ok=True)
     if not value.parent.is_dir():
         raise ValueError("database parent must be a directory")
@@ -116,17 +119,45 @@ _REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _normalized_schema_sql(value: str) -> str:
+    return " ".join(value.lower().split())
+
+
+def _schema_fingerprint(connection: sqlite3.Connection) -> dict[str, str]:
+    return {
+        row["name"]: _normalized_schema_sql(row["sql"])
+        for row in connection.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table'")
+        if not row["name"].startswith("sqlite_")
+    }
+
+
+def _expected_schema_fingerprint() -> dict[str, str]:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.executescript(_SCHEMA)
+        return _schema_fingerprint(connection)
+    finally:
+        connection.close()
+
+
+_EXPECTED_SCHEMA_FINGERPRINT = _expected_schema_fingerprint()
+
+
 class SQLiteRunStore:
     """Short-lived SQLite connections and atomic, replay-safe iteration commits."""
 
     def __init__(self, database_path: Path) -> None:
         self._path = _require_path(database_path)
+        is_new = not self._path.exists()
+        if not is_new:
+            self._validate_existing_database_read_only()
         self._prepare_database_file()
         connection = self._connect()
         try:
             connection.execute("PRAGMA journal_mode=WAL")
             self._secure_database_files()
-            if not self._table_names(connection):
+            if is_new:
                 connection.execute("BEGIN IMMEDIATE")
                 for statement in _SCHEMA.split(";"):
                     if statement.strip():
@@ -164,11 +195,21 @@ class SQLiteRunStore:
             actual = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
             if not set(columns) <= actual:
                 raise RuntimeError("unsupported schema layout")
+        if _schema_fingerprint(connection) != _EXPECTED_SCHEMA_FINGERPRINT:
+            raise RuntimeError("unsupported schema layout")
         rows = connection.execute(
             "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
         ).fetchall()
         if len(rows) != 1 or rows[0]["schema_version"] != _SCHEMA_VERSION:
             raise RuntimeError("unsupported schema version")
+
+    def _validate_existing_database_read_only(self) -> None:
+        connection = sqlite3.connect(f"{self._path.as_uri()}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            self._validate_schema(connection)
+        finally:
+            connection.close()
 
     def _prepare_database_file(self) -> None:
         try:
@@ -176,6 +217,8 @@ class SQLiteRunStore:
         except FileExistsError:
             if self._path.is_symlink():
                 raise ValueError("database_path must not be a symlink")
+            if not self._path.is_file():
+                raise ValueError("database_path must be a regular file")
             os.chmod(self._path, 0o600)
         else:
             os.close(descriptor)
@@ -186,10 +229,11 @@ class SQLiteRunStore:
             self._path.with_name(f"{self._path.name}-wal"),
             self._path.with_name(f"{self._path.name}-shm"),
         ):
-            if candidate.exists():
+            if candidate.exists() or candidate.is_symlink():
                 try:
-                    if candidate.is_symlink():
-                        raise ValueError("SQLite database files must not be symlinks")
+                    metadata = os.lstat(candidate)
+                    if not stat.S_ISREG(metadata.st_mode):
+                        raise ValueError("SQLite database files must be regular files")
                     os.chmod(candidate, 0o600)
                 except (OSError, ValueError):
                     if not suppress_errors:

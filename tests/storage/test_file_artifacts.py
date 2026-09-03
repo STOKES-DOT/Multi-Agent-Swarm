@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import threading
+import tempfile
 from pathlib import Path
 from types import MappingProxyType
 
@@ -283,3 +284,46 @@ def test_artifact_store_syncs_each_new_root_ancestor_before_publication(
     assert [observed.index(identity) for identity in identities] == sorted(
         observed.index(identity) for identity in identities
     )
+
+
+def test_artifact_store_accepts_stable_system_symlink_ancestor(tmp_path: Path) -> None:
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        root = Path(directory) / "artifacts"
+        ref = FileArtifactStore(root).publish_bytes("child/value.bin", b"payload", "application/octet-stream")
+        assert (root / ref.relative_path).read_bytes() == b"payload"
+
+
+def test_artifact_store_rejects_configured_root_symlink(tmp_path: Path) -> None:
+    physical = tmp_path / "physical"
+    physical.mkdir()
+    configured = tmp_path / "configured"
+    configured.symlink_to(physical, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="root must not be a symlink"):
+        FileArtifactStore(configured)
+
+
+def test_artifact_store_preserves_primary_write_error_when_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileArtifactStore(tmp_path)
+    real_unlink = os.unlink
+    cleanup_attempts = 0
+
+    def fail_write(_fd: int, _data: object) -> int:
+        raise OSError("PRIMARY write failure")
+
+    def fail_first_cleanup(name: object, *args: object, **kwargs: object) -> None:
+        nonlocal cleanup_attempts
+        cleanup_attempts += 1
+        if cleanup_attempts == 1:
+            raise PermissionError("CLEANUP unlink failure")
+        real_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(os, "write", fail_write)
+    monkeypatch.setattr(os, "unlink", fail_first_cleanup)
+
+    with pytest.raises(OSError, match="PRIMARY write failure"):
+        store.publish_bytes("nested/value.bin", b"payload", "application/octet-stream")
+
+    assert cleanup_attempts >= 1
