@@ -20,14 +20,20 @@ from multi_agent_pso.protocols import ToolResult, ToolStatus
 def _require_path(value: object) -> Path:
     if not isinstance(value, Path):
         raise TypeError("database_path must be a Path")
-    if value.exists() and value.is_symlink():
-        raise ValueError("database_path must not be a symlink")
-    if value.exists() and value.is_dir():
-        raise ValueError("database_path must be a regular file")
-    value.parent.mkdir(parents=True, exist_ok=True)
-    if not value.parent.is_dir():
+    path = value if value.is_absolute() else Path.cwd() / value
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        pass
+    else:
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError("database_path must not be a symlink")
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("database_path must be a regular file")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.parent.is_dir():
         raise ValueError("database parent must be a directory")
-    return value.resolve(strict=False)
+    return path.resolve(strict=False)
 
 
 def _require_identifier(value: object, name: str) -> str:

@@ -7,6 +7,7 @@ import json
 import os
 import errno
 import stat
+import sys
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from secrets import token_hex
@@ -14,6 +15,29 @@ from secrets import token_hex
 from pydantic import JsonValue
 
 from multi_agent_pso.core import ArtifactRef
+
+
+def _close_fds(*descriptors: int | None, primary_error: BaseException | None = None) -> None:
+    """Close each unique descriptor while preserving a preceding primary error."""
+    errors: list[BaseException] = []
+    seen: set[int] = set()
+    for descriptor in descriptors:
+        if descriptor is None or descriptor in seen:
+            continue
+        seen.add(descriptor)
+        try:
+            os.close(descriptor)
+        except BaseException as error:
+            errors.append(error)
+    if primary_error is not None:
+        for error in errors:
+            primary_error.add_note(f"artifact close failed: {error}")
+        return
+    if errors:
+        first, *remaining = errors
+        for error in remaining:
+            first.add_note(f"artifact close failed: {error}")
+        raise first
 
 
 def _require_root(value: object) -> Path:
@@ -47,15 +71,17 @@ def _require_root(value: object) -> Path:
                     )
                 except OSError as error:
                     raise ValueError("artifact root must be a non-symlink directory") from error
-            except OSError as error:
-                raise ValueError("artifact root must be a non-symlink directory") from error
+                except OSError as error:
+                    raise ValueError("artifact root must be a non-symlink directory") from error
             if current_fd != root_fd:
-                os.close(current_fd)
+                _close_fds(current_fd, primary_error=sys.exception())
             current_fd = child_fd
     finally:
-        if current_fd != root_fd:
-            os.close(current_fd)
-        os.close(root_fd)
+        _close_fds(
+            current_fd if current_fd != root_fd else None,
+            root_fd,
+            primary_error=sys.exception(),
+        )
     return root
 
 
@@ -128,7 +154,7 @@ class FileArtifactStore:
                 self._write_all(temporary_fd, data)
                 os.fsync(temporary_fd)
             finally:
-                os.close(temporary_fd)
+                _close_fds(temporary_fd, primary_error=sys.exception())
             # dir_fd arguments retain the verified directory even if its visible
             # pathname is replaced with a symlink between parent traversal and link.
             os.link(
@@ -169,9 +195,11 @@ class FileArtifactStore:
                 primary_error.add_note(f"artifact cleanup failed: {cleanup_error}")
             raise
         finally:
-            if parent_fd != root_fd:
-                os.close(parent_fd)
-            os.close(root_fd)
+            _close_fds(
+                parent_fd if parent_fd != root_fd else None,
+                root_fd,
+                primary_error=sys.exception(),
+            )
 
         return ArtifactRef(
             relative_path="/".join(parts),
@@ -251,12 +279,14 @@ class FileArtifactStore:
                     FileArtifactStore._raise_parent_open_error(error, current_fd, part)
                     raise AssertionError("unreachable")
                 if current_fd != root_fd:
-                    os.close(current_fd)
+                    _close_fds(current_fd, primary_error=sys.exception())
                 current_fd = child_fd
             return current_fd
         except BaseException:
-            if current_fd != root_fd:
-                os.close(current_fd)
+            _close_fds(
+                current_fd if current_fd != root_fd else None,
+                primary_error=sys.exception(),
+            )
             raise
 
     @staticmethod
@@ -273,12 +303,14 @@ class FileArtifactStore:
                     FileArtifactStore._raise_parent_open_error(error, current_fd, part)
                     raise AssertionError("unreachable")
                 if current_fd != root_fd:
-                    os.close(current_fd)
+                    _close_fds(current_fd, primary_error=sys.exception())
                 current_fd = child_fd
             return current_fd
         except BaseException:
-            if current_fd != root_fd:
-                os.close(current_fd)
+            _close_fds(
+                current_fd if current_fd != root_fd else None,
+                primary_error=sys.exception(),
+            )
             raise
 
     @staticmethod
@@ -368,10 +400,11 @@ class FileArtifactStore:
         except ValueError as error:
             raise RuntimeError("artifact path changed during publication") from error
         finally:
-            if fresh_parent_fd is not None and fresh_parent_fd != fresh_root_fd:
-                os.close(fresh_parent_fd)
-            if fresh_root_fd is not None:
-                os.close(fresh_root_fd)
+            _close_fds(
+                fresh_parent_fd if fresh_parent_fd != fresh_root_fd else None,
+                fresh_root_fd,
+                primary_error=sys.exception(),
+            )
 
     @staticmethod
     def _write_all(descriptor: int, data: bytes) -> None:

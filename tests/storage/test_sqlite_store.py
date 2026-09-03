@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import os
 from pathlib import Path
 
 import pytest
@@ -218,6 +219,29 @@ def test_store_rejects_unversioned_database_without_mode_or_journal_mutation(tmp
     assert path.stat().st_mode & 0o777 == 0o640
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+
+
+def test_store_rejects_broken_symlink_without_creating_target(tmp_path: Path) -> None:
+    target = tmp_path / "missing.sqlite"
+    path = tmp_path / "broken.sqlite"
+    path.symlink_to(target)
+
+    with pytest.raises(ValueError, match="symlink"):
+        SQLiteRunStore(path)
+
+    assert path.is_symlink()
+    assert not target.exists()
+
+
+def test_store_rejects_fifo_before_database_connection(tmp_path: Path) -> None:
+    path = tmp_path / "runs.fifo"
+    os.mkfifo(path)
+    original_mode = path.stat().st_mode
+
+    with pytest.raises(ValueError, match="regular file"):
+        SQLiteRunStore(path)
+
+    assert path.stat().st_mode == original_mode
 
 
 def test_database_and_existing_wal_sidecars_are_owner_only(tmp_path: Path) -> None:

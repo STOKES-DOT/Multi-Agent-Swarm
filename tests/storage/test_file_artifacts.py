@@ -327,3 +327,26 @@ def test_artifact_store_preserves_primary_write_error_when_cleanup_fails(
         store.publish_bytes("nested/value.bin", b"payload", "application/octet-stream")
 
     assert cleanup_attempts >= 1
+
+
+def test_artifact_store_preserves_primary_error_and_attempts_all_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileArtifactStore(tmp_path)
+    real_close = os.close
+    close_calls: list[int] = []
+
+    def fail_first_close(fd: int) -> None:
+        close_calls.append(fd)
+        if len(close_calls) == 1:
+            raise OSError("CLOSE failure")
+        real_close(fd)
+
+    monkeypatch.setattr(os, "write", lambda _fd, _data: (_ for _ in ()).throw(OSError("PRIMARY write failure")))
+    monkeypatch.setattr(os, "close", fail_first_close)
+
+    with pytest.raises(OSError, match="PRIMARY write failure"):
+        store.publish_bytes("nested/value.bin", b"payload", "application/octet-stream")
+
+    assert len(close_calls) >= 3
+    assert len(set(close_calls)) >= 3
