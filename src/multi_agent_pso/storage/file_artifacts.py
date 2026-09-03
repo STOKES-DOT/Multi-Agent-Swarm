@@ -282,8 +282,8 @@ class FileArtifactStore:
         os.unlink(name, dir_fd=parent_fd)
         return True
 
-    @staticmethod
     def _validate_committed_path(
+        self,
         root_fd: int,
         parent_fd: int,
         parent_parts: tuple[str, ...],
@@ -292,9 +292,17 @@ class FileArtifactStore:
     ) -> None:
         if identity is None:
             raise RuntimeError("artifact path changed during publication")
-        fresh_parent_fd = root_fd
+        fresh_root_fd: int | None = None
+        fresh_parent_fd: int | None = None
         try:
-            fresh_parent_fd = FileArtifactStore._reopen_parent(root_fd, parent_parts)
+            # Reopen from the public root pathname; the held root FD alone cannot
+            # prove that ``self._root / relative_path`` still resolves to it.
+            fresh_root_fd = self._open_root()
+            if FileArtifactStore._identity(os.fstat(fresh_root_fd)) != FileArtifactStore._identity(
+                os.fstat(root_fd)
+            ):
+                raise RuntimeError("artifact path changed during publication")
+            fresh_parent_fd = FileArtifactStore._reopen_parent(fresh_root_fd, parent_parts)
             if FileArtifactStore._identity(os.fstat(fresh_parent_fd)) != FileArtifactStore._identity(
                 os.fstat(parent_fd)
             ):
@@ -313,8 +321,10 @@ class FileArtifactStore:
         except ValueError as error:
             raise RuntimeError("artifact path changed during publication") from error
         finally:
-            if fresh_parent_fd != root_fd:
+            if fresh_parent_fd is not None and fresh_parent_fd != fresh_root_fd:
                 os.close(fresh_parent_fd)
+            if fresh_root_fd is not None:
+                os.close(fresh_root_fd)
 
     @staticmethod
     def _write_all(descriptor: int, data: bytes) -> None:

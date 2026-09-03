@@ -140,6 +140,33 @@ def test_artifact_store_rejects_parent_renamed_outside_root_before_link(
     assert list(moved_outside.iterdir()) == []
 
 
+def test_artifact_store_rejects_configured_root_replaced_before_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    store = FileArtifactStore(root)
+    (root / "nested").mkdir()
+    moved_root = tmp_path / "moved-root"
+    hostile_target = tmp_path / "hostile-target"
+    hostile_target.mkdir()
+    real_link = os.link
+
+    def replace_root_then_link(source: object, destination: object, *args: object, **kwargs: object) -> None:
+        root.rename(moved_root)
+        root.symlink_to(hostile_target, target_is_directory=True)
+        real_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", replace_root_then_link)
+
+    with pytest.raises(RuntimeError, match="artifact path changed during publication"):
+        store.publish_bytes("nested/result.bin", b"safe", "application/octet-stream")
+
+    assert not (root / "nested" / "result.bin").exists()
+    assert not (moved_root / "nested" / "result.bin").exists()
+    assert not (hostile_target / "nested" / "result.bin").exists()
+    assert list((moved_root / "nested").iterdir()) == []
+
+
 def test_artifact_store_two_writers_create_exactly_one_target(tmp_path: Path) -> None:
     store = FileArtifactStore(tmp_path)
     barrier = threading.Barrier(2)
