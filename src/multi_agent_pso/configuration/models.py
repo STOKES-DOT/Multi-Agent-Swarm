@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 
 NonEmptyString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -36,8 +36,15 @@ class AgentConfig(StrictFrozenModel):
 
 class WikiConfig(StrictFrozenModel):
     path: Path | None = None
-    read_only: Literal[True] = True
+    read_only: Annotated[bool, Field(strict=True)] = True
     max_results: Annotated[int, Field(strict=True, ge=1, le=100)] = 10
+
+    @field_validator("read_only")
+    @classmethod
+    def _require_read_only(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("read_only must be true in v1")
+        return value
 
 
 class TopologyConfig(StrictFrozenModel):

@@ -57,6 +57,15 @@ def _resolved_path(value: object, root: Path) -> object:
     return value
 
 
+def _resolved_relative_prompt(value: object, root: Path) -> object:
+    if isinstance(value, (Path, str)):
+        candidate = Path(value)
+        if candidate.is_absolute():
+            raise ValueError("task prompt path must be YAML-relative")
+        return (root / candidate).resolve()
+    return value
+
+
 def _prepared_config(raw: Mapping[str, Any], root: Path) -> dict[str, Any]:
     """Turn declarative path strings into resolved Path inputs for strict models."""
     prepared = dict(raw)
@@ -65,7 +74,8 @@ def _prepared_config(raw: Mapping[str, Any], root: Path) -> dict[str, Any]:
         if isinstance(value, Mapping):
             copied = dict(value)
             if copied.get(field) is not None:
-                copied[field] = _resolved_path(copied.get(field), root)
+                resolver = _resolved_relative_prompt if section == "task" else _resolved_path
+                copied[field] = resolver(copied.get(field), root)
             prepared[section] = copied
 
     agent = prepared.get("agent")
@@ -90,10 +100,12 @@ def _validate_prompt(prompt: Path, root: Path) -> bytes:
         raise ValueError("task prompt must resolve within the task package") from error
     if not prompt.is_file():
         raise ValueError(f"task prompt must be an existing regular file: {prompt}")
+    prompt_bytes = prompt.read_bytes()
     try:
-        return prompt.read_text(encoding="utf-8").encode("utf-8")
+        prompt_bytes.decode("utf-8")
     except UnicodeDecodeError as error:
         raise ValueError(f"task prompt must be a UTF-8 file: {prompt}") from error
+    return prompt_bytes
 
 
 def _validate_references(spec: RunSpec, root: Path) -> bytes:

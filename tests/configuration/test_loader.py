@@ -158,8 +158,19 @@ def test_model_bounds_are_checked(factory: object, expected: str) -> None:
         factory()  # type: ignore[operator]
 
 
+@pytest.mark.parametrize("value", [False, 1, 1.0])
+def test_wiki_read_only_requires_the_strict_boolean_true(value: object) -> None:
+    with pytest.raises(ValidationError, match="read_only"):
+        WikiConfig(read_only=value)  # type: ignore[arg-type]
+
+
 def test_prompt_must_be_utf8_regular_file_within_package(tmp_path: Path) -> None:
-    task = _write_task(tmp_path, _task_yaml(prompt="../escape.md"))
+    absolute_prompt = (tmp_path / "prompt.md").resolve()
+    task = _write_task(tmp_path, _task_yaml(prompt=str(absolute_prompt)))
+    with pytest.raises(ValueError, match="relative"):
+        load_task_package(task)
+
+    task.write_text(_task_yaml(prompt="../escape.md"), encoding="utf-8")
     (tmp_path.parent / "escape.md").write_text("outside", encoding="utf-8")
     with pytest.raises(ValueError, match="prompt"):
         load_task_package(task)
@@ -264,11 +275,22 @@ def test_snapshot_hash_is_canonical_and_tracks_relevant_content(tmp_path: Path) 
     config_changed = load_task_package(task)
     assert config_changed.snapshot_hash != prompt_changed.snapshot_hash
 
+    task.write_text(_task_yaml(), encoding="utf-8")
+    entrypoint_base = load_task_package(task)
     task.write_text(
-        reordered.replace("position_space: tests.fixtures.tasks.quadratic.plugin:position_space", "position_space: tests.fixtures.tasks.quadratic.plugin:position_space_alias"),
+        _task_yaml(position_space="position_space_alias"),
         encoding="utf-8",
     )
-    assert load_task_package(task).snapshot_hash != config_changed.snapshot_hash
+    assert load_task_package(task).snapshot_hash != entrypoint_base.snapshot_hash
+
+
+def test_snapshot_hash_preserves_prompt_newline_bytes(tmp_path: Path) -> None:
+    task = _write_task(tmp_path)
+    prompt = tmp_path / "prompt.md"
+    prompt.write_bytes(b"same prompt\r\n")
+    crlf_hash = load_task_package(task).snapshot_hash
+    prompt.write_bytes(b"same prompt\n")
+    assert load_task_package(task).snapshot_hash != crlf_hash
 
 
 def test_loaded_records_are_frozen_and_normalized(tmp_path: Path) -> None:
