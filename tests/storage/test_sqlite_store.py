@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from multi_agent_pso.core import AgentStage, ArtifactRef, StageEvent
 from multi_agent_pso.protocols import ToolResult, ToolStatus
 from multi_agent_pso.storage import SQLiteRunStore
 from multi_agent_pso.storage.sqlite_store import _SCHEMA
+import multi_agent_pso.storage.sqlite_store as sqlite_store_module
 
 
 def test_iteration_transaction_rolls_back_all_state(tmp_path: Path) -> None:
@@ -152,6 +154,70 @@ def test_new_database_records_supported_schema_version_and_reopens(tmp_path: Pat
         assert connection.execute("SELECT schema_version FROM schema_metadata").fetchall() == [(1,)]
 
     SQLiteRunStore(path).create_run("run-1", "a" * 64)
+
+
+def test_bootstrap_accepts_pre_touched_empty_file(tmp_path: Path) -> None:
+    path = tmp_path / "runs.sqlite"
+    path.touch()
+
+    SQLiteRunStore(path)
+
+    assert path.stat().st_mode & 0o777 == 0o600
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT schema_version FROM schema_metadata").fetchone() == (1,)
+        assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+
+
+def test_concurrent_bootstrap_of_same_path_is_repeatable(tmp_path: Path) -> None:
+    for iteration in range(20):
+        path = tmp_path / f"runs-{iteration}.sqlite"
+        barrier = threading.Barrier(2)
+        failures: list[BaseException] = []
+
+        def bootstrap() -> None:
+            try:
+                barrier.wait()
+                SQLiteRunStore(path)
+            except BaseException as error:
+                failures.append(error)
+
+        threads = [threading.Thread(target=bootstrap), threading.Thread(target=bootstrap)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert failures == []
+        assert SQLiteRunStore(path).get_iteration_snapshot_json("missing", 0) is None
+
+
+def test_bootstrap_retries_after_ddl_failure_leaves_empty_sqlite_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "runs.sqlite"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE transient (value INTEGER)")
+        connection.execute("DROP TABLE transient")
+    assert path.stat().st_size > 0
+    original_schema = sqlite_store_module._SCHEMA
+    monkeypatch.setattr(
+        sqlite_store_module,
+        "_SCHEMA",
+        "CREATE TABLE transient (value INTEGER); CREATE TABLE broken (",
+    )
+
+    with pytest.raises(sqlite3.OperationalError):
+        SQLiteRunStore(path)
+    assert path.stat().st_size > 0
+    with sqlite3.connect(path) as connection:
+        tables = connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        assert tables == []
+
+    monkeypatch.setattr(sqlite_store_module, "_SCHEMA", original_schema)
+    SQLiteRunStore(path)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT schema_version FROM schema_metadata").fetchone() == (1,)
 
 
 def test_store_rejects_unsupported_schema_version_before_operations(tmp_path: Path) -> None:

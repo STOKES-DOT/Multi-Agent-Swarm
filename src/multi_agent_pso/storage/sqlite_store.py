@@ -155,23 +155,23 @@ class SQLiteRunStore:
 
     def __init__(self, database_path: Path) -> None:
         self._path = _require_path(database_path)
-        is_new = not self._path.exists()
-        if not is_new:
+        created = self._prepare_database_file()
+        if not created:
             self._validate_existing_database_read_only()
-        self._prepare_database_file()
         connection = self._connect()
         try:
-            connection.execute("PRAGMA journal_mode=WAL")
-            self._secure_database_files()
-            if is_new:
-                connection.execute("BEGIN IMMEDIATE")
+            connection.execute("BEGIN IMMEDIATE")
+            if not self._table_names(connection):
                 for statement in _SCHEMA.split(";"):
                     if statement.strip():
                         connection.execute(statement)
                 connection.execute("INSERT INTO schema_metadata VALUES (1, ?)", (_SCHEMA_VERSION,))
-                connection.commit()
             else:
                 self._validate_schema(connection)
+            connection.commit()
+            self._secure_database_files()
+            connection.execute("PRAGMA journal_mode=WAL")
+            self._secure_database_files()
         except BaseException:
             connection.rollback()
             raise
@@ -213,11 +213,12 @@ class SQLiteRunStore:
         connection = sqlite3.connect(f"{self._path.as_uri()}?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
         try:
-            self._validate_schema(connection)
+            if self._table_names(connection):
+                self._validate_schema(connection)
         finally:
             connection.close()
 
-    def _prepare_database_file(self) -> None:
+    def _prepare_database_file(self) -> bool:
         try:
             descriptor = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
@@ -225,9 +226,10 @@ class SQLiteRunStore:
                 raise ValueError("database_path must not be a symlink")
             if not self._path.is_file():
                 raise ValueError("database_path must be a regular file")
-            os.chmod(self._path, 0o600)
+            return False
         else:
             os.close(descriptor)
+            return True
 
     def _secure_database_files(self, *, suppress_errors: bool = False) -> None:
         for candidate in (
