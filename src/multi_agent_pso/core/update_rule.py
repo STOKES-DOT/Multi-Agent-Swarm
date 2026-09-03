@@ -5,6 +5,8 @@ import math
 from numbers import Real
 from typing import Generic, TypeVar
 
+from numpy.random import Generator
+
 from .position_space import PositionSpace, Projection
 
 
@@ -39,32 +41,32 @@ class ConstrictedUpdateRule:
     c1: float = 2.05
     c2: float = 2.05
     chi: float = 0.72984
-    clamp_fraction: float = 0.20
+    velocity_clamp: float = 0.20
 
     def __post_init__(self) -> None:
         c1 = _finite_real(self.c1, name="c1")
         c2 = _finite_real(self.c2, name="c2")
         chi = _finite_real(self.chi, name="chi")
-        clamp_fraction = _finite_real(self.clamp_fraction, name="clamp_fraction")
+        velocity_clamp = _finite_real(self.velocity_clamp, name="velocity_clamp")
         if c1 < 0.0:
             raise ValueError("c1 must be nonnegative")
         if c2 < 0.0:
             raise ValueError("c2 must be nonnegative")
         if chi <= 0.0:
             raise ValueError("chi must be positive")
-        if not 0.0 < clamp_fraction <= 1.0:
-            raise ValueError("clamp_fraction must be in (0, 1]")
+        if not 0.0 < velocity_clamp <= 1.0:
+            raise ValueError("velocity_clamp must be in (0, 1]")
         object.__setattr__(self, "c1", c1)
         object.__setattr__(self, "c2", c2)
         object.__setattr__(self, "chi", chi)
-        object.__setattr__(self, "clamp_fraction", clamp_fraction)
+        object.__setattr__(self, "velocity_clamp", velocity_clamp)
 
     def update(
         self,
         space: PositionSpace[P, V],
         context: UpdateContext[P, V],
-        cognitive_rng: object,
-        social_rng: object,
+        cognitive_rng: Generator,
+        social_rng: Generator,
     ) -> UpdateResult[P, V]:
         """Apply inertia, cognitive, and social updates in canonical order."""
         inertia = space.scale_velocity(context.velocity, 1.0)
@@ -75,6 +77,8 @@ class ConstrictedUpdateRule:
         social_delta = (
             space.difference(context.sbest, position) if context.sbest is not None else None
         )
+        _validate_rng(cognitive_rng, name="cognitive_rng")
+        _validate_rng(social_rng, name="social_rng")
 
         cognitive = (
             space.random_scale(cognitive_delta, self.c1, cognitive_rng)
@@ -89,7 +93,7 @@ class ConstrictedUpdateRule:
         unclamped_velocity = space.scale_velocity(
             space.add_velocities((inertia, cognitive, social)), self.chi
         )
-        velocity = space.clamp_velocity(unclamped_velocity, self.clamp_fraction)
+        velocity = space.clamp_velocity(unclamped_velocity, self.velocity_clamp)
         projection = space.project(space.advance(position, velocity))
         return UpdateResult(
             position=projection.position,
@@ -111,3 +115,8 @@ def _finite_real(value: object, *, name: str) -> float:
     if not math.isfinite(result):
         raise ValueError(f"{name} must be a finite real scalar")
     return result
+
+
+def _validate_rng(value: object, *, name: str) -> None:
+    if not isinstance(value, Generator):
+        raise TypeError(f"{name} must be a numpy.random.Generator")
