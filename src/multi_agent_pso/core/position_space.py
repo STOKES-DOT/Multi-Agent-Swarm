@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import math
+from numbers import Real
 from typing import Generic, Iterable, Protocol, TypeVar
 
 import numpy as np
@@ -115,7 +116,17 @@ class ContinuousBoxPositionSpace(PositionSpace[FloatArray, FloatArray]):
         fraction_value = self._scalar(fraction, name="fraction")
         if not 0.0 < fraction_value <= 1.0:
             raise ValueError("fraction must be in (0, 1]")
-        limit = fraction_value * (self._upper - self._lower)
+        with np.errstate(over="ignore", invalid="ignore"):
+            raw_width = self._upper - self._lower
+            finite_width = np.isfinite(raw_width)
+            limit = np.empty_like(raw_width)
+            limit[finite_width] = fraction_value * raw_width[finite_width]
+            overflow_width = ~finite_width
+            if np.any(overflow_width):
+                limit[overflow_width] = (
+                    fraction_value * self._upper[overflow_width]
+                    - fraction_value * self._lower[overflow_width]
+                )
         return self._result(np.clip(self._array(velocity, name="velocity"), -limit, limit))
 
     def advance(self, position: FloatArray, velocity: FloatArray) -> FloatArray:
@@ -128,8 +139,9 @@ class ContinuousBoxPositionSpace(PositionSpace[FloatArray, FloatArray]):
         return Projection(position=self._result(projected), changed_dimensions=changed)
 
     def distance(self, left: FloatArray, right: FloatArray) -> float:
-        difference = self._array(left, name="left") - self._array(right, name="right")
-        distance = float(np.linalg.norm(difference))
+        left_values = self._array(left, name="left")
+        right_values = self._array(right, name="right")
+        distance = math.dist(left_values.tolist(), right_values.tolist())
         if not math.isfinite(distance):
             raise ValueError("distance must be finite")
         return distance
@@ -190,11 +202,15 @@ class ContinuousBoxPositionSpace(PositionSpace[FloatArray, FloatArray]):
         return self._readonly_copy(value)
 
     @staticmethod
-    def _scalar(value: float, *, name: str) -> float:
+    def _scalar(value: object, *, name: str) -> float:
+        if isinstance(value, np.ndarray) or isinstance(value, (bool, np.bool_)):
+            raise ValueError(f"{name} must be a finite real scalar")
+        if not isinstance(value, (Real, np.integer, np.floating)):
+            raise ValueError(f"{name} must be a finite real scalar")
         try:
             scalar = float(value)
-        except (TypeError, ValueError) as error:
-            raise ValueError(f"{name} must be a finite scalar") from error
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(f"{name} must be a finite real scalar") from error
         if not math.isfinite(scalar):
-            raise ValueError(f"{name} must be a finite scalar")
+            raise ValueError(f"{name} must be a finite real scalar")
         return scalar

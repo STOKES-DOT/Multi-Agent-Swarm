@@ -1,10 +1,12 @@
 import math
+import warnings
 
 import numpy as np
 import pytest
 from hypothesis import given, strategies as st
 
-from multi_agent_pso.core.position_space import ContinuousBoxPositionSpace
+from multi_agent_pso.core import __all__ as core_all
+from multi_agent_pso.core.position_space import ContinuousBoxPositionSpace, PositionSpace
 
 
 def test_projection_reports_clipped_dimensions() -> None:
@@ -26,6 +28,20 @@ def test_velocity_clamp_uses_box_width() -> None:
     space = ContinuousBoxPositionSpace(lower=[0.0, -2.0], upper=[10.0, 2.0])
     clamped = space.clamp_velocity(np.array([9.0, -9.0]), fraction=0.2)
     np.testing.assert_allclose(clamped, [2.0, -0.8])
+
+
+@pytest.mark.parametrize(
+    ("fraction", "velocity", "expected"),
+    [(0.25, 1e308, 5e307), (0.5, 1.5e308, 1e308), (0.75, 1.6e308, 1.5e308)],
+)
+def test_velocity_clamp_handles_extreme_box_width_without_warnings(
+    fraction: float, velocity: float, expected: float
+) -> None:
+    space = ContinuousBoxPositionSpace(lower=[-1e308], upper=[1e308])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        clamped = space.clamp_velocity(np.array([velocity]), fraction)
+    np.testing.assert_allclose(clamped, [expected])
 
 
 @pytest.mark.parametrize(
@@ -81,6 +97,23 @@ def test_scalar_parameters_must_be_finite(scalar: float) -> None:
         space.random_scale(velocity, scalar, np.random.default_rng(1))
     with pytest.raises(ValueError):
         space.clamp_velocity(velocity, scalar)
+
+
+@pytest.mark.parametrize("invalid", ["0.5", True, np.array(0.5), np.array([0.5]), 10**400])
+def test_scalar_parameters_require_real_scalar_values(invalid: object) -> None:
+    space = ContinuousBoxPositionSpace(lower=[0.0], upper=[1.0])
+    velocity = np.array([0.25])
+    with pytest.raises(ValueError, match="scalar must be a finite real scalar"):
+        space.scale_velocity(velocity, invalid)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="upper must be a finite real scalar"):
+        space.random_scale(velocity, invalid, np.random.default_rng(1))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="fraction must be a finite real scalar"):
+        space.clamp_velocity(velocity, invalid)  # type: ignore[arg-type]
+
+
+def test_scalar_parameters_accept_python_and_numpy_real_scalars() -> None:
+    space = ContinuousBoxPositionSpace(lower=[0.0], upper=[1.0])
+    np.testing.assert_allclose(space.scale_velocity(np.array([2.0]), np.float64(0.5)), [1.0])
 
 
 @pytest.mark.parametrize("fraction", [0.0, -0.1, 1.1])
@@ -141,6 +174,56 @@ def test_distance_is_finite_euclidean_distance() -> None:
     distance = space.distance(np.array([0.0, 0.0]), np.array([3.0, 4.0]))
     assert distance == 5.0
     assert math.isfinite(distance)
+
+
+@pytest.mark.parametrize("right", [1e-300, 1e200, 1e308])
+def test_distance_is_stable_across_finite_scales(right: float) -> None:
+    space = ContinuousBoxPositionSpace(lower=[0.0], upper=[1.0])
+    assert space.distance(np.array([0.0]), np.array([right])) == right
+
+
+def test_position_space_protocol_method_set_is_exact() -> None:
+    method_names = {
+        name
+        for name, value in PositionSpace.__dict__.items()
+        if not name.startswith("_") and callable(value)
+    }
+    assert method_names == {
+        "sample_position",
+        "zero_velocity",
+        "difference",
+        "scale_velocity",
+        "random_scale",
+        "add_velocities",
+        "clamp_velocity",
+        "advance",
+        "project",
+        "distance",
+        "serialize_position",
+        "deserialize_position",
+        "serialize_velocity",
+        "deserialize_velocity",
+    }
+
+
+def test_core_all_preserves_the_exact_public_contract() -> None:
+    assert core_all == [
+        "AgentEpisode",
+        "AgentStage",
+        "ArtifactRef",
+        "ConstraintResult",
+        "ContinuousBoxPositionSpace",
+        "EpisodeStatus",
+        "Evaluation",
+        "EvaluationStatus",
+        "IterationSnapshot",
+        "ParticleState",
+        "PositionSpace",
+        "PersonalBest",
+        "Projection",
+        "StageEvent",
+        "FloatArray",
+    ]
 
 
 def test_serialization_round_trip_is_fresh_and_deserialization_is_validated() -> None:
