@@ -1,5 +1,13 @@
 # Multi-Agent PSO
 
+## Development
+
+```bash
+conda env create -f environment.yml
+conda run -n multi-agent-pso python -m pip install -e '.[dev]'
+conda run -n multi-agent-pso pytest -q
+```
+
 > 状态：技术构想草案  
 > 日期：2026-09-02  
 > 当前范围：讨论基于 PSO 的多 Agent 自主分子研究框架，不代表最终实现方案。
@@ -382,4 +390,3 @@ Wiki 不等同于：
 - IUPAC Gold Book: [brightness](https://goldbook.iupac.org/terms/view/BT07338)
 - MOMAP 1.0: [Molecular Physics, DOI 10.1080/00268976.2017.1402966](https://doi.org/10.1080/00268976.2017.1402966)
 - CIE: [CIE 1931 colour-matching functions](https://cie.co.at/datatable/cie-1931-colour-matching-functions-2-degree-observer)
-

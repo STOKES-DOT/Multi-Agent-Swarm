@@ -1,1 +1,15 @@
 .worktrees/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+.venv/
+.DS_Store
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+runs/
+run-inputs/
+graphify-out/

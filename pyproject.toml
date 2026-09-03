@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multi-agent-pso"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "numpy>=2.0",
+  "pydantic>=2.9",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "hypothesis>=6.0",
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24",
+]
+codex = ["openai-codex"]
+molecule = ["networkx>=3.0"]
+
+[project.scripts]
+multi-agent-pso = "multi_agent_pso.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+asyncio_mode = "auto"
+markers = [
+  "live: invokes local Codex or an external scientific tool",
+]
+testpaths = ["tests"]
