@@ -13,17 +13,27 @@ from .models import (
     PersonalBest,
     StageEvent,
 )
+from .position_space import (
+    ContinuousBoxPositionSpace,
+    FloatArray,
+    PositionSpace,
+    Projection,
+)
 
 __all__ = [
     "AgentEpisode",
     "AgentStage",
     "ArtifactRef",
     "ConstraintResult",
+    "ContinuousBoxPositionSpace",
     "EpisodeStatus",
     "Evaluation",
     "EvaluationStatus",
     "IterationSnapshot",
     "ParticleState",
+    "PositionSpace",
     "PersonalBest",
+    "Projection",
     "StageEvent",
+    "FloatArray",
 ]
