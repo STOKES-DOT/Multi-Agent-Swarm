@@ -23,7 +23,7 @@ def _validate_selection_inputs(
     particle_id: str,
     particle_order: tuple[str, ...],
     bests: Mapping[str, float | None],
-) -> None:
+) -> dict[str, float | None]:
     if not isinstance(particle_id, str) or not particle_id:
         raise ValueError("particle_id must be a non-empty string")
     if not isinstance(particle_order, tuple) or not particle_order:
@@ -36,13 +36,22 @@ def _validate_selection_inputs(
         raise ValueError("particle_id must appear in particle_order")
     if not isinstance(bests, Mapping) or set(bests) != set(particle_order):
         raise ValueError("bests keys must exactly match particle_order")
-    for fitness in bests.values():
-        if fitness is not None and (
-            isinstance(fitness, bool)
-            or not isinstance(fitness, Real)
-            or not math.isfinite(fitness)
-        ):
+    normalized_bests: dict[str, float | None] = {}
+    for candidate_id in particle_order:
+        fitness = bests[candidate_id]
+        if fitness is None:
+            normalized_bests[candidate_id] = None
+            continue
+        if isinstance(fitness, bool) or not isinstance(fitness, Real):
             raise ValueError("best fitness values must be finite real numbers or None")
+        try:
+            normalized_fitness = float(fitness)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("best fitness values must be finite real numbers or None") from error
+        if not math.isfinite(normalized_fitness):
+            raise ValueError("best fitness values must be finite real numbers or None")
+        normalized_bests[candidate_id] = normalized_fitness
+    return normalized_bests
 
 
 def _select_best(
@@ -79,18 +88,22 @@ class RingTopology:
         particle_order: tuple[str, ...],
         bests: Mapping[str, float | None],
     ) -> str | None:
-        _validate_selection_inputs(particle_id, particle_order, bests)
+        normalized_bests = _validate_selection_inputs(particle_id, particle_order, bests)
+        population_size = len(particle_order)
+        if population_size == 1 or self.neighborhood_radius >= population_size // 2:
+            return _select_best(particle_order, normalized_bests)
         particle_index = particle_order.index(particle_id)
         neighbor_indices = {particle_index}
-        for offset in range(1, self.neighborhood_radius + 1):
-            neighbor_indices.add((particle_index - offset) % len(particle_order))
-            neighbor_indices.add((particle_index + offset) % len(particle_order))
+        effective_radius = min(self.neighborhood_radius, population_size // 2)
+        for offset in range(1, effective_radius + 1):
+            neighbor_indices.add((particle_index - offset) % population_size)
+            neighbor_indices.add((particle_index + offset) % population_size)
         candidate_ids = tuple(
             candidate_id
             for index, candidate_id in enumerate(particle_order)
             if index in neighbor_indices
         )
-        return _select_best(candidate_ids, bests)
+        return _select_best(candidate_ids, normalized_bests)
 
 
 @dataclass(frozen=True)
@@ -103,5 +116,5 @@ class GlobalBestTopology:
         particle_order: tuple[str, ...],
         bests: Mapping[str, float | None],
     ) -> str | None:
-        _validate_selection_inputs(particle_id, particle_order, bests)
-        return _select_best(particle_order, bests)
+        normalized_bests = _validate_selection_inputs(particle_id, particle_order, bests)
+        return _select_best(particle_order, normalized_bests)
