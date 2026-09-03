@@ -77,40 +77,79 @@ class _ManifestBuilder:
     _total_bytes: int = 0
 
     def _account(self, size_bytes: int) -> None:
-        if size_bytes > self.config.max_file_bytes:
-            raise ValueError("snapshot max_file_bytes exceeded")
         if self._files + 1 > self.config.max_files:
             raise ValueError("snapshot max_files exceeded")
+        if size_bytes > self.config.max_file_bytes:
+            raise ValueError("snapshot max_file_bytes exceeded")
         if self._total_bytes + size_bytes > self.config.max_total_bytes:
             raise ValueError("snapshot max_total_bytes exceeded")
         self._files += 1
         self._total_bytes += size_bytes
 
-    def digest_file(self, source: Path, *, force: bool = False) -> tuple[str, int]:
+    def _read_bounded(
+        self, source: Path, *, retain: bool, force: bool, account: bool
+    ) -> tuple[str, int, bytes | None]:
         resolved = source.resolve()
-        if not force and resolved in self._digest_cache:
-            return self._digest_cache[resolved]
+        if not force and not retain and resolved in self._digest_cache:
+            sha256, size_bytes = self._digest_cache[resolved]
+            return sha256, size_bytes, None
         if source.is_symlink() or not source.is_file():
             raise ValueError(f"snapshot source must be a regular file: {source}")
+        if account and self._files + 1 > self.config.max_files:
+            raise ValueError("snapshot max_files exceeded")
+        total_remaining = (
+            self.config.max_total_bytes - self._total_bytes if account else self.config.max_total_bytes
+        )
+        if total_remaining < 0:
+            raise ValueError("snapshot max_total_bytes exceeded")
         digest = hashlib.sha256()
         size_bytes = 0
+        retained: list[bytes] | None = [] if retain else None
         try:
             with source.open("rb") as handle:
-                while chunk := handle.read(_HASH_CHUNK_BYTES):
+                while True:
+                    file_remaining = self.config.max_file_bytes - size_bytes
+                    total_remaining_now = total_remaining - size_bytes
+                    request_size = min(_HASH_CHUNK_BYTES, min(file_remaining, total_remaining_now) + 1)
+                    if request_size <= 0:
+                        if file_remaining <= 0:
+                            raise ValueError("snapshot max_file_bytes exceeded")
+                        raise ValueError("snapshot max_total_bytes exceeded")
+                    chunk = handle.read(request_size)
+                    if not chunk:
+                        break
                     digest.update(chunk)
                     size_bytes += len(chunk)
+                    if retained is not None:
+                        retained.append(chunk)
+                    if size_bytes > self.config.max_file_bytes:
+                        raise ValueError("snapshot max_file_bytes exceeded")
+                    if size_bytes > total_remaining:
+                        raise ValueError("snapshot max_total_bytes exceeded")
         except OSError as error:
             raise ValueError(f"snapshot source is unreadable: {source}") from error
         result = (digest.hexdigest(), size_bytes)
-        self._digest_cache[resolved] = result
-        return result
+        if not force:
+            self._digest_cache[resolved] = result
+        return result[0], result[1], None if retained is None else b"".join(retained)
+
+    def digest_file(self, source: Path, *, force: bool = False) -> tuple[str, int]:
+        sha256, size_bytes, _ = self._read_bounded(source, retain=False, force=force, account=False)
+        return sha256, size_bytes
 
     def add_file(self, role: str, path: str, source: Path) -> SnapshotEntry:
-        sha256, size_bytes = self.digest_file(source)
+        sha256, size_bytes, _ = self._read_bounded(source, retain=False, force=False, account=True)
         self._account(size_bytes)
         entry = SnapshotEntry(role, path, sha256, size_bytes)
         self.entries.append(entry)
         return entry
+
+    def add_retained_file(self, role: str, path: str, source: Path) -> bytes:
+        sha256, size_bytes, contents = self._read_bounded(source, retain=True, force=False, account=True)
+        self._account(size_bytes)
+        self.entries.append(SnapshotEntry(role, path, sha256, size_bytes))
+        assert contents is not None
+        return contents
 
     def add_bytes(self, role: str, path: str, contents: bytes) -> SnapshotEntry:
         self._account(len(contents))
@@ -195,26 +234,18 @@ def _prepared_config(raw: Mapping[str, Any], root: Path) -> dict[str, Any]:
     return prepared
 
 
-def _require_package_file(value: Path, root: Path, *, name: str) -> bytes:
+def _require_package_file(value: Path, root: Path, *, name: str) -> None:
     try:
         value.relative_to(root)
     except ValueError as error:
         raise ValueError(f"task {name} must resolve within the task package") from error
     if value.is_symlink() or not value.is_file():
         raise ValueError(f"task {name} must be an existing regular file: {value}")
-    try:
-        return value.read_bytes()
-    except OSError as error:
-        raise ValueError(f"task {name} is unreadable: {value}") from error
-
-
-def _validate_prompt(prompt: Path, root: Path) -> bytes:
-    contents = _require_package_file(prompt, root, name="prompt")
+def _validate_prompt(contents: bytes, prompt: Path) -> None:
     try:
         contents.decode("utf-8")
     except UnicodeDecodeError as error:
         raise ValueError(f"task prompt must be a UTF-8 file: {prompt}") from error
-    return contents
 
 
 def _excluded(relative: Path) -> bool:
@@ -316,10 +347,14 @@ def _load_plugins(spec: RunSpec, root: Path, builder: _ManifestBuilder) -> Loade
     )
     module_names = tuple(sorted({_parse_entrypoint(value)[0] for value in entrypoints}))
     declared_sources = list(spec.plugins.source_files)
+    direct_sources = {module_name: _module_source_before_import(module_name) for module_name in module_names}
+    for module_name, source in direct_sources.items():
+        builder.add_file(f"plugin:{module_name}", source.name, source)
+    for index, source in enumerate(declared_sources):
+        builder.add_file("plugin-source:" + str(index), source.relative_to(root).as_posix(), source)
     declared_digests = [
         (source.relative_to(root).as_posix(), builder.digest_file(source)) for source in declared_sources
     ]
-    direct_sources = {module_name: _module_source_before_import(module_name) for module_name in module_names}
     planned = {
         module_name: _fingerprint(module_name, builder.digest_file(source), declared_digests)
         for module_name, source in direct_sources.items()
@@ -327,11 +362,6 @@ def _load_plugins(spec: RunSpec, root: Path, builder: _ManifestBuilder) -> Loade
     for module_name, fingerprint in planned.items():
         if (known := _MODULE_FINGERPRINTS.get(module_name)) is not None and known != fingerprint:
             raise RuntimeError(f"plugin source changed; restart required: {module_name}")
-
-    for module_name, source in direct_sources.items():
-        builder.add_file(f"plugin:{module_name}", source.name, source)
-    for index, source in enumerate(declared_sources):
-        builder.add_file("plugin-source:" + str(index), source.relative_to(root).as_posix(), source)
 
     loaded = [_instantiate_entrypoint(value) for value in entrypoints]
     for module_name, source in direct_sources.items():
@@ -399,11 +429,14 @@ def load_task_package(path: Path) -> TaskPackage:
     spec = RunSpec.model_validate(_prepared_config(raw, root))
     builder = _ManifestBuilder(spec.snapshot)
 
-    prompt_bytes = _validate_prompt(spec.task.prompt, root)
-    schema_bytes = tuple(_require_package_file(path, root, name="schema") for path in spec.task.schemas)
-    builder.add_bytes("prompt", spec.task.prompt.relative_to(root).as_posix(), prompt_bytes)
-    for index, (schema, contents) in enumerate(zip(spec.task.schemas, schema_bytes, strict=True)):
-        builder.add_bytes("schema:" + str(index), schema.relative_to(root).as_posix(), contents)
+    _require_package_file(spec.task.prompt, root, name="prompt")
+    prompt_bytes = builder.add_retained_file("prompt", spec.task.prompt.relative_to(root).as_posix(), spec.task.prompt)
+    _validate_prompt(prompt_bytes, spec.task.prompt)
+    schema_values: list[bytes] = []
+    for index, schema in enumerate(spec.task.schemas):
+        _require_package_file(schema, root, name="schema")
+        schema_values.append(builder.add_retained_file("schema:" + str(index), schema.relative_to(root).as_posix(), schema))
+    schema_bytes = tuple(schema_values)
     if spec.wiki.path is not None:
         _add_external_entries(builder, "wiki", spec.wiki.path)
     for index, skill in enumerate(spec.agent.skills):

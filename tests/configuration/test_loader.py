@@ -21,6 +21,7 @@ from multi_agent_pso.configuration.models import (
     RetryConfig,
     RunSpec,
     StorageConfig,
+    SnapshotConfig,
     TaskConfig,
     ThreadConfig,
     TopologyConfig,
@@ -532,3 +533,99 @@ def test_loader_rejects_invalid_plugin_factories(tmp_path: Path, factory: str) -
     task = _write_task(tmp_path, _task_yaml(position_space=factory))
     with pytest.raises((TypeError, ValueError)):
         load_task_package(task)
+
+
+class _SpyReader:
+    def __init__(self, contents: bytes) -> None:
+        self.contents = contents
+        self.offset = 0
+        self.requests: list[int] = []
+        self.open_count = 0
+
+    def __enter__(self) -> _SpyReader:
+        self.open_count += 1
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+    def read(self, size: int) -> bytes:
+        self.requests.append(size)
+        result = self.contents[self.offset : self.offset + size]
+        self.offset += len(result)
+        return result
+
+
+def _spy_path_open(monkeypatch: pytest.MonkeyPatch, path: Path, reader: _SpyReader) -> None:
+    original_open = Path.open
+
+    def open_spy(self: Path, *args: object, **kwargs: object) -> object:
+        if self == path:
+            return reader
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_spy)
+
+
+def test_bounded_reader_stops_after_per_file_budget_and_failed_reads_are_atomic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "large.bin"
+    source.write_bytes(b"0123456789")
+    reader = _SpyReader(b"0123456789")
+    _spy_path_open(monkeypatch, source, reader)
+    builder = configuration_loader._ManifestBuilder(SnapshotConfig(max_files=2, max_file_bytes=3, max_total_bytes=100))
+
+    with pytest.raises(ValueError, match="max_file_bytes"):
+        builder.add_file("wiki", "large.bin", source)
+
+    assert reader.open_count == 1
+    assert reader.requests == [4]
+    assert reader.offset == 4
+    assert builder.entries == []
+    assert builder._digest_cache == {}
+    assert builder._files == 0
+    assert builder._total_bytes == 0
+
+
+def test_bounded_reader_stops_after_remaining_total_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "large.bin"
+    source.write_bytes(b"0123456789")
+    reader = _SpyReader(b"0123456789")
+    _spy_path_open(monkeypatch, source, reader)
+    builder = configuration_loader._ManifestBuilder(SnapshotConfig(max_files=3, max_file_bytes=100, max_total_bytes=5))
+    builder.add_bytes("seed", "seed", b"abc")
+
+    with pytest.raises(ValueError, match="max_total_bytes"):
+        builder.add_file("wiki", "large.bin", source)
+
+    assert reader.requests == [3]
+    assert reader.offset == 3
+    assert len(builder.entries) == 1
+    assert builder._files == 1
+    assert builder._total_bytes == 3
+
+
+def test_max_files_rejects_before_opening_the_next_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "next.bin"
+    source.write_bytes(b"x")
+    reader = _SpyReader(b"x")
+    _spy_path_open(monkeypatch, source, reader)
+    builder = configuration_loader._ManifestBuilder(SnapshotConfig(max_files=1, max_file_bytes=100, max_total_bytes=100))
+    builder.add_bytes("seed", "seed", b"x")
+
+    with pytest.raises(ValueError, match="max_files"):
+        builder.add_file("wiki", "next.bin", source)
+
+    assert reader.open_count == 0
+    assert reader.requests == []
+
+
+def test_prompt_and_schema_use_bounded_retained_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    task = _write_task(tmp_path, _task_yaml(schemas=("result.schema.json",)))
+    (tmp_path / "result.schema.json").write_bytes(b"{}")
+    monkeypatch.setattr(Path, "read_bytes", lambda _: pytest.fail("unbounded read_bytes called"))
+
+    package = load_task_package(task)
+    assert package.prompt_bytes == b"deterministic task prompt\n"
+    assert package.schema_bytes == (b"{}",)
