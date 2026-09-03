@@ -105,6 +105,22 @@ def test_sample_position_is_seed_reproducible_and_within_bounds() -> None:
     assert np.all(first < space.upper)
 
 
+def test_sample_position_excludes_adjacent_float_upper_bound() -> None:
+    lower = 1.0
+    upper = np.nextafter(lower, np.inf)
+    space = ContinuousBoxPositionSpace(lower=[lower], upper=[upper])
+    sample = space.sample_position(np.random.default_rng(0))
+    assert sample[0] == lower
+    assert sample[0] < upper
+
+
+def test_sample_position_is_finite_for_extreme_finite_interval() -> None:
+    space = ContinuousBoxPositionSpace(lower=[-1e308], upper=[1e308])
+    sample = space.sample_position(np.random.default_rng(0))
+    assert np.isfinite(sample[0])
+    assert -1e308 <= sample[0] < 1e308
+
+
 def test_random_scale_uses_independent_per_dimension_coefficients() -> None:
     space = ContinuousBoxPositionSpace(lower=[0.0, 0.0, 0.0], upper=[1.0, 1.0, 1.0])
     actual = space.random_scale(np.ones(3), upper=2.0, rng=np.random.default_rng(23))
@@ -144,6 +160,15 @@ def test_serialization_round_trip_is_fresh_and_deserialization_is_validated() ->
             space.deserialize_position(invalid)
         with pytest.raises((TypeError, ValueError)):
             space.deserialize_velocity(invalid)
+
+
+@pytest.mark.parametrize("invalid", [(0.25, -0.5), np.array([0.25, -0.5])])
+def test_deserialization_accepts_only_python_lists(invalid: object) -> None:
+    space = ContinuousBoxPositionSpace(lower=[0.0, -1.0], upper=[1.0, 1.0])
+    with pytest.raises(TypeError):
+        space.deserialize_position(invalid)
+    with pytest.raises(TypeError):
+        space.deserialize_velocity(invalid)
 
 
 def test_arrays_and_bounds_are_defensive_read_only_copies() -> None:

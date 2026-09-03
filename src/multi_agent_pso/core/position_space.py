@@ -80,7 +80,12 @@ class ContinuousBoxPositionSpace(PositionSpace[FloatArray, FloatArray]):
         return self._readonly_copy(self._upper)
 
     def sample_position(self, rng: np.random.Generator) -> FloatArray:
-        return self._readonly_copy(rng.uniform(self._lower, self._upper))
+        factors = rng.random(self._dimension)
+        sample = (1.0 - factors) * self._lower + factors * self._upper
+        sample = np.maximum(sample, self._lower)
+        upper_inside = np.nextafter(self._upper, self._lower)
+        sample = np.where(sample >= self._upper, upper_inside, sample)
+        return self._result(sample)
 
     def zero_velocity(self) -> FloatArray:
         return self._readonly_copy(np.zeros(self._dimension, dtype=np.float64))
@@ -133,12 +138,16 @@ class ContinuousBoxPositionSpace(PositionSpace[FloatArray, FloatArray]):
         return self._array(position, name="position").tolist()
 
     def deserialize_position(self, value: object) -> FloatArray:
+        if not isinstance(value, list):
+            raise TypeError("position serialization must be a Python list")
         return self._array(value, name="position")
 
     def serialize_velocity(self, velocity: FloatArray) -> object:
         return self._array(velocity, name="velocity").tolist()
 
     def deserialize_velocity(self, value: object) -> FloatArray:
+        if not isinstance(value, list):
+            raise TypeError("velocity serialization must be a Python list")
         return self._array(value, name="velocity")
 
     @property
