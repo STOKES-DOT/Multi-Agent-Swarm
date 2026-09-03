@@ -71,11 +71,12 @@ def _require_root(value: object) -> Path:
                     )
                 except OSError as error:
                     raise ValueError("artifact root must be a non-symlink directory") from error
-                except OSError as error:
-                    raise ValueError("artifact root must be a non-symlink directory") from error
-            if current_fd != root_fd:
-                _close_fds(current_fd, primary_error=sys.exception())
+            except OSError as error:
+                raise ValueError("artifact root must be a non-symlink directory") from error
+            previous_fd = current_fd
             current_fd = child_fd
+            if previous_fd != root_fd:
+                _close_fds(previous_fd)
     finally:
         _close_fds(
             current_fd if current_fd != root_fd else None,
@@ -278,9 +279,10 @@ class FileArtifactStore:
                 except OSError as error:
                     FileArtifactStore._raise_parent_open_error(error, current_fd, part)
                     raise AssertionError("unreachable")
-                if current_fd != root_fd:
-                    _close_fds(current_fd, primary_error=sys.exception())
+                previous_fd = current_fd
                 current_fd = child_fd
+                if previous_fd != root_fd:
+                    _close_fds(previous_fd)
             return current_fd
         except BaseException:
             _close_fds(
@@ -302,9 +304,10 @@ class FileArtifactStore:
                 except OSError as error:
                     FileArtifactStore._raise_parent_open_error(error, current_fd, part)
                     raise AssertionError("unreachable")
-                if current_fd != root_fd:
-                    _close_fds(current_fd, primary_error=sys.exception())
+                previous_fd = current_fd
                 current_fd = child_fd
+                if previous_fd != root_fd:
+                    _close_fds(previous_fd)
             return current_fd
         except BaseException:
             _close_fds(

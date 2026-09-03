@@ -14,6 +14,7 @@ from types import MappingProxyType
 import pytest
 
 from multi_agent_pso.storage import FileArtifactStore
+from multi_agent_pso.storage.file_artifacts import _require_root
 
 
 def test_artifact_store_refuses_overwrite(tmp_path: Path) -> None:
@@ -350,3 +351,87 @@ def test_artifact_store_preserves_primary_error_and_attempts_all_closes(
 
     assert len(close_calls) >= 3
     assert len(set(close_calls)) >= 3
+
+
+def test_require_root_transfers_child_fd_ownership_before_intermediate_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "first" / "second").mkdir(parents=True)
+    _assert_traversal_closes_opened_child_after_intermediate_close_failure(
+        monkeypatch,
+        lambda: _require_root(tmp_path / "first" / "second"),
+        {"first", "second"},
+    )
+
+
+def test_open_parent_transfers_child_fd_ownership_before_intermediate_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        _assert_traversal_closes_opened_child_after_intermediate_close_failure(
+            monkeypatch,
+            lambda: FileArtifactStore._open_parent(root_fd, ("first", "second")),
+            {"first", "second"},
+        )
+    finally:
+        os.close(root_fd)
+
+
+def test_reopen_parent_transfers_child_fd_ownership_before_intermediate_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "first" / "second").mkdir(parents=True)
+    root_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        _assert_traversal_closes_opened_child_after_intermediate_close_failure(
+            monkeypatch,
+            lambda: FileArtifactStore._reopen_parent(root_fd, ("first", "second")),
+            {"first", "second"},
+        )
+    finally:
+        os.close(root_fd)
+
+
+def _assert_traversal_closes_opened_child_after_intermediate_close_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    traverse: object,
+    names: set[str],
+) -> None:
+    real_open = os.open
+    real_close = os.close
+    opened_children: list[tuple[int, tuple[int, int]]] = []
+    close_attempts: list[tuple[int, tuple[int, int] | None]] = []
+
+    def track_open(path: object, *args: object, **kwargs: object) -> int:
+        fd = real_open(path, *args, **kwargs)
+        if str(path) in names:
+            metadata = os.fstat(fd)
+            opened_children.append((fd, (metadata.st_dev, metadata.st_ino)))
+        return fd
+
+    def fail_first_child_close(fd: int) -> None:
+        try:
+            metadata = os.fstat(fd)
+            identity = (metadata.st_dev, metadata.st_ino)
+        except OSError:
+            identity = None
+        close_attempts.append((fd, identity))
+        if len(opened_children) >= 2 and identity == opened_children[0][1]:
+            raise OSError("intermediate close failure")
+        real_close(fd)
+
+    monkeypatch.setattr(os, "open", track_open)
+    monkeypatch.setattr(os, "close", fail_first_child_close)
+
+    try:
+        traverse()  # type: ignore[operator]
+    except OSError as error:
+        assert "intermediate close failure" in str(error)
+    else:
+        pytest.fail(f"intermediate close did not fail: opened={opened_children}, closes={close_attempts}")
+
+    assert len(opened_children) == 2
+    assert {identity for _, identity in opened_children} <= {
+        identity for _, identity in close_attempts
+    }
