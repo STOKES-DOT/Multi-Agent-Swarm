@@ -64,7 +64,12 @@ def _json_ready(value: object) -> object:
 
 
 class FileArtifactStore:
-    """Publish content once without allowing an existing artifact to be replaced."""
+    """Publish content once without allowing an existing artifact to be replaced.
+
+    POSIX cannot provide a transaction spanning external pathname renames.  The
+    final inode check assumes an attacker does not rename or replace the path
+    again after that check and before this method returns.
+    """
 
     def __init__(self, root: Path) -> None:
         self._root = _require_root(root)
@@ -78,6 +83,8 @@ class FileArtifactStore:
         root_fd = self._open_root()
         parent_fd = root_fd
         temporary_name: str | None = None
+        temporary_identity: tuple[int, int] | None = None
+        target_created = False
         try:
             parent_fd = self._open_parent(root_fd, parts[:-1])
             self._refuse_existing(parent_fd, parts[-1])
@@ -85,6 +92,7 @@ class FileArtifactStore:
             try:
                 self._write_all(temporary_fd, data)
                 os.fsync(temporary_fd)
+                temporary_identity = self._identity(os.fstat(temporary_fd))
             finally:
                 os.close(temporary_fd)
             # dir_fd arguments retain the verified directory even if its visible
@@ -96,14 +104,24 @@ class FileArtifactStore:
                 dst_dir_fd=parent_fd,
                 follow_symlinks=False,
             )
-            os.unlink(temporary_name, dir_fd=parent_fd)
+            target_created = True
+            self._validate_committed_path(
+                root_fd, parent_fd, parts[:-1], parts[-1], temporary_identity
+            )
+            if not self._unlink_if_owned(parent_fd, temporary_name, temporary_identity):
+                raise RuntimeError("artifact path changed during publication")
             temporary_name = None
             os.fsync(parent_fd)
         except BaseException:
-            if temporary_name is not None:
-                # This is our own sibling temporary only. Never remove user targets.
+            if temporary_identity is not None:
+                # Only unlink entries after matching their inode to our owned file.
+                # A hostile replacement at either name remains untouched.
+                if target_created:
+                    self._unlink_if_owned(parent_fd, parts[-1], temporary_identity)
+                if temporary_name is not None:
+                    self._unlink_if_owned(parent_fd, temporary_name, temporary_identity)
                 try:
-                    os.unlink(temporary_name, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
                 except OSError:
                     pass
             raise
@@ -195,6 +213,28 @@ class FileArtifactStore:
             raise
 
     @staticmethod
+    def _reopen_parent(root_fd: int, parts: tuple[str, ...]) -> int:
+        """Re-traverse the public relative path without creating any components."""
+        current_fd = root_fd
+        try:
+            for part in parts:
+                try:
+                    child_fd = os.open(
+                        part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current_fd
+                    )
+                except OSError as error:
+                    FileArtifactStore._raise_parent_open_error(error, current_fd, part)
+                    raise AssertionError("unreachable")
+                if current_fd != root_fd:
+                    os.close(current_fd)
+                current_fd = child_fd
+            return current_fd
+        except BaseException:
+            if current_fd != root_fd:
+                os.close(current_fd)
+            raise
+
+    @staticmethod
     def _raise_parent_open_error(error: OSError, parent_fd: int, part: str) -> None:
         if error.errno == errno.ELOOP:
             raise ValueError("artifact path contains a symlink") from error
@@ -226,6 +266,55 @@ class FileArtifactStore:
             except FileExistsError:
                 continue
         raise FileExistsError("unable to allocate unique artifact temporary file")
+
+    @staticmethod
+    def _identity(metadata: os.stat_result) -> tuple[int, int]:
+        return metadata.st_dev, metadata.st_ino
+
+    @staticmethod
+    def _unlink_if_owned(parent_fd: int, name: str, identity: tuple[int, int]) -> bool:
+        try:
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if FileArtifactStore._identity(metadata) != identity:
+            return False
+        os.unlink(name, dir_fd=parent_fd)
+        return True
+
+    @staticmethod
+    def _validate_committed_path(
+        root_fd: int,
+        parent_fd: int,
+        parent_parts: tuple[str, ...],
+        target_name: str,
+        identity: tuple[int, int] | None,
+    ) -> None:
+        if identity is None:
+            raise RuntimeError("artifact path changed during publication")
+        fresh_parent_fd = root_fd
+        try:
+            fresh_parent_fd = FileArtifactStore._reopen_parent(root_fd, parent_parts)
+            if FileArtifactStore._identity(os.fstat(fresh_parent_fd)) != FileArtifactStore._identity(
+                os.fstat(parent_fd)
+            ):
+                raise RuntimeError("artifact path changed during publication")
+            held_target = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+            public_target = os.stat(target_name, dir_fd=fresh_parent_fd, follow_symlinks=False)
+            if (
+                FileArtifactStore._identity(held_target) != identity
+                or FileArtifactStore._identity(public_target) != identity
+            ):
+                raise RuntimeError("artifact path changed during publication")
+        except RuntimeError:
+            raise
+        except OSError as error:
+            raise RuntimeError("artifact path changed during publication") from error
+        except ValueError as error:
+            raise RuntimeError("artifact path changed during publication") from error
+        finally:
+            if fresh_parent_fd != root_fd:
+                os.close(fresh_parent_fd)
 
     @staticmethod
     def _write_all(descriptor: int, data: bytes) -> None:

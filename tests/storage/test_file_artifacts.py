@@ -90,10 +90,10 @@ def test_artifact_store_rejects_existing_symlink_parent(tmp_path: Path) -> None:
     assert not (outside / "payload").exists()
 
 
-def test_artifact_store_does_not_follow_parent_swapped_to_symlink_before_link(
+def test_artifact_store_rejects_parent_renamed_inside_root_before_link(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The publication directory FD remains authoritative across a pathname swap."""
+    """A committed reference must still resolve to the directory held for publication."""
     store = FileArtifactStore(tmp_path)
     (tmp_path / "nested").mkdir()
     external = tmp_path / "external"
@@ -107,10 +107,37 @@ def test_artifact_store_does_not_follow_parent_swapped_to_symlink_before_link(
 
     monkeypatch.setattr(os, "link", swap_parent_then_link)
 
-    store.publish_bytes("nested/result.bin", b"safe", "application/octet-stream")
+    with pytest.raises(RuntimeError, match="artifact path changed during publication"):
+        store.publish_bytes("nested/result.bin", b"safe", "application/octet-stream")
 
     assert not (external / "result.bin").exists()
-    assert (tmp_path / "nested-real" / "result.bin").read_bytes() == b"safe"
+    assert not (tmp_path / "nested-real" / "result.bin").exists()
+
+
+def test_artifact_store_rejects_parent_renamed_outside_root_before_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    store = FileArtifactStore(root)
+    (root / "nested").mkdir()
+    moved_outside = tmp_path / "moved-outside"
+    symlink_target = tmp_path / "symlink-target"
+    symlink_target.mkdir()
+    real_link = os.link
+
+    def move_outside_then_link(source: object, destination: object, *args: object, **kwargs: object) -> None:
+        (root / "nested").rename(moved_outside)
+        (root / "nested").symlink_to(symlink_target, target_is_directory=True)
+        real_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", move_outside_then_link)
+
+    with pytest.raises(RuntimeError, match="artifact path changed during publication"):
+        store.publish_bytes("nested/result.bin", b"safe", "application/octet-stream")
+
+    assert not (moved_outside / "result.bin").exists()
+    assert not (symlink_target / "result.bin").exists()
+    assert list(moved_outside.iterdir()) == []
 
 
 def test_artifact_store_two_writers_create_exactly_one_target(tmp_path: Path) -> None:
