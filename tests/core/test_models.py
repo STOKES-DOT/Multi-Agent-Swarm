@@ -30,6 +30,12 @@ def test_failure_forbids_fitness() -> None:
         Evaluation(status=EvaluationStatus.FAILED, feasible=False, fitness=-100.0)
 
 
+@pytest.mark.parametrize("non_finite", [math.nan, math.inf, -math.inf])
+def test_constraint_violation_must_be_finite(non_finite: float) -> None:
+    with pytest.raises(ValidationError):
+        ConstraintResult(name="validity", satisfied=False, violation=non_finite)
+
+
 def test_success_preserves_metrics_and_provenance() -> None:
     result = Evaluation(
         status=EvaluationStatus.SUCCESS,

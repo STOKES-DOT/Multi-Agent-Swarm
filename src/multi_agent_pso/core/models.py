@@ -52,7 +52,7 @@ def _validate_finite_json(value: JsonValue, *, allow_none: bool = True) -> JsonV
 
 
 class _FrozenModel(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
 
 class ConstraintResult(_FrozenModel):
