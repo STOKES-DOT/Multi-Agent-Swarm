@@ -257,3 +257,29 @@ def test_artifact_store_syncs_each_parent_after_creating_it(
     assert root_identity in observed
     assert first_identity in observed
     assert observed.index(root_identity) < observed.index(first_identity)
+
+
+def test_artifact_store_syncs_each_new_root_ancestor_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "level1" / "level2"
+    observed: list[tuple[int, int]] = []
+    real_fsync = os.fsync
+
+    def track_fsync(fd: int) -> None:
+        metadata = os.fstat(fd)
+        observed.append((metadata.st_dev, metadata.st_ino))
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", track_fsync)
+    FileArtifactStore(root).publish_bytes("child/value.bin", b"payload", "application/octet-stream")
+
+    identities = [
+        (tmp_path.stat().st_dev, tmp_path.stat().st_ino),
+        ((tmp_path / "level1").stat().st_dev, (tmp_path / "level1").stat().st_ino),
+        (root.stat().st_dev, root.stat().st_ino),
+    ]
+    assert all(identity in observed for identity in identities)
+    assert [observed.index(identity) for identity in identities] == sorted(
+        observed.index(identity) for identity in identities
+    )

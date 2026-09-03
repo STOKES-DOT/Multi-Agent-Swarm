@@ -19,12 +19,42 @@ from multi_agent_pso.core import ArtifactRef
 def _require_root(value: object) -> Path:
     if not isinstance(value, Path):
         raise TypeError("root must be a Path")
-    if value.exists() and value.is_symlink():
-        raise ValueError("artifact root must not be a symlink")
-    value.mkdir(parents=True, exist_ok=True)
-    if value.is_symlink() or not value.is_dir():
-        raise ValueError("artifact root must be a non-symlink directory")
-    return value.resolve(strict=True)
+    root = value if value.is_absolute() else Path.cwd() / value
+    root_fd = os.open(root.parts[0], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    current_fd = root_fd
+    try:
+        for part in root.parts[1:]:
+            try:
+                child_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=current_fd,
+                )
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
+                else:
+                    os.fsync(current_fd)
+                try:
+                    child_fd = os.open(
+                        part,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=current_fd,
+                    )
+                except OSError as error:
+                    raise ValueError("artifact root must be a non-symlink directory") from error
+            except OSError as error:
+                raise ValueError("artifact root must be a non-symlink directory") from error
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = child_fd
+    finally:
+        if current_fd != root_fd:
+            os.close(current_fd)
+        os.close(root_fd)
+    return root
 
 
 def _relative_parts(value: object) -> tuple[str, ...]:
@@ -74,8 +104,8 @@ class FileArtifactStore:
     """
 
     def __init__(self, root: Path) -> None:
-        self._root = _require_root(root)
         self._require_secure_dir_fd_support()
+        self._root = _require_root(root)
 
     def publish_bytes(self, relative_path: str, data: bytes, media_type: str) -> ArtifactRef:
         if not isinstance(data, bytes):
