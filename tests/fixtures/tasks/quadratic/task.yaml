@@ -1,0 +1,40 @@
+task:
+  name: quadratic
+  version: v1
+  prompt: prompt.md
+agent:
+  model: deterministic-test
+  skills: []
+  stage_timeout_seconds: 30.0
+wiki:
+  path: null
+  read_only: true
+  max_results: 10
+pso:
+  population_size: 3
+  iterations: 2
+  run_seed: 42
+  cognitive_coefficient: 2.05
+  social_coefficient: 2.05
+  constriction_factor: 0.72984
+  velocity_clamp: 0.2
+  topology:
+    type: ring
+    neighborhood_radius: 1
+concurrency:
+  agents: 1
+  evaluations: 1
+retry:
+  agent_schema_corrections: 1
+  transient_resource_retries: 1
+  consecutive_failures_before_resample: 1
+thread:
+  max_turns: 4
+  max_context_tokens: 1024
+storage:
+  runs_directory: runs
+plugins:
+  position_space: tests.fixtures.tasks.quadratic.plugin:position_space
+  task_adapter: tests.fixtures.tasks.quadratic.plugin:task_adapter
+  evaluator: tests.fixtures.tasks.quadratic.plugin:evaluator
+  tool_provider: tests.fixtures.tasks.quadratic.plugin:tool_provider
