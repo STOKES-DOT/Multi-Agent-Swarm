@@ -13,13 +13,21 @@ from multi_agent_pso.storage import SQLiteRunStore
 
 
 def test_iteration_transaction_rolls_back_all_state(tmp_path: Path) -> None:
-    store = SQLiteRunStore(tmp_path / "runs.sqlite")
+    path = tmp_path / "runs.sqlite"
+    store = SQLiteRunStore(path)
     store.create_run("run-1", snapshot_hash="a" * 64)
     with pytest.raises(RuntimeError):
         with store.iteration_transaction("run-1", 0) as tx:
             tx.put_particle_json("p0", {"position": [0.1]})
+            tx.put_pbest_json("p0", {"fitness": 1.0})
+            tx.put_gbest_json({"particle_id": "p0", "fitness": 1.0})
+            tx.put_snapshot_json({"iteration": 0})
             raise RuntimeError("injected")
-    assert store.get_particle_json("run-1", "p0") is None
+    assert SQLiteRunStore(path).get_particle_json("run-1", "p0") is None
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM iterations").fetchone() == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM pbest_history").fetchone() == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM gbest_history").fetchone() == (0,)
 
 
 def test_iteration_commit_requires_snapshot_and_persists_atomically(tmp_path: Path) -> None:
@@ -40,6 +48,52 @@ def test_iteration_commit_requires_snapshot_and_persists_atomically(tmp_path: Pa
         "iteration": 0,
         "items": ["p0"],
     }
+
+
+def test_iteration_commits_particle_pbest_gbest_and_snapshot_atomically(tmp_path: Path) -> None:
+    path = tmp_path / "runs.sqlite"
+    store = SQLiteRunStore(path)
+    store.create_run("run-1", "a" * 64)
+    with store.iteration_transaction("run-1", 0) as tx:
+        tx.put_particle_json("p0", {"position": [0.1]})
+        tx.put_pbest_json("p0", {"fitness": 1.0})
+        tx.put_gbest_json({"particle_id": "p0", "fitness": 1.0})
+        tx.put_snapshot_json({"iteration": 0})
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT payload_json FROM pbest_history").fetchall() == [('{"fitness":1.0}',)]
+        assert connection.execute("SELECT payload_json FROM gbest_history").fetchall() == [('{"fitness":1.0,"particle_id":"p0"}',)]
+    assert SQLiteRunStore(path).get_particle_json("run-1", "p0") == {"position": [0.1]}
+
+
+def test_iteration_replay_conflicts_when_any_staged_state_differs(tmp_path: Path) -> None:
+    path = tmp_path / "runs.sqlite"
+    store = SQLiteRunStore(path)
+    store.create_run("run-1", "a" * 64)
+    with store.iteration_transaction("run-1", 0) as tx:
+        tx.put_particle_json("p0", {"position": [0.1]})
+        tx.put_pbest_json("p0", {"fitness": 1.0})
+        tx.put_gbest_json({"particle_id": "p0", "fitness": 1.0})
+        tx.put_snapshot_json({"iteration": 0})
+
+    def replay(particle: dict[str, object], pbest: dict[str, object], gbest: dict[str, object]) -> None:
+        with store.iteration_transaction("run-1", 0) as tx:
+            tx.put_particle_json("p0", particle)
+            tx.put_pbest_json("p0", pbest)
+            tx.put_gbest_json(gbest)
+            tx.put_snapshot_json({"iteration": 0})
+
+    with pytest.raises(ValueError, match="iteration state conflict"):
+        replay({"position": [0.2]}, {"fitness": 1.0}, {"particle_id": "p0", "fitness": 1.0})
+    with pytest.raises(ValueError, match="iteration state conflict"):
+        replay({"position": [0.1]}, {"fitness": 2.0}, {"particle_id": "p0", "fitness": 1.0})
+    with pytest.raises(ValueError, match="iteration state conflict"):
+        replay({"position": [0.1]}, {"fitness": 1.0}, {"particle_id": "p1", "fitness": 1.0})
+    with pytest.raises(ValueError, match="iteration state conflict"):
+        with store.iteration_transaction("run-1", 0) as tx:
+            tx.put_snapshot_json({"iteration": 0})
+
+    assert SQLiteRunStore(path).get_particle_json("run-1", "p0") == {"position": [0.1]}
 
 
 def test_create_run_is_idempotent_only_for_matching_hash(tmp_path: Path) -> None:
@@ -107,6 +161,35 @@ def test_store_rejects_unsupported_schema_version_before_operations(tmp_path: Pa
 
     with pytest.raises(RuntimeError, match="unsupported schema version"):
         SQLiteRunStore(path)
+
+
+def test_store_rejects_nonempty_database_without_schema_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "runs.sqlite"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE unrelated (value TEXT)")
+
+    with pytest.raises(RuntimeError, match="schema metadata"):
+        SQLiteRunStore(path)
+
+
+def test_store_reopen_rejects_v1_database_missing_required_table(tmp_path: Path) -> None:
+    path = tmp_path / "runs.sqlite"
+    SQLiteRunStore(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE artifact_index")
+
+    with pytest.raises(RuntimeError, match="schema layout"):
+        SQLiteRunStore(path)
+
+
+def test_database_and_existing_wal_sidecars_are_owner_only(tmp_path: Path) -> None:
+    path = tmp_path / "runs.sqlite"
+    store = SQLiteRunStore(path)
+    store.create_run("run-1", "a" * 64)
+
+    for candidate in (path, path.with_name(f"{path.name}-wal"), path.with_name(f"{path.name}-shm")):
+        if candidate.exists():
+            assert candidate.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.parametrize("bad_iteration", [True, -1, 1.5])

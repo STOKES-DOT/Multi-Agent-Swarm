@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
@@ -52,15 +53,15 @@ def _require_hash(value: object) -> str:
 
 def _json_value(value: object) -> JsonValue:
     if isinstance(value, Mapping):
-        converted: dict[str, JsonValue] = {}
+        result: dict[str, JsonValue] = {}
         for key, nested in value.items():
             if not isinstance(key, str):
                 raise TypeError("JSON object keys must be strings")
-            converted[key] = _json_value(nested)
-        return converted
+            result[key] = _json_value(nested)
+        return result
     if isinstance(value, (list, tuple)):
         return [_json_value(nested) for nested in value]
-    if value is None or type(value) is bool or type(value) is str or type(value) is int:
+    if value is None or type(value) in (bool, str, int):
         return value
     if type(value) is float:
         if not math.isfinite(value):
@@ -71,122 +72,75 @@ def _json_value(value: object) -> JsonValue:
 
 def _canonical_json(payload: object) -> str:
     return json.dumps(
-        _json_value(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        _json_value(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
     )
 
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS schema_metadata (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    schema_version INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS runs (
-    run_id TEXT PRIMARY KEY,
-    snapshot_hash TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS particles (
-    run_id TEXT NOT NULL REFERENCES runs(run_id),
-    particle_id TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
-    PRIMARY KEY (run_id, particle_id)
-);
-CREATE TABLE IF NOT EXISTS iterations (
-    run_id TEXT NOT NULL REFERENCES runs(run_id),
-    iteration_id INTEGER NOT NULL CHECK (iteration_id >= 0),
-    snapshot_json TEXT NOT NULL,
-    PRIMARY KEY (run_id, iteration_id)
-);
-CREATE TABLE IF NOT EXISTS stage_events (
-    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id TEXT NOT NULL REFERENCES runs(run_id),
-    particle_id TEXT NOT NULL,
-    iteration_id INTEGER NOT NULL CHECK (iteration_id >= 0),
-    stage TEXT NOT NULL,
-    attempt INTEGER NOT NULL CHECK (attempt >= 0),
-    event_type TEXT NOT NULL,
-    payload_json TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS hypotheses (
-    hypothesis_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id TEXT NOT NULL REFERENCES runs(run_id),
-    particle_id TEXT NOT NULL,
-    iteration_id INTEGER NOT NULL CHECK (iteration_id >= 0),
-    payload_json TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS tool_requests (
-    request_id TEXT PRIMARY KEY,
-    run_id TEXT REFERENCES runs(run_id),
-    payload_json TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS tool_results (
-    idempotency_key TEXT PRIMARY KEY,
-    result_json TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS evaluations (
-    evaluation_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id TEXT NOT NULL REFERENCES runs(run_id),
-    particle_id TEXT NOT NULL,
-    iteration_id INTEGER NOT NULL CHECK (iteration_id >= 0),
-    payload_json TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS pbest_history (
-    history_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id TEXT NOT NULL REFERENCES runs(run_id),
-    particle_id TEXT NOT NULL,
-    iteration_id INTEGER NOT NULL CHECK (iteration_id >= 0),
-    payload_json TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS gbest_history (
-    history_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id TEXT NOT NULL REFERENCES runs(run_id),
-    iteration_id INTEGER NOT NULL CHECK (iteration_id >= 0),
-    payload_json TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS thread_checkpoints (
-    checkpoint_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id TEXT NOT NULL REFERENCES runs(run_id),
-    particle_id TEXT NOT NULL,
-    iteration_id INTEGER NOT NULL CHECK (iteration_id >= 0),
-    payload_json TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS artifact_index (
-    relative_path TEXT PRIMARY KEY,
-    run_id TEXT REFERENCES runs(run_id),
-    artifact_json TEXT NOT NULL
-);
+CREATE TABLE schema_metadata (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), schema_version INTEGER NOT NULL);
+CREATE TABLE runs (run_id TEXT PRIMARY KEY, snapshot_hash TEXT NOT NULL);
+CREATE TABLE particles (run_id TEXT NOT NULL REFERENCES runs(run_id), particle_id TEXT NOT NULL, payload_json TEXT NOT NULL, PRIMARY KEY (run_id, particle_id));
+CREATE TABLE iterations (run_id TEXT NOT NULL REFERENCES runs(run_id), iteration_id INTEGER NOT NULL CHECK (iteration_id >= 0), snapshot_json TEXT NOT NULL, PRIMARY KEY (run_id, iteration_id));
+CREATE TABLE iteration_particles (run_id TEXT NOT NULL REFERENCES runs(run_id), iteration_id INTEGER NOT NULL CHECK (iteration_id >= 0), particle_id TEXT NOT NULL, payload_json TEXT NOT NULL, PRIMARY KEY (run_id, iteration_id, particle_id));
+CREATE TABLE stage_events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), particle_id TEXT NOT NULL, iteration_id INTEGER NOT NULL CHECK (iteration_id >= 0), stage TEXT NOT NULL, attempt INTEGER NOT NULL CHECK (attempt >= 0), event_type TEXT NOT NULL, payload_json TEXT NOT NULL);
+CREATE TABLE hypotheses (hypothesis_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), particle_id TEXT NOT NULL, iteration_id INTEGER NOT NULL CHECK (iteration_id >= 0), payload_json TEXT NOT NULL);
+CREATE TABLE tool_requests (request_id TEXT PRIMARY KEY, run_id TEXT REFERENCES runs(run_id), payload_json TEXT NOT NULL);
+CREATE TABLE tool_results (idempotency_key TEXT PRIMARY KEY, result_json TEXT NOT NULL);
+CREATE TABLE evaluations (evaluation_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), particle_id TEXT NOT NULL, iteration_id INTEGER NOT NULL CHECK (iteration_id >= 0), payload_json TEXT NOT NULL);
+CREATE TABLE pbest_history (history_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), particle_id TEXT NOT NULL, iteration_id INTEGER NOT NULL CHECK (iteration_id >= 0), payload_json TEXT NOT NULL, UNIQUE (run_id, particle_id, iteration_id));
+CREATE TABLE gbest_history (history_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), iteration_id INTEGER NOT NULL CHECK (iteration_id >= 0), payload_json TEXT NOT NULL, UNIQUE (run_id, iteration_id));
+CREATE TABLE thread_checkpoints (checkpoint_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(run_id), particle_id TEXT NOT NULL, iteration_id INTEGER NOT NULL CHECK (iteration_id >= 0), payload_json TEXT NOT NULL);
+CREATE TABLE artifact_index (relative_path TEXT PRIMARY KEY, run_id TEXT REFERENCES runs(run_id), artifact_json TEXT NOT NULL);
 """
 
 _SCHEMA_VERSION = 1
+_REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
+    "schema_metadata": ("singleton", "schema_version"),
+    "runs": ("run_id", "snapshot_hash"),
+    "particles": ("run_id", "particle_id", "payload_json"),
+    "iterations": ("run_id", "iteration_id", "snapshot_json"),
+    "iteration_particles": ("run_id", "iteration_id", "particle_id", "payload_json"),
+    "stage_events": ("event_id", "run_id", "particle_id", "iteration_id", "stage", "attempt", "event_type", "payload_json"),
+    "hypotheses": ("hypothesis_id", "run_id", "particle_id", "iteration_id", "payload_json"),
+    "tool_requests": ("request_id", "run_id", "payload_json"),
+    "tool_results": ("idempotency_key", "result_json"),
+    "evaluations": ("evaluation_id", "run_id", "particle_id", "iteration_id", "payload_json"),
+    "pbest_history": ("history_id", "run_id", "particle_id", "iteration_id", "payload_json"),
+    "gbest_history": ("history_id", "run_id", "iteration_id", "payload_json"),
+    "thread_checkpoints": ("checkpoint_id", "run_id", "particle_id", "iteration_id", "payload_json"),
+    "artifact_index": ("relative_path", "run_id", "artifact_json"),
+}
 
 
 class SQLiteRunStore:
-    """A short-lived-connection SQLite store with explicit iteration boundaries."""
+    """Short-lived SQLite connections and atomic, replay-safe iteration commits."""
 
     def __init__(self, database_path: Path) -> None:
         self._path = _require_path(database_path)
+        self._prepare_database_file()
         connection = self._connect()
         try:
             connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("BEGIN IMMEDIATE")
-            for statement in _SCHEMA.split(";"):
-                if statement.strip():
-                    connection.execute(statement)
-            rows = connection.execute(
-                "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
-            ).fetchall()
-            if not rows:
-                connection.execute(
-                    "INSERT INTO schema_metadata (singleton, schema_version) VALUES (1, ?)",
-                    (_SCHEMA_VERSION,),
-                )
-            elif len(rows) != 1 or rows[0]["schema_version"] != _SCHEMA_VERSION:
-                raise RuntimeError("unsupported schema version")
-            connection.commit()
+            self._secure_database_files()
+            if not self._table_names(connection):
+                connection.execute("BEGIN IMMEDIATE")
+                for statement in _SCHEMA.split(";"):
+                    if statement.strip():
+                        connection.execute(statement)
+                connection.execute("INSERT INTO schema_metadata VALUES (1, ?)", (_SCHEMA_VERSION,))
+                connection.commit()
+            else:
+                self._validate_schema(connection)
         except BaseException:
             connection.rollback()
             raise
         finally:
             connection.close()
+            self._secure_database_files(suppress_errors=True)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._path)
@@ -194,23 +148,75 @@ class SQLiteRunStore:
         connection.execute("PRAGMA foreign_keys=ON")
         return connection
 
+    @staticmethod
+    def _table_names(connection: sqlite3.Connection) -> set[str]:
+        return {
+            row["name"]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            if not row["name"].startswith("sqlite_")
+        }
+
+    def _validate_schema(self, connection: sqlite3.Connection) -> None:
+        tables = self._table_names(connection)
+        if "schema_metadata" not in tables:
+            raise RuntimeError("database has no schema metadata")
+        for table, columns in _REQUIRED_COLUMNS.items():
+            actual = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+            if not set(columns) <= actual:
+                raise RuntimeError("unsupported schema layout")
+        rows = connection.execute(
+            "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+        ).fetchall()
+        if len(rows) != 1 or rows[0]["schema_version"] != _SCHEMA_VERSION:
+            raise RuntimeError("unsupported schema version")
+
+    def _prepare_database_file(self) -> None:
+        try:
+            descriptor = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            if self._path.is_symlink():
+                raise ValueError("database_path must not be a symlink")
+            os.chmod(self._path, 0o600)
+        else:
+            os.close(descriptor)
+
+    def _secure_database_files(self, *, suppress_errors: bool = False) -> None:
+        for candidate in (
+            self._path,
+            self._path.with_name(f"{self._path.name}-wal"),
+            self._path.with_name(f"{self._path.name}-shm"),
+        ):
+            if candidate.exists():
+                try:
+                    if candidate.is_symlink():
+                        raise ValueError("SQLite database files must not be symlinks")
+                    os.chmod(candidate, 0o600)
+                except (OSError, ValueError):
+                    if not suppress_errors:
+                        raise
+
     def create_run(self, run_id: str, snapshot_hash: str) -> None:
         run = _require_identifier(run_id, "run_id")
         digest = _require_hash(snapshot_hash)
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute("SELECT snapshot_hash FROM runs WHERE run_id = ?", (run,)).fetchone()
+            self._secure_database_files()
+            row = connection.execute(
+                "SELECT snapshot_hash FROM runs WHERE run_id = ?", (run,)
+            ).fetchone()
             if row is None:
-                connection.execute("INSERT INTO runs (run_id, snapshot_hash) VALUES (?, ?)", (run, digest))
+                connection.execute("INSERT INTO runs VALUES (?, ?)", (run, digest))
             elif row["snapshot_hash"] != digest:
                 raise ValueError("run_id already exists with a different snapshot_hash")
+            self._secure_database_files()
             connection.commit()
         except BaseException:
             connection.rollback()
             raise
         finally:
             connection.close()
+            self._secure_database_files(suppress_errors=True)
 
     def append_stage_event(self, event: StageEvent) -> None:
         if not isinstance(event, StageEvent):
@@ -218,21 +224,29 @@ class SQLiteRunStore:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            self._secure_database_files()
             connection.execute(
                 """INSERT INTO stage_events
                 (run_id, particle_id, iteration_id, stage, attempt, event_type, payload_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    event.run_id, event.particle_id, event.iteration_id, event.stage.value,
-                    event.attempt, event.event_type, _canonical_json(event.payload),
+                    event.run_id,
+                    event.particle_id,
+                    event.iteration_id,
+                    event.stage.value,
+                    event.attempt,
+                    event.event_type,
+                    _canonical_json(event.payload),
                 ),
             )
+            self._secure_database_files()
             connection.commit()
         except BaseException:
             connection.rollback()
             raise
         finally:
             connection.close()
+            self._secure_database_files(suppress_errors=True)
 
     def get_committed_tool_result(self, idempotency_key: str) -> ToolResult | None:
         key = _require_identifier(idempotency_key, "idempotency_key")
@@ -243,14 +257,15 @@ class SQLiteRunStore:
             ).fetchone()
         finally:
             connection.close()
+            self._secure_database_files(suppress_errors=True)
         if row is None:
             return None
         document = json.loads(row["result_json"])
         return ToolResult(
-            status=ToolStatus(document["status"]),
-            payload=document["payload"],
-            artifacts=tuple(ArtifactRef.model_validate(item) for item in document["artifacts"]),
-            error=document["error"],
+            ToolStatus(document["status"]),
+            document["payload"],
+            tuple(ArtifactRef.model_validate(item) for item in document["artifacts"]),
+            document["error"],
         )
 
     def record_tool_result(self, idempotency_key: str, result: ToolResult) -> None:
@@ -261,34 +276,41 @@ class SQLiteRunStore:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            self._secure_database_files()
             row = connection.execute(
                 "SELECT result_json FROM tool_results WHERE idempotency_key = ?", (key,)
             ).fetchone()
             if row is None:
-                connection.execute(
-                    "INSERT INTO tool_results (idempotency_key, result_json) VALUES (?, ?)",
-                    (key, serialized),
-                )
+                connection.execute("INSERT INTO tool_results VALUES (?, ?)", (key, serialized))
             elif row["result_json"] != serialized:
                 raise ValueError("idempotency key conflict: committed result differs")
+            self._secure_database_files()
             connection.commit()
         except BaseException:
             connection.rollback()
             raise
         finally:
             connection.close()
+            self._secure_database_files(suppress_errors=True)
 
     def iteration_transaction(self, run_id: str, iteration_id: int) -> "_IterationTransaction":
-        return _IterationTransaction(self, _require_identifier(run_id, "run_id"), _require_iteration(iteration_id))
+        return _IterationTransaction(
+            self,
+            _require_identifier(run_id, "run_id"),
+            _require_iteration(iteration_id),
+        )
 
     def get_particle_json(self, run_id: str, particle_id: str) -> dict[str, JsonValue] | None:
-        run = _require_identifier(run_id, "run_id")
-        particle = _require_identifier(particle_id, "particle_id")
-        return self._get_json("SELECT payload_json FROM particles WHERE run_id = ? AND particle_id = ?", (run, particle))
+        return self._get_json(
+            "SELECT payload_json FROM particles WHERE run_id = ? AND particle_id = ?",
+            (_require_identifier(run_id, "run_id"), _require_identifier(particle_id, "particle_id")),
+        )
 
     def get_iteration_snapshot_json(self, run_id: str, iteration_id: int) -> dict[str, JsonValue] | None:
-        run = _require_identifier(run_id, "run_id")
-        return self._get_json("SELECT snapshot_json FROM iterations WHERE run_id = ? AND iteration_id = ?", (run, _require_iteration(iteration_id)))
+        return self._get_json(
+            "SELECT snapshot_json FROM iterations WHERE run_id = ? AND iteration_id = ?",
+            (_require_identifier(run_id, "run_id"), _require_iteration(iteration_id)),
+        )
 
     def _get_json(self, query: str, parameters: tuple[object, ...]) -> dict[str, JsonValue] | None:
         connection = self._connect()
@@ -296,6 +318,7 @@ class SQLiteRunStore:
             row = connection.execute(query, parameters).fetchone()
         finally:
             connection.close()
+            self._secure_database_files(suppress_errors=True)
         if row is None:
             return None
         value = json.loads(row[0])
@@ -305,7 +328,7 @@ class SQLiteRunStore:
 
 
 class _IterationTransaction:
-    """One live ``BEGIN IMMEDIATE`` transaction; it owns its SQLite connection."""
+    """One ``BEGIN IMMEDIATE`` transaction with staged state written only at commit."""
 
     def __init__(self, store: SQLiteRunStore, run_id: str, iteration_id: int) -> None:
         self._store = store
@@ -314,14 +337,21 @@ class _IterationTransaction:
         self._connection = store._connect()
         self._closed = False
         self._snapshot_json: str | None = None
+        self._gbest: str | None = None
+        self._particles: dict[str, str] = {}
+        self._pbests: dict[str, str] = {}
         try:
             self._connection.execute("BEGIN IMMEDIATE")
-            if self._connection.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone() is None:
+            store._secure_database_files()
+            if self._connection.execute(
+                "SELECT 1 FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone() is None:
                 raise ValueError("unknown run_id")
         except BaseException:
             self._connection.rollback()
             self._connection.close()
             self._closed = True
+            store._secure_database_files(suppress_errors=True)
             raise
 
     def __enter__(self) -> Self:
@@ -330,29 +360,28 @@ class _IterationTransaction:
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
         if not self._closed:
-            if exc_type is None:
-                self.commit()
-            else:
-                self.rollback()
+            self.commit() if exc_type is None else self.rollback()
         return False
 
     def put_particle_json(self, particle_id: str, payload: Mapping[str, JsonValue]) -> None:
-        self._require_open()
         particle = _require_identifier(particle_id, "particle_id")
-        if not isinstance(payload, Mapping):
-            raise TypeError("payload must be a JSON object mapping")
-        serialized = _canonical_json(payload)
-        self._connection.execute(
-            """INSERT INTO particles (run_id, particle_id, payload_json) VALUES (?, ?, ?)
-            ON CONFLICT(run_id, particle_id) DO UPDATE SET payload_json = excluded.payload_json""",
-            (self._run_id, particle, serialized),
-        )
+        self._particles[particle] = self._payload_json(payload)
+
+    def put_pbest_json(self, particle_id: str, payload: Mapping[str, JsonValue]) -> None:
+        particle = _require_identifier(particle_id, "particle_id")
+        self._pbests[particle] = self._payload_json(payload)
+
+    def put_gbest_json(self, payload: Mapping[str, JsonValue]) -> None:
+        self._gbest = self._payload_json(payload)
 
     def put_snapshot_json(self, payload: Mapping[str, JsonValue]) -> None:
+        self._snapshot_json = self._payload_json(payload)
+
+    def _payload_json(self, payload: Mapping[str, JsonValue]) -> str:
         self._require_open()
         if not isinstance(payload, Mapping):
             raise TypeError("payload must be a JSON object mapping")
-        self._snapshot_json = _canonical_json(payload)
+        return _canonical_json(payload)
 
     def commit(self) -> None:
         self._require_open()
@@ -360,22 +389,80 @@ class _IterationTransaction:
             self._finish_rollback()
             raise ValueError("iteration transaction requires a snapshot before commit")
         try:
-            row = self._connection.execute(
+            existing = self._connection.execute(
                 "SELECT snapshot_json FROM iterations WHERE run_id = ? AND iteration_id = ?",
                 (self._run_id, self._iteration_id),
             ).fetchone()
-            if row is None:
-                self._connection.execute(
-                    "INSERT INTO iterations (run_id, iteration_id, snapshot_json) VALUES (?, ?, ?)",
-                    (self._run_id, self._iteration_id, self._snapshot_json),
-                )
-            elif row["snapshot_json"] != self._snapshot_json:
+            if existing is None:
+                self._write_new_iteration()
+            elif existing["snapshot_json"] != self._snapshot_json:
                 raise ValueError("iteration snapshot conflict")
+            elif not self._matches_existing_iteration():
+                raise ValueError("iteration state conflict")
+            self._store._secure_database_files()
             self._connection.commit()
             self._close()
         except BaseException:
             self._finish_rollback()
             raise
+
+    def _write_new_iteration(self) -> None:
+        self._connection.execute(
+            "INSERT INTO iterations VALUES (?, ?, ?)",
+            (self._run_id, self._iteration_id, self._snapshot_json),
+        )
+        for particle_id, payload in self._particles.items():
+            self._connection.execute(
+                """INSERT INTO particles VALUES (?, ?, ?)
+                ON CONFLICT(run_id, particle_id) DO UPDATE SET payload_json = excluded.payload_json""",
+                (self._run_id, particle_id, payload),
+            )
+            self._connection.execute(
+                "INSERT INTO iteration_particles VALUES (?, ?, ?, ?)",
+                (self._run_id, self._iteration_id, particle_id, payload),
+            )
+        for particle_id, payload in self._pbests.items():
+            self._connection.execute(
+                """INSERT INTO pbest_history (run_id, particle_id, iteration_id, payload_json)
+                VALUES (?, ?, ?, ?)""",
+                (self._run_id, particle_id, self._iteration_id, payload),
+            )
+        if self._gbest is not None:
+            self._connection.execute(
+                "INSERT INTO gbest_history (run_id, iteration_id, payload_json) VALUES (?, ?, ?)",
+                (self._run_id, self._iteration_id, self._gbest),
+            )
+
+    def _matches_existing_iteration(self) -> bool:
+        particles = {
+            row["particle_id"]: row["payload_json"]
+            for row in self._connection.execute(
+                """SELECT particle_id, payload_json FROM iteration_particles
+                WHERE run_id = ? AND iteration_id = ?""",
+                (self._run_id, self._iteration_id),
+            )
+        }
+        pbests = {
+            row["particle_id"]: row["payload_json"]
+            for row in self._connection.execute(
+                """SELECT particle_id, payload_json FROM pbest_history
+                WHERE run_id = ? AND iteration_id = ?""",
+                (self._run_id, self._iteration_id),
+            )
+        }
+        gbests = [
+            row["payload_json"]
+            for row in self._connection.execute(
+                "SELECT payload_json FROM gbest_history WHERE run_id = ? AND iteration_id = ?",
+                (self._run_id, self._iteration_id),
+            )
+        ]
+        return (
+            particles == self._particles
+            and pbests == self._pbests
+            and len(gbests) <= 1
+            and (gbests[0] if gbests else None) == self._gbest
+        )
 
     def rollback(self) -> None:
         self._require_open()
@@ -395,3 +482,4 @@ class _IterationTransaction:
         if not self._closed:
             self._connection.close()
             self._closed = True
+            self._store._secure_database_files(suppress_errors=True)

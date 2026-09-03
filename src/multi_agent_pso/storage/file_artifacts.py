@@ -66,9 +66,11 @@ def _json_ready(value: object) -> object:
 class FileArtifactStore:
     """Publish content once without allowing an existing artifact to be replaced.
 
-    POSIX cannot provide a transaction spanning external pathname renames.  The
-    final inode check assumes an attacker does not rename or replace the path
-    again after that check and before this method returns.
+    V1 forbids external pathname mutation that bypasses ``FileArtifactStore``
+    while a publication is active.  Coordinated concurrent publication through
+    this store remains supported. FD-relative publication and inode revalidation
+    are best-effort defenses for observed pre-commit swaps, not a filesystem
+    transaction against a malicious external process.
     """
 
     def __init__(self, root: Path) -> None:
@@ -90,9 +92,9 @@ class FileArtifactStore:
             self._refuse_existing(parent_fd, parts[-1])
             temporary_name, temporary_fd = self._create_temporary(parent_fd)
             try:
+                temporary_identity = self._identity(os.fstat(temporary_fd))
                 self._write_all(temporary_fd, data)
                 os.fsync(temporary_fd)
-                temporary_identity = self._identity(os.fstat(temporary_fd))
             finally:
                 os.close(temporary_fd)
             # dir_fd arguments retain the verified directory even if its visible
@@ -189,10 +191,14 @@ class FileArtifactStore:
                         part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current_fd
                     )
                 except FileNotFoundError:
+                    created = False
                     try:
                         os.mkdir(part, dir_fd=current_fd)
+                        created = True
                     except FileExistsError:
                         pass
+                    if created:
+                        os.fsync(current_fd)
                     try:
                         child_fd = os.open(
                             part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current_fd

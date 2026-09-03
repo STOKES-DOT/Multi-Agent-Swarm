@@ -133,6 +133,8 @@ def test_protocol_method_names_and_async_boundaries_are_exact() -> None:
     assert _protocol_methods(ResourceManager) == {"agent_slot", "evaluation_slot"}
     assert _protocol_methods(IterationTransaction) == {
         "put_particle_json",
+        "put_pbest_json",
+        "put_gbest_json",
         "put_snapshot_json",
         "commit",
         "rollback",
@@ -170,7 +172,7 @@ def test_protocol_method_names_and_async_boundaries_are_exact() -> None:
             assert inspect.iscoroutinefunction(getattr(protocol, method))
     for protocol, methods in (
         (ResourceManager, ("agent_slot", "evaluation_slot")),
-        (IterationTransaction, ("put_particle_json", "put_snapshot_json", "commit", "rollback")),
+        (IterationTransaction, ("put_particle_json", "put_pbest_json", "put_gbest_json", "put_snapshot_json", "commit", "rollback")),
         (RunStore, ("create_run", "append_stage_event", "get_committed_tool_result", "iteration_transaction")),
         (ArtifactStore, ("publish_bytes", "publish_text", "publish_json")),
         (TaskAdapter, tuple(_protocol_methods(TaskAdapter))),
@@ -219,6 +221,12 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
 
     class TransactionFake:
         def put_particle_json(self, particle_id: str, payload: Mapping[str, JsonValue]) -> None:
+            return None
+
+        def put_pbest_json(self, particle_id: str, payload: Mapping[str, JsonValue]) -> None:
+            return None
+
+        def put_gbest_json(self, payload: Mapping[str, JsonValue]) -> None:
             return None
 
         def put_snapshot_json(self, payload: Mapping[str, JsonValue]) -> None:
@@ -337,6 +345,8 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
             TransactionFake(),
             {
                 "put_particle_json": (("self", "particle_id", "payload"), {"particle_id": str, "payload": Mapping[str, JsonValue], "return": type(None)}),
+                "put_pbest_json": (("self", "particle_id", "payload"), {"particle_id": str, "payload": Mapping[str, JsonValue], "return": type(None)}),
+                "put_gbest_json": (("self", "payload"), {"payload": Mapping[str, JsonValue], "return": type(None)}),
                 "put_snapshot_json": (("self", "payload"), {"payload": Mapping[str, JsonValue], "return": type(None)}),
                 "commit": (("self",), {"return": type(None)}),
                 "rollback": (("self",), {"return": type(None)}),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import threading
 from pathlib import Path
 from types import MappingProxyType
@@ -202,3 +203,57 @@ def test_artifact_store_uses_durable_file_and_parent_sync(tmp_path: Path, monkey
     FileArtifactStore(tmp_path).publish_bytes("nested/value", b"x", "application/octet-stream")
 
     assert len(calls) >= 2
+
+
+@pytest.mark.parametrize("failing_call", ["write", "fsync"])
+def test_artifact_store_cleans_owned_temporary_after_write_or_sync_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_call: str
+) -> None:
+    store = FileArtifactStore(tmp_path)
+
+    if failing_call == "write":
+        monkeypatch.setattr(os, "write", lambda _fd, _data: (_ for _ in ()).throw(OSError("write failed")))
+    else:
+        real_fsync = os.fsync
+        temp_sync_failed = False
+
+        def fail_only_temp_file_sync(fd: int) -> None:
+            nonlocal temp_sync_failed
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                temp_sync_failed = True
+                raise OSError("sync failed")
+            real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", fail_only_temp_file_sync)
+
+    with pytest.raises(OSError):
+        store.publish_bytes("nested/value.bin", b"payload", "application/octet-stream")
+
+    nested = tmp_path / "nested"
+    assert not (nested / "value.bin").exists()
+    assert list(nested.iterdir()) == []
+    if failing_call == "fsync":
+        assert temp_sync_failed
+
+
+def test_artifact_store_syncs_each_parent_after_creating_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    observed: list[tuple[int, int]] = []
+    real_fsync = os.fsync
+
+    def track_fsync(fd: int) -> None:
+        metadata = os.fstat(fd)
+        observed.append((metadata.st_dev, metadata.st_ino))
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", track_fsync)
+    FileArtifactStore(root).publish_bytes("first/second/value.bin", b"payload", "application/octet-stream")
+
+    root_identity = (root.stat().st_dev, root.stat().st_ino)
+    first = root / "first"
+    first_identity = (first.stat().st_dev, first.stat().st_ino)
+    assert root_identity in observed
+    assert first_identity in observed
+    assert observed.index(root_identity) < observed.index(first_identity)
