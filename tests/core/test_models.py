@@ -51,7 +51,124 @@ def test_records_are_frozen_and_json_serializable() -> None:
     )
     with pytest.raises(ValidationError):
         evaluation.fitness = 2.0
-    assert '"status":"success"' in evaluation.model_dump_json()
+    assert '"status":"SUCCESS"' in evaluation.model_dump_json()
+
+
+def test_uncertainty_accepts_json_values_and_serializes() -> None:
+    evaluation = Evaluation(
+        status=EvaluationStatus.SUCCESS,
+        feasible=True,
+        fitness=1.0,
+        uncertainty={"samples": [0.1, 0.2]},
+    )
+    assert evaluation.uncertainty == {"samples": [0.1, 0.2]}
+    assert '"uncertainty":{"samples":[0.1,0.2]}' in evaluation.model_dump_json()
+
+
+def test_status_enums_serialize_as_uppercase_contract_values() -> None:
+    assert EvaluationStatus.SUCCESS.value == "SUCCESS"
+    assert AgentStage.EXECUTING.value == "EXECUTING"
+    assert EpisodeStatus.INTERRUPTED.value == "INTERRUPTED"
+
+
+@pytest.mark.parametrize("non_finite", [math.nan, math.inf, -math.inf])
+@pytest.mark.parametrize(
+    "record_factory",
+    [
+        lambda value: Evaluation(
+            status=EvaluationStatus.SUCCESS,
+            feasible=True,
+            fitness=1.0,
+            metrics={"nested": [value]},
+        ),
+        lambda value: Evaluation(
+            status=EvaluationStatus.SUCCESS,
+            feasible=True,
+            fitness=1.0,
+            provenance={"nested": [value]},
+        ),
+        lambda value: Evaluation(
+            status=EvaluationStatus.SUCCESS,
+            feasible=True,
+            fitness=1.0,
+            uncertainty={"nested": [value]},
+        ),
+        lambda value: ParticleState(
+            particle_id="p1", position={"nested": [value]}, velocity=[], rng_state={}
+        ),
+        lambda value: ParticleState(
+            particle_id="p1", position=[], velocity={"nested": [value]}, rng_state={}
+        ),
+        lambda value: ParticleState(
+            particle_id="p1", position=[], velocity=[], rng_state={"nested": [value]}
+        ),
+        lambda value: StageEvent(
+            run_id="run1",
+            particle_id="p1",
+            iteration_id=0,
+            stage=AgentStage.PENDING,
+            attempt=0,
+            event_type="started",
+            payload={"nested": [value]},
+        ),
+        lambda value: AgentEpisode(
+            episode_id="ep1",
+            run_id="run1",
+            particle_id="p1",
+            iteration_id=0,
+            target_position=[],
+            evaluated_position=[],
+            position_adherence={"nested": [value]},
+            status=EpisodeStatus.PENDING,
+        ),
+    ],
+)
+def test_json_boundaries_reject_nested_non_finite_values(
+    non_finite: float, record_factory: object
+) -> None:
+    with pytest.raises(ValidationError):
+        record_factory(non_finite)  # type: ignore[operator]
+
+
+def test_required_positions_accept_json_lists_but_not_null() -> None:
+    particle = ParticleState(
+        particle_id="p1", position=[0.0], velocity=[0.1], rng_state={}
+    )
+    pbest = PersonalBest(
+        evaluated_position=[0.0],
+        candidate_reference="candidate-1",
+        hypothesis_reference="hypothesis-1",
+        evaluation_reference="evaluation-1",
+        candidate_hash="a" * 64,
+        fitness=1.0,
+        iteration_id=0,
+    )
+    assert particle.position == [0.0]
+    assert pbest.evaluated_position == [0.0]
+    with pytest.raises(ValidationError):
+        PersonalBest(
+            evaluated_position=None,
+            candidate_reference="candidate-1",
+            hypothesis_reference="hypothesis-1",
+            evaluation_reference="evaluation-1",
+            candidate_hash="a" * 64,
+            fitness=1.0,
+            iteration_id=0,
+        )
+    with pytest.raises(ValidationError):
+        ParticleState(particle_id="p1", position=None, velocity=[], rng_state={})
+    with pytest.raises(ValidationError):
+        ParticleState(particle_id="p1", position=[], velocity=None, rng_state={})
+    with pytest.raises(ValidationError):
+        AgentEpisode(
+            episode_id="ep1",
+            run_id="run1",
+            particle_id="p1",
+            iteration_id=0,
+            target_position=[],
+            evaluated_position=None,
+            status=EpisodeStatus.PENDING,
+        )
 
 
 def test_negative_counters_and_iteration_ids_are_rejected() -> None:

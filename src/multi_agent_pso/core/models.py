@@ -1,7 +1,7 @@
 """Immutable, task-agnostic records shared across swarm execution layers."""
 
 import math
-from enum import StrEnum, auto
+from enum import StrEnum
 from pathlib import PurePath
 from typing import Mapping
 
@@ -9,29 +9,46 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, m
 
 
 class EvaluationStatus(StrEnum):
-    SUCCESS = auto()
-    INVALID = auto()
-    FAILED = auto()
-    TIMEOUT = auto()
+    SUCCESS = "SUCCESS"
+    INVALID = "INVALID"
+    FAILED = "FAILED"
+    TIMEOUT = "TIMEOUT"
 
 
 class AgentStage(StrEnum):
-    PENDING = auto()
-    HYPOTHESIZING = auto()
-    PROPOSING_ACTION = auto()
-    EXECUTING = auto()
-    EVALUATING = auto()
-    REFLECTING = auto()
-    COMPLETED = auto()
+    PENDING = "PENDING"
+    HYPOTHESIZING = "HYPOTHESIZING"
+    PROPOSING_ACTION = "PROPOSING_ACTION"
+    EXECUTING = "EXECUTING"
+    EVALUATING = "EVALUATING"
+    REFLECTING = "REFLECTING"
+    COMPLETED = "COMPLETED"
 
 
 class EpisodeStatus(StrEnum):
-    PENDING = auto()
-    COMPLETED = auto()
-    INVALID = auto()
-    FAILED = auto()
-    TIMEOUT = auto()
-    INTERRUPTED = auto()
+    PENDING = "PENDING"
+    COMPLETED = "COMPLETED"
+    INVALID = "INVALID"
+    FAILED = "FAILED"
+    TIMEOUT = "TIMEOUT"
+    INTERRUPTED = "INTERRUPTED"
+
+
+def _validate_finite_json(value: JsonValue, *, allow_none: bool = True) -> JsonValue:
+    """Reject NaN and infinity before JSON state reaches persistence."""
+    if value is None:
+        if allow_none:
+            return value
+        raise ValueError("value must not be null")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("JSON values must not contain NaN or infinity")
+    if isinstance(value, dict):
+        for nested_value in value.values():
+            _validate_finite_json(nested_value)
+    elif isinstance(value, list):
+        for nested_value in value:
+            _validate_finite_json(nested_value)
+    return value
 
 
 class _FrozenModel(BaseModel):
@@ -50,8 +67,13 @@ class Evaluation(_FrozenModel):
     metrics: Mapping[str, JsonValue] = Field(default_factory=dict)
     constraints: tuple[ConstraintResult, ...] = ()
     fitness: float | None = None
-    uncertainty: float | None = None
+    uncertainty: JsonValue | None = None
     provenance: Mapping[str, JsonValue] = Field(default_factory=dict)
+
+    @field_validator("metrics", "provenance", "uncertainty")
+    @classmethod
+    def validate_json_fields(cls, value: JsonValue) -> JsonValue:
+        return _validate_finite_json(value)
 
     @model_validator(mode="after")
     def validate_fitness_for_status(self) -> "Evaluation":
@@ -87,6 +109,11 @@ class PersonalBest(_FrozenModel):
     fitness: float
     iteration_id: int = Field(ge=0)
 
+    @field_validator("evaluated_position")
+    @classmethod
+    def validate_evaluated_position(cls, value: JsonValue) -> JsonValue:
+        return _validate_finite_json(value, allow_none=False)
+
     @field_validator("fitness")
     @classmethod
     def validate_finite_fitness(cls, value: float) -> float:
@@ -107,6 +134,16 @@ class ParticleState(_FrozenModel):
     rng_state: JsonValue
     lifecycle_status: EpisodeStatus = EpisodeStatus.PENDING
 
+    @field_validator("position", "velocity")
+    @classmethod
+    def validate_positions(cls, value: JsonValue) -> JsonValue:
+        return _validate_finite_json(value, allow_none=False)
+
+    @field_validator("rng_state")
+    @classmethod
+    def validate_rng_state(cls, value: JsonValue) -> JsonValue:
+        return _validate_finite_json(value)
+
 
 class StageEvent(_FrozenModel):
     run_id: str = Field(min_length=1)
@@ -116,6 +153,11 @@ class StageEvent(_FrozenModel):
     attempt: int = Field(ge=0)
     event_type: str = Field(min_length=1)
     payload: Mapping[str, JsonValue] = Field(default_factory=dict)
+
+    @field_validator("payload")
+    @classmethod
+    def validate_payload(cls, value: JsonValue) -> JsonValue:
+        return _validate_finite_json(value)
 
 
 class AgentEpisode(_FrozenModel):
@@ -131,6 +173,16 @@ class AgentEpisode(_FrozenModel):
     events: tuple[StageEvent, ...] = ()
     status: EpisodeStatus
 
+    @field_validator("target_position", "evaluated_position")
+    @classmethod
+    def validate_required_positions(cls, value: JsonValue) -> JsonValue:
+        return _validate_finite_json(value, allow_none=False)
+
+    @field_validator("realized_position", "position_adherence")
+    @classmethod
+    def validate_json_fields(cls, value: JsonValue) -> JsonValue:
+        return _validate_finite_json(value)
+
 
 class IterationSnapshot(_FrozenModel):
     run_id: str = Field(min_length=1)
@@ -139,3 +191,8 @@ class IterationSnapshot(_FrozenModel):
     gbest: PersonalBest | None = None
     config_snapshot_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     rng_state: JsonValue
+
+    @field_validator("rng_state")
+    @classmethod
+    def validate_rng_state(cls, value: JsonValue) -> JsonValue:
+        return _validate_finite_json(value)
