@@ -103,8 +103,9 @@ class ContinuousBoxPositionSpace(PositionSpace[FloatArray, FloatArray]):
         upper_value = self._scalar(upper, name="upper")
         if upper_value < 0.0:
             raise ValueError("upper must be nonnegative")
+        velocity_values = self._array(velocity, name="velocity")
         factors = rng.uniform(0.0, upper_value, size=self._dimension)
-        return self._result(self._array(velocity, name="velocity") * factors)
+        return self._result(velocity_values * factors)
 
     def add_velocities(self, parts: Iterable[FloatArray]) -> FloatArray:
         total = np.zeros(self._dimension, dtype=np.float64)

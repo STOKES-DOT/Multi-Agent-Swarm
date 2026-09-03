@@ -162,6 +162,15 @@ def test_random_scale_uses_independent_per_dimension_coefficients() -> None:
     assert len(set(actual.tolist())) > 1
 
 
+def test_random_scale_does_not_advance_rng_when_velocity_is_invalid() -> None:
+    space = ContinuousBoxPositionSpace(lower=[0.0, 0.0], upper=[1.0, 1.0])
+    rng = np.random.default_rng(123)
+    reference_rng = np.random.default_rng(123)
+    with pytest.raises(ValueError):
+        space.random_scale(np.array([math.nan, 0.0]), upper=1.0, rng=rng)
+    assert rng.random() == reference_rng.random()
+
+
 def test_add_velocities_empty_is_zero_and_bad_member_is_rejected() -> None:
     space = ContinuousBoxPositionSpace(lower=[0.0, 0.0], upper=[1.0, 1.0])
     np.testing.assert_array_equal(space.add_velocities([]), np.zeros(2))
