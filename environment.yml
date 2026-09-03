@@ -4,3 +4,5 @@ channels:
 dependencies:
   - python=3.12
   - pip>=24
+variables:
+  PYTHONNOUSERSITE: "1"

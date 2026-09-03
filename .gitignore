@@ -13,3 +13,6 @@ htmlcov/
 runs/
 run-inputs/
 graphify-out/
+*.egg-info/
+build/
+dist/
