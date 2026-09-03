@@ -233,6 +233,67 @@ def test_stored_json_boundaries_are_deeply_immutable() -> None:
             stored_value["nested"] = {}  # type: ignore[index]
 
 
+def test_frozen_mapping_has_no_mutable_or_rebindable_backing_store() -> None:
+    evaluation = Evaluation(
+        status=EvaluationStatus.SUCCESS,
+        feasible=True,
+        fitness=1.0,
+        metrics={"nested": {"items": [1.0]}},
+    )
+    before = evaluation.model_dump(mode="json")
+    with pytest.raises((AttributeError, TypeError)):
+        evaluation.metrics._values["nested"]["items"].append(math.inf)  # type: ignore[attr-defined]
+    with pytest.raises((AttributeError, TypeError)):
+        evaluation.metrics._values["injected"] = math.inf  # type: ignore[attr-defined]
+    with pytest.raises(AttributeError):
+        evaluation.metrics._values = {}  # type: ignore[attr-defined]
+    assert evaluation.model_dump(mode="json") == before
+    assert json.loads(evaluation.model_dump_json()) == before
+
+
+def test_frozen_positions_can_be_reused_directly_by_core_models() -> None:
+    mapping_particle = ParticleState(
+        particle_id="mapping", position={"x": [0.0]}, velocity={}, rng_state={}
+    )
+    episode = AgentEpisode(
+        episode_id="ep1",
+        run_id="run1",
+        particle_id="mapping",
+        iteration_id=0,
+        target_position=mapping_particle.position,
+        evaluated_position=mapping_particle.position,
+        status=EpisodeStatus.PENDING,
+    )
+    list_particle = ParticleState(
+        particle_id="list", position=[0.0], velocity=[], rng_state={}
+    )
+    pbest = PersonalBest(
+        evaluated_position=list_particle.position,
+        candidate_reference="candidate-1",
+        hypothesis_reference="hypothesis-1",
+        evaluation_reference="evaluation-1",
+        candidate_hash="a" * 64,
+        fitness=1.0,
+        iteration_id=0,
+    )
+    assert episode.model_dump(mode="json")["target_position"] == {"x": [0.0]}
+    assert pbest.model_dump(mode="json")["evaluated_position"] == [0.0]
+
+
+def test_mutating_a_json_dump_cannot_change_stored_state() -> None:
+    evaluation = Evaluation(
+        status=EvaluationStatus.SUCCESS,
+        feasible=True,
+        fitness=1.0,
+        metrics={"nested": {"items": [1.0]}},
+    )
+    before = evaluation.model_dump(mode="json")
+    dumped = evaluation.model_dump(mode="json")
+    dumped["metrics"]["nested"]["items"].append(math.inf)
+    assert evaluation.model_dump(mode="json") == before
+    assert json.loads(evaluation.model_dump_json()) == before
+
+
 def test_json_boundaries_are_isolated_from_source_mutation() -> None:
     source = {"nested": {"items": [1]}}
     evaluation = Evaluation(

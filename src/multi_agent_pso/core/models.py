@@ -3,6 +3,7 @@
 import math
 from enum import StrEnum
 from pathlib import PurePath
+from types import MappingProxyType
 from typing import Mapping
 
 from pydantic import (
@@ -45,8 +46,13 @@ class EpisodeStatus(StrEnum):
 class _FrozenDict(Mapping[str, object]):
     """A dependency-free immutable mapping for nested JSON state."""
 
+    __slots__ = ("_values",)
+
     def __init__(self, values: Mapping[str, object]) -> None:
-        self._values = dict(values)
+        object.__setattr__(self, "_values", MappingProxyType(dict(values)))
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError(f"{type(self).__name__} is immutable")
 
     def __getitem__(self, key: str) -> object:
         return self._values[key]
@@ -89,12 +95,17 @@ def _freeze_finite_json(value: JsonValue, *, allow_none: bool = True) -> JsonVal
     return _freeze_json(_validate_finite_json(value, allow_none=allow_none))
 
 
-def _thaw_json(value: JsonValue) -> JsonValue:
+def _thaw_json(value: object) -> object:
     if isinstance(value, Mapping):
         return {key: _thaw_json(nested) for key, nested in value.items()}
-    if isinstance(value, tuple):
-        return [_thaw_json(nested) for nested in value]  # type: ignore[return-value]
+    if isinstance(value, (list, tuple)):
+        return [_thaw_json(nested) for nested in value]
     return value
+
+
+def _normalize_json_input(value: object) -> object:
+    """Convert values frozen by another core record back into JSON input."""
+    return _thaw_json(value)
 
 
 class _FrozenModel(BaseModel):
@@ -116,6 +127,11 @@ class Evaluation(_FrozenModel):
     uncertainty: JsonValue | None = None
     provenance: Mapping[str, JsonValue] = Field(default_factory=dict)
 
+    @field_validator("metrics", "provenance", "uncertainty", mode="before")
+    @classmethod
+    def normalize_json_fields(cls, value: object) -> object:
+        return _normalize_json_input(value)
+
     @field_validator("metrics", "provenance", "uncertainty")
     @classmethod
     def validate_json_fields(cls, value: JsonValue) -> JsonValue:
@@ -123,7 +139,7 @@ class Evaluation(_FrozenModel):
 
     @field_serializer("metrics", "provenance", "uncertainty")
     def serialize_json_fields(self, value: JsonValue) -> JsonValue:
-        return _thaw_json(value)
+        return _thaw_json(value)  # type: ignore[return-value]
 
     @model_validator(mode="after")
     def validate_fitness_for_status(self) -> "Evaluation":
@@ -159,6 +175,11 @@ class PersonalBest(_FrozenModel):
     fitness: float
     iteration_id: int = Field(ge=0)
 
+    @field_validator("evaluated_position", mode="before")
+    @classmethod
+    def normalize_evaluated_position(cls, value: object) -> object:
+        return _normalize_json_input(value)
+
     @field_validator("evaluated_position")
     @classmethod
     def validate_evaluated_position(cls, value: JsonValue) -> JsonValue:
@@ -166,7 +187,7 @@ class PersonalBest(_FrozenModel):
 
     @field_serializer("evaluated_position")
     def serialize_evaluated_position(self, value: JsonValue) -> JsonValue:
-        return _thaw_json(value)
+        return _thaw_json(value)  # type: ignore[return-value]
 
     @field_validator("fitness")
     @classmethod
@@ -188,6 +209,11 @@ class ParticleState(_FrozenModel):
     rng_state: JsonValue
     lifecycle_status: EpisodeStatus = EpisodeStatus.PENDING
 
+    @field_validator("position", "velocity", "rng_state", mode="before")
+    @classmethod
+    def normalize_json_fields(cls, value: object) -> object:
+        return _normalize_json_input(value)
+
     @field_validator("position", "velocity")
     @classmethod
     def validate_positions(cls, value: JsonValue) -> JsonValue:
@@ -200,7 +226,7 @@ class ParticleState(_FrozenModel):
 
     @field_serializer("position", "velocity", "rng_state")
     def serialize_json_fields(self, value: JsonValue) -> JsonValue:
-        return _thaw_json(value)
+        return _thaw_json(value)  # type: ignore[return-value]
 
 
 class StageEvent(_FrozenModel):
@@ -212,6 +238,11 @@ class StageEvent(_FrozenModel):
     event_type: str = Field(min_length=1)
     payload: Mapping[str, JsonValue] = Field(default_factory=dict)
 
+    @field_validator("payload", mode="before")
+    @classmethod
+    def normalize_payload(cls, value: object) -> object:
+        return _normalize_json_input(value)
+
     @field_validator("payload")
     @classmethod
     def validate_payload(cls, value: JsonValue) -> JsonValue:
@@ -219,7 +250,7 @@ class StageEvent(_FrozenModel):
 
     @field_serializer("payload")
     def serialize_payload(self, value: JsonValue) -> JsonValue:
-        return _thaw_json(value)
+        return _thaw_json(value)  # type: ignore[return-value]
 
 
 class AgentEpisode(_FrozenModel):
@@ -234,6 +265,17 @@ class AgentEpisode(_FrozenModel):
     evaluation: Evaluation | None = None
     events: tuple[StageEvent, ...] = ()
     status: EpisodeStatus
+
+    @field_validator(
+        "target_position",
+        "realized_position",
+        "evaluated_position",
+        "position_adherence",
+        mode="before",
+    )
+    @classmethod
+    def normalize_json_fields(cls, value: object) -> object:
+        return _normalize_json_input(value)
 
     @field_validator("target_position", "evaluated_position")
     @classmethod
@@ -252,7 +294,7 @@ class AgentEpisode(_FrozenModel):
         "position_adherence",
     )
     def serialize_json_fields(self, value: JsonValue) -> JsonValue:
-        return _thaw_json(value)
+        return _thaw_json(value)  # type: ignore[return-value]
 
 
 class IterationSnapshot(_FrozenModel):
@@ -263,6 +305,11 @@ class IterationSnapshot(_FrozenModel):
     config_snapshot_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     rng_state: JsonValue
 
+    @field_validator("rng_state", mode="before")
+    @classmethod
+    def normalize_rng_state(cls, value: object) -> object:
+        return _normalize_json_input(value)
+
     @field_validator("rng_state")
     @classmethod
     def validate_rng_state(cls, value: JsonValue) -> JsonValue:
@@ -270,4 +317,4 @@ class IterationSnapshot(_FrozenModel):
 
     @field_serializer("rng_state")
     def serialize_rng_state(self, value: JsonValue) -> JsonValue:
-        return _thaw_json(value)
+        return _thaw_json(value)  # type: ignore[return-value]
