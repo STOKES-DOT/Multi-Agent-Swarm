@@ -33,6 +33,10 @@ retry:
 thread:
   max_turns: 4
   max_context_tokens: 1024
+snapshot:
+  max_files: 10000
+  max_file_bytes: 67108864
+  max_total_bytes: 536870912
 storage:
   runs_directory: runs
 plugins:
@@ -40,3 +44,5 @@ plugins:
   task_adapter: tests.fixtures.tasks.quadratic.plugin:create_task_adapter
   evaluator: tests.fixtures.tasks.quadratic.plugin:create_evaluator
   tool_provider: tests.fixtures.tasks.quadratic.plugin:create_tool_provider
+  source_files:
+    - helper.py

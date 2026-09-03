@@ -80,6 +80,12 @@ class ThreadConfig(StrictFrozenModel):
     max_context_tokens: PositiveInt = 1024
 
 
+class SnapshotConfig(StrictFrozenModel):
+    max_files: PositiveInt = 10_000
+    max_file_bytes: PositiveInt = 64 * 1024 * 1024
+    max_total_bytes: PositiveInt = 512 * 1024 * 1024
+
+
 class StorageConfig(StrictFrozenModel):
     runs_directory: Path
 
@@ -89,6 +95,7 @@ class PluginConfig(StrictFrozenModel):
     task_adapter: NonEmptyString
     evaluator: NonEmptyString
     tool_provider: NonEmptyString
+    source_files: tuple[Path, ...] = ()
 
 
 class RunSpec(StrictFrozenModel):
@@ -99,6 +106,7 @@ class RunSpec(StrictFrozenModel):
     concurrency: ConcurrencyConfig
     retry: RetryConfig
     thread: ThreadConfig
+    snapshot: SnapshotConfig = SnapshotConfig()
     storage: StorageConfig
     plugins: PluginConfig
 
@@ -110,6 +118,7 @@ __all__ = [
     "PsoConfig",
     "RetryConfig",
     "RunSpec",
+    "SnapshotConfig",
     "StorageConfig",
     "TaskConfig",
     "ThreadConfig",

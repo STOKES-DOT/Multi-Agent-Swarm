@@ -6,6 +6,8 @@ from collections.abc import Mapping
 
 from pydantic import JsonValue
 
+from .helper import SCALE
+
 from multi_agent_pso.core import (
     AgentStage,
     ContinuousBoxPositionSpace,
@@ -33,7 +35,7 @@ class QuadraticTaskAdapter:
     def build_stage_request(
         self, stage: AgentStage, context: Mapping[str, JsonValue]
     ) -> StageRequest:
-        return StageRequest(stage, "quadratic")
+        return StageRequest(stage, f"quadratic-{SCALE}")
 
     def parse_stage_response(
         self, stage: AgentStage, response: StageResponse
@@ -113,3 +115,14 @@ def create_bad_position_space() -> BadPositionSpace:
 
 def create_sync_position_space() -> SyncPositionSpace:
     return SyncPositionSpace()
+
+
+noncallable_factory = None
+
+
+def create_required_position_space(required: object) -> ContinuousBoxPositionSpace:
+    return create_position_space()
+
+
+async def create_async_position_space() -> ContinuousBoxPositionSpace:
+    return create_position_space()

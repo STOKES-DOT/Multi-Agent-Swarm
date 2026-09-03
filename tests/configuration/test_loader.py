@@ -38,8 +38,11 @@ def _task_yaml(
     schemas: tuple[str, ...] = (),
     position_space: str = "create_position_space",
     plugin_module: str = PLUGIN_MODULE,
+    source_files: tuple[str, ...] = ("helper.py",),
+    snapshot: str = "max_files: 10000\n  max_file_bytes: 67108864\n  max_total_bytes: 536870912",
 ) -> str:
     schema_lines = "[]" if not schemas else "\n" + "\n".join(f"    - {schema}" for schema in schemas)
+    source_lines = "[]" if not source_files else "\n" + "\n".join(f"    - {source}" for source in source_files)
     return f"""\
 task:
   name: quadratic
@@ -75,6 +78,8 @@ retry:
 thread:
   max_turns: 4
   max_context_tokens: 1024
+snapshot:
+  {snapshot}
 storage:
   runs_directory: runs
 plugins:
@@ -82,11 +87,16 @@ plugins:
   task_adapter: "{plugin_module}:create_task_adapter"
   evaluator: "{plugin_module}:create_evaluator"
   tool_provider: "{plugin_module}:create_tool_provider"
+  source_files: {source_lines}
 """
 
 
 def _write_task(tmp_path: Path, text: str | None = None) -> Path:
     (tmp_path / "prompt.md").write_text("deterministic task prompt\n", encoding="utf-8")
+    (tmp_path / "helper.py").write_text(
+        '"""Explicitly declared helper source for the trusted fixture plugin."""\n\nSCALE = 1\n',
+        encoding="utf-8",
+    )
     task = tmp_path / "task.yaml"
     task.write_text(text or _task_yaml(), encoding="utf-8")
     return task
@@ -372,11 +382,13 @@ def test_snapshot_manifest_tracks_plugin_source_bytes(tmp_path: Path, monkeypatc
     ):
         setattr(module, attribute, getattr(actual, attribute))
     monkeypatch.setattr(configuration_loader.importlib, "import_module", lambda _: module)
+    monkeypatch.setattr(configuration_loader.importlib.util, "find_spec", lambda _: module.__spec__)
 
     task = _write_task(tmp_path, _task_yaml(plugin_module=module_name))
-    first = load_task_package(task)
+    load_task_package(task)
     source.write_bytes(b"# second source\n")
-    assert load_task_package(task).snapshot_hash != first.snapshot_hash
+    with pytest.raises(RuntimeError, match="source changed.*restart"):
+        load_task_package(task)
 
 
 def test_snapshot_hash_tracks_configured_skill_and_wiki_content(tmp_path: Path) -> None:
@@ -440,3 +452,83 @@ def test_snapshot_hash_ignores_absolute_package_and_storage_locations(tmp_path: 
     storage_a = load_task_package(source_task).snapshot_hash
     source_task.write_text(_task_yaml().replace("runs_directory: runs", "runs_directory: output-b"), encoding="utf-8")
     assert load_task_package(source_task).snapshot_hash == storage_a
+
+
+def test_loader_rejects_cached_plugin_module_when_direct_source_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    actual = __import__(PLUGIN_MODULE, fromlist=["create_position_space"])
+    source = tmp_path / "direct.py"
+    source.write_bytes(b"# direct one\n")
+    module_name = "cached_source_plugin"
+    module = ModuleType(module_name)
+    module.__spec__ = SimpleNamespace(origin=str(source))
+    for name in ("create_position_space", "create_task_adapter", "create_evaluator", "create_tool_provider"):
+        setattr(module, name, getattr(actual, name))
+    monkeypatch.setattr(configuration_loader.importlib, "import_module", lambda _: module)
+    monkeypatch.setattr(configuration_loader.importlib.util, "find_spec", lambda _: module.__spec__)
+
+    task = _write_task(tmp_path, _task_yaml(plugin_module=module_name))
+    load_task_package(task)
+    source.write_bytes(b"# direct two\n")
+    with pytest.raises(RuntimeError, match="source changed.*restart"):
+        load_task_package(task)
+
+
+def test_declared_plugin_source_is_hashed_fresh_and_rejected_when_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    actual = __import__(PLUGIN_MODULE, fromlist=["create_position_space"])
+    source = tmp_path / "direct.py"
+    source.write_bytes(b"# direct\n")
+    module_name = "declared_source_plugin"
+    module = ModuleType(module_name)
+    module.__spec__ = SimpleNamespace(origin=str(source))
+    for name in ("create_position_space", "create_task_adapter", "create_evaluator", "create_tool_provider"):
+        setattr(module, name, getattr(actual, name))
+    monkeypatch.setattr(configuration_loader.importlib, "import_module", lambda _: module)
+    monkeypatch.setattr(configuration_loader.importlib.util, "find_spec", lambda _: module.__spec__)
+    monkeypatch.setattr(configuration_loader, "_MODULE_FINGERPRINTS", {})
+
+    task = _write_task(tmp_path, _task_yaml(plugin_module=module_name))
+    first = load_task_package(task)
+    helper = tmp_path / "helper.py"
+    helper.write_bytes(b"SCALE = 2\n")
+    with pytest.raises(RuntimeError, match="source changed.*restart"):
+        load_task_package(task)
+
+    monkeypatch.setattr(configuration_loader, "_MODULE_FINGERPRINTS", {})
+    changed = load_task_package(task)
+    assert changed.snapshot_hash != first.snapshot_hash
+    assert any(entry.role == "plugin-source:0" for entry in changed.manifest.entries)
+
+
+def test_snapshot_entries_keep_only_metadata_and_enforce_limits(tmp_path: Path) -> None:
+    task = _write_task(tmp_path)
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    (wiki / "a.md").write_bytes(b"abc")
+    (wiki / "b.md").write_bytes(b"defg")
+    task.write_text(_task_yaml().replace("path: null", "path: wiki"), encoding="utf-8")
+    package = load_task_package(task)
+    wiki_entries = [entry for entry in package.manifest.entries if entry.role == "wiki"]
+    assert [entry.path for entry in wiki_entries] == ["a.md", "b.md"]
+    assert [entry.size_bytes for entry in wiki_entries] == [3, 4]
+    assert not hasattr(wiki_entries[0], "bytes")
+
+    task.write_text(_task_yaml(snapshot="max_files: 1\n  max_file_bytes: 67108864\n  max_total_bytes: 536870912"), encoding="utf-8")
+    with pytest.raises(ValueError, match="max_files"):
+        load_task_package(task)
+    task.write_text(_task_yaml(snapshot="max_files: 10000\n  max_file_bytes: 1\n  max_total_bytes: 536870912"), encoding="utf-8")
+    with pytest.raises(ValueError, match="max_file_bytes"):
+        load_task_package(task)
+    task.write_text(_task_yaml(snapshot="max_files: 10000\n  max_file_bytes: 67108864\n  max_total_bytes: 1"), encoding="utf-8")
+    with pytest.raises(ValueError, match="max_total_bytes"):
+        load_task_package(task)
+
+
+@pytest.mark.parametrize("factory", ["missing_factory", "noncallable_factory", "create_required_position_space", "create_async_position_space"])
+def test_loader_rejects_invalid_plugin_factories(tmp_path: Path, factory: str) -> None:
+    task = _write_task(tmp_path, _task_yaml(position_space=factory))
+    with pytest.raises((TypeError, ValueError)):
+        load_task_package(task)
