@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import tempfile
+import errno
+import stat
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
+from secrets import token_hex
 
 from pydantic import JsonValue
 
@@ -30,6 +32,9 @@ def _relative_parts(value: object) -> tuple[str, ...]:
         raise TypeError("relative_path must be a string")
     if not value or "\\" in value:
         raise ValueError("relative_path must be a nonempty POSIX path")
+    raw_parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in raw_parts):
+        raise ValueError("relative_path must not contain empty, dot, or dot-dot segments")
     path = PurePosixPath(value)
     if not path.parts or path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         raise ValueError("relative_path must be a normalized path below the artifact root")
@@ -63,36 +68,49 @@ class FileArtifactStore:
 
     def __init__(self, root: Path) -> None:
         self._root = _require_root(root)
+        self._require_secure_dir_fd_support()
 
     def publish_bytes(self, relative_path: str, data: bytes, media_type: str) -> ArtifactRef:
         if not isinstance(data, bytes):
             raise TypeError("data must be bytes")
         parts = _relative_parts(relative_path)
         media = _require_media_type(media_type)
-        target_parent = self._safe_parent(parts[:-1])
-        target = target_parent / parts[-1]
-        self._refuse_existing(target)
-
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=".multi-agent-pso-", suffix=".tmp", dir=target_parent
-        )
-        temporary = Path(temporary_name)
+        root_fd = self._open_root()
+        parent_fd = root_fd
+        temporary_name: str | None = None
         try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-            # link(2) is create-if-absent, unlike replace-based publication.
-            os.link(temporary, target, follow_symlinks=False)
-            temporary.unlink()
-            self._fsync_directory(target_parent)
-        except BaseException:
-            # This is our own sibling temporary only.  Never remove user targets.
+            parent_fd = self._open_parent(root_fd, parts[:-1])
+            self._refuse_existing(parent_fd, parts[-1])
+            temporary_name, temporary_fd = self._create_temporary(parent_fd)
             try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
+                self._write_all(temporary_fd, data)
+                os.fsync(temporary_fd)
+            finally:
+                os.close(temporary_fd)
+            # dir_fd arguments retain the verified directory even if its visible
+            # pathname is replaced with a symlink between parent traversal and link.
+            os.link(
+                temporary_name,
+                parts[-1],
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            os.unlink(temporary_name, dir_fd=parent_fd)
+            temporary_name = None
+            os.fsync(parent_fd)
+        except BaseException:
+            if temporary_name is not None:
+                # This is our own sibling temporary only. Never remove user targets.
+                try:
+                    os.unlink(temporary_name, dir_fd=parent_fd)
+                except OSError:
+                    pass
             raise
+        finally:
+            if parent_fd != root_fd:
+                os.close(parent_fd)
+            os.close(root_fd)
 
         return ArtifactRef(
             relative_path="/".join(parts),
@@ -124,33 +142,96 @@ class FileArtifactStore:
             raise ValueError("payload must be finite JSON") from error
         return self.publish_bytes(relative_path, serialized, "application/json")
 
-    def _safe_parent(self, parts: tuple[str, ...]) -> Path:
-        current = self._root
-        for part in parts:
-            candidate = current / part
-            if candidate.exists() or candidate.is_symlink():
-                if candidate.is_symlink():
-                    raise ValueError("artifact path contains a symlink")
-                if not candidate.is_dir():
-                    raise FileExistsError(f"artifact parent is not a directory: {candidate}")
-            else:
-                candidate.mkdir()
-            current = candidate
-        # The lexical parts above and this resolved-prefix check prevent root escape.
-        if self._root not in (current, *current.parents):
-            raise ValueError("artifact path escapes configured root")
-        return current
-
     @staticmethod
-    def _refuse_existing(target: Path) -> None:
-        if target.exists() or target.is_symlink():
-            raise FileExistsError(f"artifact already exists: {target}")
+    def _require_secure_dir_fd_support() -> None:
+        required_flags = ("O_DIRECTORY", "O_NOFOLLOW")
+        required_functions = (os.open, os.mkdir, os.unlink, os.link, os.stat)
+        if (
+            any(not hasattr(os, flag) for flag in required_flags)
+            or any(function not in os.supports_dir_fd for function in required_functions)
+            or os.link not in os.supports_follow_symlinks
+        ):
+            raise RuntimeError("secure dir_fd artifact publication is unsupported on this platform")
 
-    @staticmethod
-    def _fsync_directory(directory: Path) -> None:
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        descriptor = os.open(directory, flags)
+    def _open_root(self) -> int:
         try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+            return os.open(self._root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise ValueError("artifact root must not be a symlink") from error
+            raise
+
+    @staticmethod
+    def _open_parent(root_fd: int, parts: tuple[str, ...]) -> int:
+        current_fd = root_fd
+        try:
+            for part in parts:
+                try:
+                    child_fd = os.open(
+                        part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current_fd
+                    )
+                except FileNotFoundError:
+                    try:
+                        os.mkdir(part, dir_fd=current_fd)
+                    except FileExistsError:
+                        pass
+                    try:
+                        child_fd = os.open(
+                            part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current_fd
+                        )
+                    except OSError as error:
+                        FileArtifactStore._raise_parent_open_error(error, current_fd, part)
+                        raise AssertionError("unreachable")
+                except OSError as error:
+                    FileArtifactStore._raise_parent_open_error(error, current_fd, part)
+                    raise AssertionError("unreachable")
+                if current_fd != root_fd:
+                    os.close(current_fd)
+                current_fd = child_fd
+            return current_fd
+        except BaseException:
+            if current_fd != root_fd:
+                os.close(current_fd)
+            raise
+
+    @staticmethod
+    def _raise_parent_open_error(error: OSError, parent_fd: int, part: str) -> None:
+        if error.errno == errno.ELOOP:
+            raise ValueError("artifact path contains a symlink") from error
+        if error.errno == errno.ENOTDIR:
+            try:
+                metadata = os.stat(part, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError:
+                metadata = None
+            if metadata is not None and stat.S_ISLNK(metadata.st_mode):
+                raise ValueError("artifact path contains a symlink") from error
+            raise FileExistsError("artifact parent is not a directory") from error
+        raise error
+
+    @staticmethod
+    def _refuse_existing(parent_fd: int, target_name: str) -> None:
+        try:
+            os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        raise FileExistsError(f"artifact already exists: {target_name}")
+
+    @staticmethod
+    def _create_temporary(parent_fd: int) -> tuple[str, int]:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        for _ in range(32):
+            name = f".multi-agent-pso-{token_hex(16)}.tmp"
+            try:
+                return name, os.open(name, flags, 0o600, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+        raise FileExistsError("unable to allocate unique artifact temporary file")
+
+    @staticmethod
+    def _write_all(descriptor: int, data: bytes) -> None:
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("failed to write artifact payload")
+            view = view[written:]

@@ -88,6 +88,27 @@ def test_schema_and_parameterized_ids_preserve_database_integrity(tmp_path: Path
         assert connection.execute("SELECT run_id FROM runs").fetchone() == (injected,)
 
 
+def test_new_database_records_supported_schema_version_and_reopens(tmp_path: Path) -> None:
+    path = tmp_path / "runs.sqlite"
+    SQLiteRunStore(path)
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT schema_version FROM schema_metadata").fetchall() == [(1,)]
+
+    SQLiteRunStore(path).create_run("run-1", "a" * 64)
+
+
+def test_store_rejects_unsupported_schema_version_before_operations(tmp_path: Path) -> None:
+    path = tmp_path / "runs.sqlite"
+    SQLiteRunStore(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE schema_metadata SET schema_version = 999")
+        connection.commit()
+
+    with pytest.raises(RuntimeError, match="unsupported schema version"):
+        SQLiteRunStore(path)
+
+
 @pytest.mark.parametrize("bad_iteration", [True, -1, 1.5])
 def test_store_rejects_invalid_iteration_ids(tmp_path: Path, bad_iteration: object) -> None:
     store = SQLiteRunStore(tmp_path / "runs.sqlite")

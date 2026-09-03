@@ -76,6 +76,10 @@ def _canonical_json(payload: object) -> str:
 
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS schema_metadata (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    schema_version INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY,
     snapshot_hash TEXT NOT NULL
@@ -152,6 +156,8 @@ CREATE TABLE IF NOT EXISTS artifact_index (
 );
 """
 
+_SCHEMA_VERSION = 1
+
 
 class SQLiteRunStore:
     """A short-lived-connection SQLite store with explicit iteration boundaries."""
@@ -161,8 +167,24 @@ class SQLiteRunStore:
         connection = self._connect()
         try:
             connection.execute("PRAGMA journal_mode=WAL")
-            connection.executescript(_SCHEMA)
+            connection.execute("BEGIN IMMEDIATE")
+            for statement in _SCHEMA.split(";"):
+                if statement.strip():
+                    connection.execute(statement)
+            rows = connection.execute(
+                "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+            ).fetchall()
+            if not rows:
+                connection.execute(
+                    "INSERT INTO schema_metadata (singleton, schema_version) VALUES (1, ?)",
+                    (_SCHEMA_VERSION,),
+                )
+            elif len(rows) != 1 or rows[0]["schema_version"] != _SCHEMA_VERSION:
+                raise RuntimeError("unsupported schema version")
             connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 

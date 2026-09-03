@@ -24,7 +24,10 @@ def test_artifact_store_refuses_overwrite(tmp_path: Path) -> None:
     assert json.loads((tmp_path / ref.relative_path).read_text()) == {"value": 1}
 
 
-@pytest.mark.parametrize("path", ["", ".", "../escape", "/absolute", "a/../b", r"a\\b"])
+@pytest.mark.parametrize(
+    "path",
+    ["", ".", "../escape", "/absolute", "a/../b", "a//b", "a/./b", "a/b/", r"a\\b"],
+)
 def test_artifact_store_rejects_ambiguous_or_escaping_paths(tmp_path: Path, path: str) -> None:
     store = FileArtifactStore(tmp_path)
 
@@ -85,6 +88,29 @@ def test_artifact_store_rejects_existing_symlink_parent(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="symlink"):
         store.publish_bytes("linked/payload", b"x", "application/octet-stream")
     assert not (outside / "payload").exists()
+
+
+def test_artifact_store_does_not_follow_parent_swapped_to_symlink_before_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The publication directory FD remains authoritative across a pathname swap."""
+    store = FileArtifactStore(tmp_path)
+    (tmp_path / "nested").mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    real_link = os.link
+
+    def swap_parent_then_link(source: object, destination: object, *args: object, **kwargs: object) -> None:
+        (tmp_path / "nested").rename(tmp_path / "nested-real")
+        (tmp_path / "nested").symlink_to(external, target_is_directory=True)
+        real_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", swap_parent_then_link)
+
+    store.publish_bytes("nested/result.bin", b"safe", "application/octet-stream")
+
+    assert not (external / "result.bin").exists()
+    assert (tmp_path / "nested-real" / "result.bin").read_bytes() == b"safe"
 
 
 def test_artifact_store_two_writers_create_exactly_one_target(tmp_path: Path) -> None:
