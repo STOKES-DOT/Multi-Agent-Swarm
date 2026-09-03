@@ -26,6 +26,7 @@ class TaskConfig(StrictFrozenModel):
     name: NonEmptyString
     version: NonEmptyString
     prompt: Path
+    schemas: tuple[Path, ...] = ()
 
 
 class AgentConfig(StrictFrozenModel):

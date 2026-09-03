@@ -1,6 +1,6 @@
 """Strict task-package configuration and trusted plugin loading."""
 
-from .loader import LoadedPlugins, TaskPackage, load_task_package
+from .loader import LoadedPlugins, SnapshotEntry, SnapshotManifest, TaskPackage, load_task_package
 from .models import (
     AgentConfig,
     ConcurrencyConfig,
@@ -23,6 +23,8 @@ __all__ = [
     "PsoConfig",
     "RetryConfig",
     "RunSpec",
+    "SnapshotEntry",
+    "SnapshotManifest",
     "StorageConfig",
     "TaskConfig",
     "TaskPackage",

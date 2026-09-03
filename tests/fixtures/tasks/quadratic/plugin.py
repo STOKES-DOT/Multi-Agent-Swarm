@@ -27,6 +27,9 @@ from multi_agent_pso.protocols import (
 
 
 class QuadraticTaskAdapter:
+    def __init__(self) -> None:
+        self.state = "fresh"
+
     def build_stage_request(
         self, stage: AgentStage, context: Mapping[str, JsonValue]
     ) -> StageRequest:
@@ -84,10 +87,29 @@ class SyncPositionSpace:
         return (0.0, 0.0)
 
 
-position_space = ContinuousBoxPositionSpace([-1, -1], [1, 1])
-position_space_alias = position_space
-task_adapter = QuadraticTaskAdapter()
-evaluator = QuadraticEvaluator()
-tool_provider: ToolProvider = QuadraticToolProvider()
-bad_position_space = BadPositionSpace()
-sync_position_space = SyncPositionSpace()
+def create_position_space() -> ContinuousBoxPositionSpace:
+    return ContinuousBoxPositionSpace([-1, -1], [1, 1])
+
+
+def create_position_space_alias() -> ContinuousBoxPositionSpace:
+    return create_position_space()
+
+
+def create_task_adapter() -> QuadraticTaskAdapter:
+    return QuadraticTaskAdapter()
+
+
+def create_evaluator() -> QuadraticEvaluator:
+    return QuadraticEvaluator()
+
+
+def create_tool_provider() -> ToolProvider:
+    return QuadraticToolProvider()
+
+
+def create_bad_position_space() -> BadPositionSpace:
+    return BadPositionSpace()
+
+
+def create_sync_position_space() -> SyncPositionSpace:
+    return SyncPositionSpace()

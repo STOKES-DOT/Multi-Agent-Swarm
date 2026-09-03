@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import shutil
+from types import ModuleType, SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,7 @@ import yaml
 from pydantic import ValidationError
 
 from multi_agent_pso.configuration import load_task_package
+import multi_agent_pso.configuration.loader as configuration_loader
 from multi_agent_pso.configuration.models import (
     AgentConfig,
     ConcurrencyConfig,
@@ -29,12 +32,20 @@ FIXTURE_TASK = Path("tests/fixtures/tasks/quadratic/task.yaml")
 PLUGIN_MODULE = "tests.fixtures.tasks.quadratic.plugin"
 
 
-def _task_yaml(*, prompt: str = "prompt.md", position_space: str = "position_space") -> str:
+def _task_yaml(
+    *,
+    prompt: str = "prompt.md",
+    schemas: tuple[str, ...] = (),
+    position_space: str = "create_position_space",
+    plugin_module: str = PLUGIN_MODULE,
+) -> str:
+    schema_lines = "[]" if not schemas else "\n" + "\n".join(f"    - {schema}" for schema in schemas)
     return f"""\
 task:
   name: quadratic
   version: v1
   prompt: {prompt}
+  schemas: {schema_lines}
 agent:
   model: deterministic-test
   skills: []
@@ -67,10 +78,10 @@ thread:
 storage:
   runs_directory: runs
 plugins:
-  position_space: "{PLUGIN_MODULE}:{position_space}"
-  task_adapter: "{PLUGIN_MODULE}:task_adapter"
-  evaluator: "{PLUGIN_MODULE}:evaluator"
-  tool_provider: "{PLUGIN_MODULE}:tool_provider"
+  position_space: "{plugin_module}:{position_space}"
+  task_adapter: "{plugin_module}:create_task_adapter"
+  evaluator: "{plugin_module}:create_evaluator"
+  tool_provider: "{plugin_module}:create_tool_provider"
 """
 
 
@@ -219,7 +230,7 @@ def test_configured_wiki_and_skill_paths_must_exist_and_are_resolved(tmp_path: P
     ["", "module", ":attribute", "module:", ".module:attribute", "module:attr:extra", "bad-module:attribute"],
 )
 def test_loader_rejects_malformed_entrypoints(tmp_path: Path, entrypoint: str) -> None:
-    task = _write_task(tmp_path, _task_yaml().replace(f"{PLUGIN_MODULE}:position_space", entrypoint))
+    task = _write_task(tmp_path, _task_yaml().replace(f"{PLUGIN_MODULE}:create_position_space", entrypoint))
     with pytest.raises(ValueError, match="position_space|entrypoint"):
         load_task_package(task)
 
@@ -247,7 +258,7 @@ def test_loader_imports_and_validates_all_plugins() -> None:
     assert package.plugins.tool_provider.__class__.__name__ == "QuadraticToolProvider"
 
 
-@pytest.mark.parametrize("position_space", ["bad_position_space", "sync_position_space"])
+@pytest.mark.parametrize("position_space", ["create_bad_position_space", "create_sync_position_space"])
 def test_loader_rejects_bad_plugin_shapes_before_run(tmp_path: Path, position_space: str) -> None:
     task = _write_task(tmp_path, _task_yaml(position_space=position_space))
     with pytest.raises(TypeError):
@@ -278,7 +289,7 @@ def test_snapshot_hash_is_canonical_and_tracks_relevant_content(tmp_path: Path) 
     task.write_text(_task_yaml(), encoding="utf-8")
     entrypoint_base = load_task_package(task)
     task.write_text(
-        _task_yaml(position_space="position_space_alias"),
+        _task_yaml(position_space="create_position_space_alias"),
         encoding="utf-8",
     )
     assert load_task_package(task).snapshot_hash != entrypoint_base.snapshot_hash
@@ -303,3 +314,129 @@ def test_loaded_records_are_frozen_and_normalized(tmp_path: Path) -> None:
     with pytest.raises(ValidationError):
         package.spec.task.name = "mutated"
     assert isinstance(package.spec.agent.skills, tuple)
+
+
+def test_loader_rejects_duplicate_yaml_keys_at_any_depth(tmp_path: Path) -> None:
+    config = tmp_path / "task.yaml"
+    config.write_text(
+        "task:\n  name: quadratic\n  name: duplicate\n  version: v1\n  prompt: prompt.md\n",
+        encoding="utf-8",
+    )
+    with pytest.raises((ValueError, yaml.YAMLError), match="duplicate key"):
+        load_task_package(config)
+
+
+def test_loader_creates_isolated_plugin_instances() -> None:
+    first = load_task_package(FIXTURE_TASK)
+    second = load_task_package(FIXTURE_TASK)
+    assert first.plugins.position_space is not second.plugins.position_space
+    assert first.plugins.task_adapter is not second.plugins.task_adapter
+    assert first.plugins.evaluator is not second.plugins.evaluator
+    assert first.plugins.tool_provider is not second.plugins.tool_provider
+
+    first.plugins.task_adapter.state = "mutated"  # type: ignore[attr-defined]
+    assert second.plugins.task_adapter.state == "fresh"  # type: ignore[attr-defined]
+
+
+def test_snapshot_manifest_tracks_package_schema_and_retains_verified_bytes(tmp_path: Path) -> None:
+    task = _write_task(tmp_path, _task_yaml(schemas=("result.schema.json",)))
+    schema = tmp_path / "result.schema.json"
+    schema.write_bytes(b'{"type":"object"}\n')
+
+    package = load_task_package(task)
+    assert package.prompt_bytes == b"deterministic task prompt\n"
+    assert package.schema_bytes == (b'{"type":"object"}\n',)
+    assert {entry.role for entry in package.manifest.entries} >= {"prompt", "schema:0"}
+
+    schema.write_bytes(b'{"type":"string"}\n')
+    changed = load_task_package(task)
+    assert changed.snapshot_hash != package.snapshot_hash
+
+    (tmp_path / "prompt.md").write_bytes(b"changed after load\n")
+    assert package.prompt_bytes == b"deterministic task prompt\n"
+    assert package.schema_bytes == (b'{"type":"object"}\n',)
+
+
+def test_snapshot_manifest_tracks_plugin_source_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    actual = __import__(PLUGIN_MODULE, fromlist=["create_position_space"])
+    source = tmp_path / "isolated_plugin.py"
+    source.write_bytes(b"# first source\n")
+    module_name = "isolated_configuration_plugin"
+    module = ModuleType(module_name)
+    module.__spec__ = SimpleNamespace(origin=str(source))
+    for attribute in (
+        "create_position_space",
+        "create_task_adapter",
+        "create_evaluator",
+        "create_tool_provider",
+    ):
+        setattr(module, attribute, getattr(actual, attribute))
+    monkeypatch.setattr(configuration_loader.importlib, "import_module", lambda _: module)
+
+    task = _write_task(tmp_path, _task_yaml(plugin_module=module_name))
+    first = load_task_package(task)
+    source.write_bytes(b"# second source\n")
+    assert load_task_package(task).snapshot_hash != first.snapshot_hash
+
+
+def test_snapshot_hash_tracks_configured_skill_and_wiki_content(tmp_path: Path) -> None:
+    task = _write_task(tmp_path)
+    skill_file = tmp_path / "skill.md"
+    skill_file.write_bytes(b"skill one\n")
+    skill_dir = tmp_path / "skills"
+    skill_dir.mkdir()
+    skill_child = skill_dir / "child.md"
+    skill_child.write_bytes(b"child one\n")
+    wiki_file = tmp_path / "wiki.md"
+    wiki_file.write_bytes(b"wiki one\n")
+    wiki_dir = tmp_path / "wiki"
+    wiki_dir.mkdir()
+    wiki_child = wiki_dir / "page.md"
+    wiki_child.write_bytes(b"page one\n")
+
+    task.write_text(
+        _task_yaml().replace("skills: []", "skills: [skill.md]").replace("path: null", "path: wiki.md"),
+        encoding="utf-8",
+    )
+    skill_file_hash = load_task_package(task).snapshot_hash
+    skill_file.write_bytes(b"skill two\n")
+    assert load_task_package(task).snapshot_hash != skill_file_hash
+
+    task.write_text(
+        _task_yaml().replace("skills: []", "skills: [skills]").replace("path: null", "path: wiki"),
+        encoding="utf-8",
+    )
+    directory_hash = load_task_package(task).snapshot_hash
+    skill_child.write_bytes(b"child two\n")
+    assert load_task_package(task).snapshot_hash != directory_hash
+
+    task.write_text(
+        _task_yaml().replace("skills: []", "skills: [skill.md]").replace("path: null", "path: wiki.md"),
+        encoding="utf-8",
+    )
+    wiki_file_hash = load_task_package(task).snapshot_hash
+    wiki_file.write_bytes(b"wiki two\n")
+    assert load_task_package(task).snapshot_hash != wiki_file_hash
+
+    task.write_text(
+        _task_yaml().replace("skills: []", "skills: [skills]").replace("path: null", "path: wiki"),
+        encoding="utf-8",
+    )
+    wiki_directory_hash = load_task_package(task).snapshot_hash
+    wiki_child.write_bytes(b"page two\n")
+    assert load_task_package(task).snapshot_hash != wiki_directory_hash
+
+
+def test_snapshot_hash_ignores_absolute_package_and_storage_locations(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    source_task = _write_task(source, _task_yaml(schemas=("result.schema.json",)))
+    (source / "result.schema.json").write_bytes(b"{}\n")
+    copied = tmp_path / "copied"
+    shutil.copytree(source, copied)
+    assert load_task_package(source_task).snapshot_hash == load_task_package(copied / "task.yaml").snapshot_hash
+
+    source_task.write_text(_task_yaml().replace("runs_directory: runs", "runs_directory: output-a"), encoding="utf-8")
+    storage_a = load_task_package(source_task).snapshot_hash
+    source_task.write_text(_task_yaml().replace("runs_directory: runs", "runs_directory: output-b"), encoding="utf-8")
+    assert load_task_package(source_task).snapshot_hash == storage_a

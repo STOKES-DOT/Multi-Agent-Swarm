@@ -2,6 +2,8 @@ task:
   name: quadratic
   version: v1
   prompt: prompt.md
+  schemas:
+    - result.schema.json
 agent:
   model: deterministic-test
   skills: []
@@ -34,7 +36,7 @@ thread:
 storage:
   runs_directory: runs
 plugins:
-  position_space: tests.fixtures.tasks.quadratic.plugin:position_space
-  task_adapter: tests.fixtures.tasks.quadratic.plugin:task_adapter
-  evaluator: tests.fixtures.tasks.quadratic.plugin:evaluator
-  tool_provider: tests.fixtures.tasks.quadratic.plugin:tool_provider
+  position_space: tests.fixtures.tasks.quadratic.plugin:create_position_space
+  task_adapter: tests.fixtures.tasks.quadratic.plugin:create_task_adapter
+  evaluator: tests.fixtures.tasks.quadratic.plugin:create_evaluator
+  tool_provider: tests.fixtures.tasks.quadratic.plugin:create_tool_provider
