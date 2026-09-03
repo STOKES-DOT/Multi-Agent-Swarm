@@ -14,21 +14,33 @@ from pydantic import JsonValue
 from multi_agent_pso.core import AgentStage
 
 
-def _require_nonempty(value: str, name: str) -> str:
+def _require_nonempty(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
     if not value:
         raise ValueError(f"{name} must not be empty")
     return value
 
 
-def _require_nonnegative(value: int, name: str) -> int:
+def _require_nonnegative(value: object, name: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{name} must be an integer")
     if value < 0:
         raise ValueError(f"{name} must be non-negative")
     return value
 
 
-def _require_absolute_workspace(value: Path) -> Path:
+def _require_absolute_workspace(value: object) -> Path:
+    if not isinstance(value, Path):
+        raise TypeError("workspace must be a Path")
     if not value.is_absolute():
         raise ValueError("workspace must be absolute")
+    return value
+
+
+def _require_instance(value: object, expected_type: type[object], name: str) -> object:
+    if not isinstance(value, expected_type):
+        raise TypeError(f"{name} must be a {expected_type.__name__}")
     return value
 
 
@@ -47,7 +59,9 @@ def _freeze_json(value: JsonValue) -> JsonValue:
     raise TypeError("value must be JSON-compatible")
 
 
-def _freeze_json_mapping(value: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
+def _freeze_json_mapping(value: object) -> Mapping[str, JsonValue]:
+    if not isinstance(value, Mapping):
+        raise TypeError("JSON mapping fields must be mappings")
     return _freeze_json(value)  # type: ignore[return-value]
 
 
@@ -120,6 +134,7 @@ class StageRequest:
     response_schema: Mapping[str, JsonValue] | None = None
 
     def __post_init__(self) -> None:
+        _require_instance(self.stage, AgentStage, "stage")
         _require_nonempty(self.prompt, "prompt")
         if self.response_schema is not None:
             object.__setattr__(self, "response_schema", _freeze_json_mapping(self.response_schema))
@@ -141,6 +156,8 @@ class StageResponse:
     provider_metadata: Mapping[str, JsonValue] = field(default_factory=_empty_json_mapping)
 
     def __post_init__(self) -> None:
+        _require_nonempty(self.raw_text, "raw_text")
+        _require_instance(self.usage, TokenUsage, "usage")
         object.__setattr__(self, "provider_metadata", _freeze_json_mapping(self.provider_metadata))
 
     def to_json(self) -> dict[str, JsonValue]:

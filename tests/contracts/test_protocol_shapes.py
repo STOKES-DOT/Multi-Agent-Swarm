@@ -13,7 +13,6 @@ import pytest
 from pydantic import JsonValue
 
 from multi_agent_pso.core import (
-    AgentEpisode,
     AgentStage,
     ArtifactRef,
     Evaluation,
@@ -43,6 +42,7 @@ from multi_agent_pso.protocols import (
     WikiHit,
     WikiQuery,
     WikiRetriever,
+    validate_protocol_implementation,
 )
 
 
@@ -141,6 +141,7 @@ def test_protocol_method_names_and_async_boundaries_are_exact() -> None:
         "create_run",
         "append_stage_event",
         "get_committed_tool_result",
+        "record_tool_result",
         "iteration_transaction",
     }
     assert _protocol_methods(ArtifactStore) == {
@@ -151,6 +152,7 @@ def test_protocol_method_names_and_async_boundaries_are_exact() -> None:
     assert _protocol_methods(TaskAdapter) == {
         "build_stage_request",
         "parse_stage_response",
+        "candidate_from_tool_result",
         "realized_position",
         "evaluated_position",
         "position_adherence",
@@ -229,6 +231,9 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
             return None
 
     class RunStoreFake:
+        def __init__(self) -> None:
+            self.tool_results: dict[str, ToolResult] = {}
+
         def create_run(self, run_id: str, snapshot_hash: str) -> None:
             return None
 
@@ -236,7 +241,10 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
             return None
 
         def get_committed_tool_result(self, idempotency_key: str) -> ToolResult | None:
-            return None
+            return self.tool_results.get(idempotency_key)
+
+        def record_tool_result(self, idempotency_key: str, result: ToolResult) -> None:
+            self.tool_results[idempotency_key] = result
 
         def iteration_transaction(
             self, run_id: str, iteration_id: int
@@ -264,8 +272,13 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
         ) -> Mapping[str, JsonValue]:
             return {}
 
-        def realized_position(self, episode: AgentEpisode) -> str | None:
-            return None
+        def candidate_from_tool_result(
+            self, result: ToolResult, context: ToolContext
+        ) -> CandidateRef:
+            return CandidateRef("candidate", HASH, metadata=result.payload)
+
+        def realized_position(self, candidate: CandidateRef) -> str | None:
+            return candidate.metadata.get("position")  # type: ignore[return-value]
 
         def evaluated_position(self, target: str, realized: str | None) -> str:
             return target
@@ -336,6 +349,7 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
                 "create_run": (("self", "run_id", "snapshot_hash"), {"run_id": str, "snapshot_hash": str, "return": type(None)}),
                 "append_stage_event": (("self", "event"), {"event": StageEvent, "return": type(None)}),
                 "get_committed_tool_result": (("self", "idempotency_key"), {"idempotency_key": str, "return": ToolResult | None}),
+                "record_tool_result": (("self", "idempotency_key", "result"), {"idempotency_key": str, "result": ToolResult, "return": type(None)}),
                 "iteration_transaction": (("self", "run_id", "iteration_id"), {"run_id": str, "iteration_id": int, "return": ContextManager[IterationTransaction]}),
             },
         ),
@@ -374,9 +388,14 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
         {"stage": AgentStage, "response": StageResponse, "return": Mapping[str, JsonValue]},
     )
     _assert_signature_and_hints(
+        TaskAdapter.candidate_from_tool_result,
+        ("self", "result", "context"),
+        {"result": ToolResult, "context": ToolContext, "return": CandidateRef},
+    )
+    _assert_signature_and_hints(
         TaskAdapter.realized_position,
-        ("self", "episode"),
-        {"episode": AgentEpisode, "return": position_type | None},
+        ("self", "candidate"),
+        {"candidate": CandidateRef, "return": position_type | None},
     )
     _assert_signature_and_hints(
         TaskAdapter.evaluated_position,
@@ -401,7 +420,8 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
     adapter_contracts = {
         "build_stage_request": (("self", "stage", "context"), {"stage": AgentStage, "context": Mapping[str, JsonValue], "return": StageRequest}),
         "parse_stage_response": (("self", "stage", "response"), {"stage": AgentStage, "response": StageResponse, "return": Mapping[str, JsonValue]}),
-        "realized_position": (("self", "episode"), {"episode": AgentEpisode, "return": str | None}),
+        "candidate_from_tool_result": (("self", "result", "context"), {"result": ToolResult, "context": ToolContext, "return": CandidateRef}),
+        "realized_position": (("self", "candidate"), {"candidate": CandidateRef, "return": str | None}),
         "evaluated_position": (("self", "target", "realized"), {"target": str, "realized": str | None, "return": str}),
         "position_adherence": (("self", "target", "realized"), {"target": str, "realized": str | None, "return": Mapping[str, JsonValue]}),
         "compare": (("self", "left", "right"), {"left": Evaluation, "right": Evaluation, "return": int}),
@@ -413,6 +433,80 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
         )
     adapter: TaskAdapter[str] = AdapterFake()
     assert isinstance(adapter, TaskAdapter)
+
+    context = ToolContext("run", "particle", 0, AgentStage.EXECUTING, 0, WORKSPACE)
+    result = ToolResult(ToolStatus.SUCCESS, {"position": "realized"})
+    store = RunStoreFake()
+    assert store.get_committed_tool_result("request-key") is None
+    store.record_tool_result("request-key", result)
+    assert store.get_committed_tool_result("request-key") is result
+    candidate = adapter.candidate_from_tool_result(result, context)
+    assert adapter.realized_position(candidate) == "realized"
+    for instance, protocol in (
+        (RuntimeFake(), AgentRuntime),
+        (adapter, TaskAdapter),
+        (store, RunStore),
+    ):
+        validate_protocol_implementation(instance, protocol)
+
+
+def test_protocol_implementation_validator_rejects_bad_signatures_and_async_mismatch() -> None:
+    class BadRuntime:
+        async def start_thread(self) -> ThreadRef:
+            raise NotImplementedError
+
+        async def run_stage(self) -> StageResponse:
+            raise NotImplementedError
+
+        async def rotate_thread(self) -> ThreadRef:
+            raise NotImplementedError
+
+        async def close_thread(self) -> None:
+            return None
+
+    class BadAdapter:
+        async def build_stage_request(self) -> StageRequest:
+            raise NotImplementedError
+
+    class AsyncWikiRetriever:
+        async def search(self, query: WikiQuery) -> tuple[WikiHit, ...]:
+            return ()
+
+    for instance, protocol in (
+        (BadRuntime(), AgentRuntime),
+        (BadAdapter(), TaskAdapter),
+        (AsyncWikiRetriever(), WikiRetriever),
+    ):
+        with pytest.raises(TypeError):
+            validate_protocol_implementation(instance, protocol)
+
+
+def test_protocol_implementation_validator_rejects_noncallable_and_exact_shape_errors() -> None:
+    class NonCallableWikiRetriever:
+        search = None
+
+    class WrongNameWikiRetriever:
+        def search(self, text: WikiQuery) -> tuple[WikiHit, ...]:
+            return ()
+
+    class WrongKindWikiRetriever:
+        def search(self, *, query: WikiQuery) -> tuple[WikiHit, ...]:
+            return ()
+
+    class WrongDefaultWikiRetriever:
+        def search(
+            self, query: WikiQuery = WikiQuery("default", 1)
+        ) -> tuple[WikiHit, ...]:
+            return ()
+
+    for instance in (
+        NonCallableWikiRetriever(),
+        WrongNameWikiRetriever(),
+        WrongKindWikiRetriever(),
+        WrongDefaultWikiRetriever(),
+    ):
+        with pytest.raises(TypeError):
+            validate_protocol_implementation(instance, WikiRetriever)
 
 
 def test_records_are_frozen_deeply_immutable_and_json_serializable() -> None:
@@ -471,6 +565,7 @@ def test_records_are_frozen_deeply_immutable_and_json_serializable() -> None:
         (lambda: ToolRequest("request", "", "operation", {}, "key"), "provider"),
         (lambda: ToolRequest("request", "provider", "", {}, "key"), "operation"),
         (lambda: ToolRequest("request", "provider", "operation", {}, ""), "idempotency_key"),
+        (lambda: ToolResult(ToolStatus.FAILED, {}, (), ""), "error"),
         (lambda: ToolContext("run", "particle", -1, AgentStage.EXECUTING, 0, WORKSPACE), "iteration_id"),
         (lambda: ToolContext("run", "particle", 0, AgentStage.EXECUTING, -1, WORKSPACE), "attempt"),
         (lambda: ToolContext("", "particle", 0, AgentStage.EXECUTING, 0, WORKSPACE), "run_id"),
@@ -495,6 +590,96 @@ def test_records_are_frozen_deeply_immutable_and_json_serializable() -> None:
 )
 def test_boundary_records_reject_invalid_values(factory: object, match: str) -> None:
     with pytest.raises(ValueError, match=match):
+        factory()  # type: ignore[operator]
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: StageRequest(AgentStage.PENDING, "prompt", []),
+        lambda: StageResponse("{}", TokenUsage(0, 0), []),
+        lambda: ToolRequest("request", "provider", "operation", [], "key"),
+        lambda: ToolResult(ToolStatus.SUCCESS, []),
+        lambda: CandidateRef("candidate", HASH, metadata=[]),
+        lambda: EvaluationContext("run", "particle", 0, WORKSPACE, HASH, []),
+    ],
+)
+def test_json_mapping_fields_reject_non_mappings(factory: object) -> None:
+    with pytest.raises(TypeError):
+        factory()  # type: ignore[operator]
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: StageRequest(AgentStage.PENDING, "prompt", ()),
+        lambda: StageRequest(AgentStage.PENDING, "prompt", 0),
+        lambda: StageResponse("{}", TokenUsage(0, 0), ()),
+        lambda: StageResponse("{}", TokenUsage(0, 0), 0),
+        lambda: ToolRequest("request", "provider", "operation", (), "key"),
+        lambda: ToolRequest("request", "provider", "operation", 0, "key"),
+        lambda: ToolResult(ToolStatus.SUCCESS, ()),
+        lambda: ToolResult(ToolStatus.SUCCESS, 0),
+        lambda: CandidateRef("candidate", HASH, metadata=()),
+        lambda: CandidateRef("candidate", HASH, metadata=0),
+        lambda: EvaluationContext("run", "particle", 0, WORKSPACE, HASH, ()),
+        lambda: EvaluationContext("run", "particle", 0, WORKSPACE, HASH, 0),
+    ],
+)
+def test_json_mapping_fields_reject_tuples_and_scalars(factory: object) -> None:
+    with pytest.raises(TypeError):
+        factory()  # type: ignore[operator]
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: TokenUsage(True, 0),
+        lambda: TokenUsage(0, 0, 1.0),
+        lambda: ThreadRef(1, "particle", 0, WORKSPACE),
+        lambda: ThreadRef("thread", "particle", True, WORKSPACE),
+        lambda: ThreadRef("thread", "particle", 0, "/tmp"),
+        lambda: ThreadRef("thread", "particle", 0, WORKSPACE, 1),
+        lambda: StageRequest("PENDING", "prompt"),
+        lambda: StageRequest(AgentStage.PENDING, 1),
+        lambda: StageResponse(1, TokenUsage(0, 0)),
+        lambda: StageResponse("{}", object()),
+        lambda: ToolRequest(1, "provider", "operation", {}, "key"),
+        lambda: ToolContext("run", "particle", 0, "EXECUTING", 0, WORKSPACE),
+        lambda: ToolContext("run", "particle", True, AgentStage.EXECUTING, 0, WORKSPACE),
+        lambda: ToolResult("SUCCESS", {}),
+        lambda: ToolResult(ToolStatus.SUCCESS, {}, [ARTIFACT]),
+        lambda: ToolResult(ToolStatus.SUCCESS, {}, (object(),)),
+        lambda: ToolResult(ToolStatus.SUCCESS, {}, (), 1),
+        lambda: CandidateRef("candidate", []),
+        lambda: CandidateRef("candidate", 1.0),
+        lambda: CandidateRef("candidate", HASH, [ARTIFACT]),
+        lambda: CandidateRef("candidate", HASH, (object(),)),
+        lambda: EvaluationContext(True, "particle", 0, WORKSPACE, HASH),
+        lambda: EvaluationContext("run", "particle", 0, WORKSPACE, []),
+        lambda: WikiQuery(True, 1),
+        lambda: WikiQuery("query", True),
+        lambda: WikiHit("note.md", True, 1, "evidence", "content"),
+        lambda: WikiHit("note.md", 1, 1, 1, "content"),
+        lambda: WikiHit("note.md", 1, 1, "evidence", 1),
+    ],
+)
+def test_boundary_records_reject_wrong_runtime_types(factory: object) -> None:
+    with pytest.raises(TypeError):
+        factory()  # type: ignore[operator]
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: StageRequest(AgentStage.PENDING, "prompt", {"bad": float("nan")}),
+        lambda: ToolResult(ToolStatus.SUCCESS, {"bad": float("nan")}),
+        lambda: CandidateRef("candidate", HASH, metadata={"bad": float("nan")}),
+        lambda: EvaluationContext("run", "particle", 0, WORKSPACE, HASH, {"bad": float("nan")}),
+    ],
+)
+def test_boundary_records_reject_nonfinite_json(factory: object) -> None:
+    with pytest.raises(ValueError, match="NaN or infinity"):
         factory()  # type: ignore[operator]
 
 

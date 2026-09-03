@@ -17,14 +17,25 @@ from .agent_runtime import (
     _freeze_json_mapping,
     _json_mapping,
     _require_absolute_workspace,
+    _require_instance,
     _require_nonempty,
     _require_nonnegative,
 )
 
 
-def _require_sha256(value: str, name: str) -> str:
+def _require_sha256(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
     if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
         raise ValueError(f"{name} must be a lowercase SHA-256 hex digest")
+    return value
+
+
+def _require_artifacts(value: object) -> tuple[ArtifactRef, ...]:
+    if not isinstance(value, tuple):
+        raise TypeError("artifacts must be a tuple")
+    if not all(isinstance(artifact, ArtifactRef) for artifact in value):
+        raise TypeError("artifacts must contain ArtifactRef records")
     return value
 
 
@@ -70,6 +81,7 @@ class ToolContext:
     workspace: Path
 
     def __post_init__(self) -> None:
+        _require_instance(self.stage, AgentStage, "stage")
         _require_nonempty(self.run_id, "run_id")
         _require_nonempty(self.particle_id, "particle_id")
         _require_nonnegative(self.iteration_id, "iteration_id")
@@ -95,8 +107,11 @@ class ToolResult:
     error: str | None = None
 
     def __post_init__(self) -> None:
+        _require_instance(self.status, ToolStatus, "status")
         object.__setattr__(self, "payload", _freeze_json_mapping(self.payload))
-        object.__setattr__(self, "artifacts", tuple(self.artifacts))
+        object.__setattr__(self, "artifacts", _require_artifacts(self.artifacts))
+        if self.error is not None:
+            _require_nonempty(self.error, "error")
 
     def to_json(self) -> dict[str, JsonValue]:
         return {
@@ -117,7 +132,7 @@ class CandidateRef:
     def __post_init__(self) -> None:
         _require_nonempty(self.reference, "reference")
         _require_sha256(self.candidate_hash, "candidate_hash")
-        object.__setattr__(self, "artifacts", tuple(self.artifacts))
+        object.__setattr__(self, "artifacts", _require_artifacts(self.artifacts))
         object.__setattr__(self, "metadata", _freeze_json_mapping(self.metadata))
 
     def to_json(self) -> dict[str, JsonValue]:

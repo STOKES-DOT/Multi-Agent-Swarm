@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import PurePath
 from typing import AsyncContextManager, Protocol, runtime_checkable
 
-from .agent_runtime import _require_nonempty
+from .agent_runtime import _require_nonempty, _require_nonnegative
 
 
 @runtime_checkable
@@ -25,6 +25,7 @@ class WikiQuery:
 
     def __post_init__(self) -> None:
         _require_nonempty(self.text, "text")
+        _require_nonnegative(self.max_results, "max_results")
         if not 1 <= self.max_results <= 100:
             raise ValueError("max_results must be between 1 and 100")
 
@@ -44,11 +45,14 @@ class WikiHit:
         _require_nonempty(self.relative_path, "relative_path")
         if PurePath(self.relative_path).is_absolute():
             raise ValueError("relative_path must be relative")
+        _require_nonnegative(self.line_start, "line_start")
+        _require_nonnegative(self.line_end, "line_end")
         if self.line_start < 1:
             raise ValueError("line_start must be at least 1")
         if self.line_end < self.line_start:
             raise ValueError("line_end must not precede line_start")
         _require_nonempty(self.evidence_layer, "evidence_layer")
+        _require_nonempty(self.content, "content")
 
     def to_json(self) -> dict[str, object]:
         return {

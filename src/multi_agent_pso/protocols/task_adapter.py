@@ -7,9 +7,10 @@ from typing import Protocol, TypeVar, runtime_checkable
 
 from pydantic import JsonValue
 
-from multi_agent_pso.core import AgentEpisode, AgentStage, Evaluation, PersonalBest
+from multi_agent_pso.core import AgentStage, Evaluation, PersonalBest
 
 from .agent_runtime import StageRequest, StageResponse
+from .tools import CandidateRef, ToolContext, ToolResult
 
 
 P = TypeVar("P")
@@ -27,7 +28,11 @@ class TaskAdapter(Protocol[P]):
         self, stage: AgentStage, response: StageResponse
     ) -> Mapping[str, JsonValue]: ...
 
-    def realized_position(self, episode: AgentEpisode) -> P | None: ...
+    def candidate_from_tool_result(
+        self, result: ToolResult, context: ToolContext
+    ) -> CandidateRef: ...
+
+    def realized_position(self, candidate: CandidateRef) -> P | None: ...
 
     def evaluated_position(self, target: P, realized: P | None) -> P: ...
 

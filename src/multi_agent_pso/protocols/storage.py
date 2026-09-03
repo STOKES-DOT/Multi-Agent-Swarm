@@ -35,6 +35,10 @@ class RunStore(Protocol):
 
     def get_committed_tool_result(self, idempotency_key: str) -> ToolResult | None: ...
 
+    def record_tool_result(self, idempotency_key: str, result: ToolResult) -> None:
+        """Atomically persist a result so its idempotency key can retrieve it."""
+        ...
+
     def iteration_transaction(
         self, run_id: str, iteration_id: int
     ) -> ContextManager[IterationTransaction]: ...
