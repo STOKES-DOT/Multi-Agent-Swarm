@@ -18,7 +18,7 @@ dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.24",
 ]
-codex = ["openai-codex"]
+codex = ["openai-codex>=0.147"]
 molecule = ["networkx>=3.0"]
 
 [project.scripts]
@@ -28,7 +28,7 @@ multi-agent-pso = "multi_agent_pso.cli:main"
 where = ["src"]
 
 [tool.pytest.ini_options]
-addopts = "-ra"
+addopts = "-ra -m 'not live'"
 asyncio_mode = "auto"
 markers = [
   "live: invokes local Codex or an external scientific tool",

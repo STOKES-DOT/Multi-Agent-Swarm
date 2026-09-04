@@ -4,5 +4,7 @@ channels:
 dependencies:
   - python=3.12
   - pip>=24
+  - networkx>=3
+  - rdkit
 variables:
   PYTHONNOUSERSITE: "1"
