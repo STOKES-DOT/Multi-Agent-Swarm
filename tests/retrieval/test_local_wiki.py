@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,7 @@ def test_retriever_returns_source_locations_in_stable_order() -> None:
     assert first[0].line_end >= first[0].line_start
     assert first[0].evidence_layer == "direct evidence"
     assert "Red absorption" in first[0].content
+    assert first[0].linked_raw_path == "raw/source-red/v1.pdf"
     assert isinstance(retriever, WikiRetriever)
 
 
@@ -181,11 +183,13 @@ def test_source_explicit_raw_link_is_validated_but_raw_is_not_indexed(
         {
             "sources/source.md": (
                 "# Signal — direct evidence\n"
-                "rawsignal `raw/source/v1.pdf`\n"
+                "- Raw snapshot: raw/source/v1.pdf\n"
+                "rawsignal\n"
             ),
             "mocs/moc.md": (
                 "# Navigation — cross-paper synthesis\n"
-                "rawsignal `raw/source/v1.pdf`\n"
+                "- Raw snapshot: raw/source/v1.pdf\n"
+                "rawsignal\n"
             ),
         },
     )
@@ -209,8 +213,9 @@ def test_unsafe_raw_link_and_raw_symlink_are_not_exposed(tmp_path: Path) -> None
         {
             "sources/escape.md": (
                 "# Escape — direct evidence\n"
-                "escapetoken `raw/../../outside.pdf`\n"
-                "also [raw](../raw/link.pdf)\n"
+                "- Raw snapshot: raw/../../outside.pdf\n"
+                "- Raw snapshot: raw/link.pdf\n"
+                "escapetoken\n"
             )
         },
     )
@@ -219,6 +224,144 @@ def test_unsafe_raw_link_and_raw_symlink_are_not_exposed(tmp_path: Path) -> None
     (raw / "link.pdf").symlink_to(outside)
 
     hit = LocalWikiRetriever(root).search(WikiQuery("escapetoken", 1))[0]
+
+    assert hit.linked_raw_path is None
+
+
+def test_raw_snapshot_rejects_an_intermediate_directory_symlink(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "v1.pdf").write_bytes(b"outside")
+    root = _wiki(
+        tmp_path,
+        {
+            "sources/source.md": (
+                "# Source — direct evidence\n"
+                "- Raw snapshot: raw/linked/v1.pdf\n"
+                "rawinnersymlinktoken\n"
+            )
+        },
+    )
+    raw = root / "raw"
+    raw.mkdir()
+    (raw / "linked").symlink_to(outside, target_is_directory=True)
+
+    hit = LocalWikiRetriever(root).search(WikiQuery("rawinnersymlinktoken", 1))[0]
+
+    assert hit.linked_raw_path is None
+
+
+def test_raw_snapshot_path_swap_after_open_is_not_exposed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = _wiki(
+        tmp_path,
+        {
+            "sources/source.md": (
+                "# Source — direct evidence\n"
+                "- Raw snapshot: raw/source/v1.pdf\n"
+                "rawswaptoken\n"
+            )
+        },
+    )
+    raw = root / "raw/source/v1.pdf"
+    raw.parent.mkdir(parents=True)
+    raw.write_bytes(b"snapshot")
+    backup = raw.with_name("original.pdf")
+    outside = tmp_path / "outside.pdf"
+    outside.write_bytes(b"outside")
+    original_open = os.open
+    swapped = False
+
+    def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if dir_fd is None:
+            fd = original_open(path, flags, mode)
+        else:
+            fd = original_open(path, flags, mode, dir_fd=dir_fd)
+        if path == "v1.pdf" and not swapped:
+            raw.rename(backup)
+            raw.symlink_to(outside)
+            swapped = True
+        return fd
+
+    monkeypatch.setattr(os, "open", swapping_open)
+
+    hit = LocalWikiRetriever(root).search(WikiQuery("rawswaptoken", 1))[0]
+
+    assert hit.linked_raw_path is None
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        "- Raw snapshot: raw/source/v1.pdf",
+        "- Raw snapshot: `raw/source/v1.pdf`",
+        "- Raw snapshot: <raw/source/v1.pdf>",
+    ],
+)
+def test_raw_snapshot_metadata_accepts_only_standalone_canonical_lines(
+    tmp_path: Path, metadata: str
+) -> None:
+    root = _wiki(
+        tmp_path,
+        {"sources/source.md": f"# Source — direct evidence\n{metadata}\nrawmetatoken\n"},
+    )
+    raw = root / "raw/source/v1.pdf"
+    raw.parent.mkdir(parents=True)
+    raw.write_bytes(b"snapshot")
+
+    hit = LocalWikiRetriever(root).search(WikiQuery("rawmetatoken", 1))[0]
+
+    assert hit.linked_raw_path == "raw/source/v1.pdf"
+
+
+def test_raw_snapshot_allows_a_regular_file_directly_under_raw(tmp_path: Path) -> None:
+    root = _wiki(
+        tmp_path,
+        {
+            "sources/source.md": (
+                "# Source — direct evidence\n"
+                "- Raw snapshot: raw/v1.pdf\n"
+                "directrawtoken\n"
+            )
+        },
+    )
+    raw = root / "raw/v1.pdf"
+    raw.parent.mkdir()
+    raw.write_bytes(b"snapshot")
+
+    hit = LocalWikiRetriever(root).search(WikiQuery("directrawtoken", 1))[0]
+
+    assert hit.linked_raw_path == "raw/v1.pdf"
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        "- Raw snapshot: raw/source/v1.pdf extra prose",
+        "  - Raw snapshot: raw/source/v1.pdf",
+        "- Local raw snapshot: `raw/source/v1.pdf`",
+        "The Raw snapshot: raw/source/v1.pdf is useful.",
+        "[snapshot](raw/source/v1.pdf)",
+    ],
+)
+def test_raw_snapshot_metadata_rejects_noncanonical_prose(
+    tmp_path: Path, metadata: str
+) -> None:
+    root = _wiki(
+        tmp_path,
+        {
+            "sources/source.md": (
+                f"# Source — direct evidence\n{metadata}\nrawrejecttoken\n"
+            )
+        },
+    )
+    raw = root / "raw/source/v1.pdf"
+    raw.parent.mkdir(parents=True)
+    raw.write_bytes(b"snapshot")
+
+    hit = LocalWikiRetriever(root).search(WikiQuery("rawrejecttoken", 1))[0]
 
     assert hit.linked_raw_path is None
 
@@ -257,6 +400,44 @@ def test_invalid_evidence_label_is_demoted_to_open_hypothesis(tmp_path: Path) ->
     hit = LocalWikiRetriever(root).search(WikiQuery("unsupportedlabeltoken", 1))[0]
 
     assert hit.evidence_layer == "open hypothesis"
+
+
+def test_negated_evidence_marker_does_not_promote_section(tmp_path: Path) -> None:
+    root = _wiki(
+        tmp_path,
+        {
+            "sources/negated-marker.md": (
+                "# Unclassified\n"
+                "This is not an Evidence layer: direct evidence marker.\n"
+                "negatedmarkertoken\n"
+            )
+        },
+    )
+
+    hit = LocalWikiRetriever(root).search(WikiQuery("negatedmarkertoken", 1))[0]
+
+    assert hit.evidence_layer == "open hypothesis"
+
+
+def test_evidence_boundary_bullets_are_independent_typed_fragments() -> None:
+    hits = LocalWikiRetriever(FIXTURE_WIKI).search(
+        WikiQuery("directclaim authorclaim crossclaim openclaim", 10)
+    )
+    by_token = {
+        token: next(hit for hit in hits if token in hit.content)
+        for token in ("directclaim", "authorclaim", "crossclaim", "openclaim")
+    }
+
+    assert {
+        token: (hit.evidence_layer, hit.line_start, hit.line_end)
+        for token, hit in by_token.items()
+    } == {
+        "directclaim": ("direct evidence", 19, 19),
+        "authorclaim": ("author interpretation", 20, 20),
+        "crossclaim": ("cross-paper synthesis", 21, 21),
+        "openclaim": ("open hypothesis", 22, 22),
+    }
+    assert len({hit.content for hit in by_token.values()}) == 4
 
 
 def test_evidence_phrase_in_non_label_heading_is_not_promoted(tmp_path: Path) -> None:
@@ -309,6 +490,111 @@ def test_long_line_snippet_keeps_the_matching_text(tmp_path: Path) -> None:
     assert (hit.line_start, hit.line_end) == (2, 2)
 
 
+def test_snippet_uses_token_span_not_substring_inside_another_token(
+    tmp_path: Path,
+) -> None:
+    root = _wiki(
+        tmp_path,
+        {
+            "sources/span.md": (
+                "# Measurement — direct evidence\n"
+                + "hundred "
+                + "x" * 160
+                + " red is the exact token\n"
+            )
+        },
+    )
+
+    hit = LocalWikiRetriever(root).search(
+        WikiQuery("red", 1, snippet_max_chars=64)
+    )[0]
+
+    assert " red " in hit.content
+    assert "hundred" not in hit.content
+
+
+def test_markdown_is_read_from_open_fd_across_path_swap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = _wiki(
+        tmp_path,
+        {"sources/race.md": "# Safe — direct evidence\nsafetoken\n"},
+    )
+    victim = root / "sources/race.md"
+    backup = root / "sources/race-original.md"
+    outside = tmp_path / "outside.md"
+    outside.write_text("# Outside — direct evidence\noutsideescape\n", encoding="utf-8")
+    swapped = False
+    original_read_text = Path.read_text
+    original_open = os.open
+
+    def swap_path() -> None:
+        nonlocal swapped
+        if not swapped:
+            victim.rename(backup)
+            victim.symlink_to(outside)
+            swapped = True
+
+    def swapping_read_text(path: Path, *args, **kwargs):
+        if path == victim:
+            swap_path()
+        return original_read_text(path, *args, **kwargs)
+
+    def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is None:
+            fd = original_open(path, flags, mode)
+        else:
+            fd = original_open(path, flags, mode, dir_fd=dir_fd)
+        if path == "race.md":
+            swap_path()
+        return fd
+
+    monkeypatch.setattr(Path, "read_text", swapping_read_text)
+    monkeypatch.setattr(os, "open", swapping_open)
+
+    with pytest.raises(ValueError, match="changed|symlink|race"):
+        LocalWikiRetriever(root)
+
+
+def test_regular_file_replacement_between_stat_and_open_is_rejected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = _wiki(
+        tmp_path,
+        {"sources/race.md": "# Safe — direct evidence\nsafetoken\n"},
+    )
+    victim = root / "sources/race.md"
+    backup = root / "sources/race-original.md"
+    swapped = False
+    original_open = os.open
+
+    def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if path == "race.md" and not swapped:
+            victim.rename(backup)
+            victim.write_text(
+                "# Replacement — direct evidence\noutsideescape\n",
+                encoding="utf-8",
+            )
+            swapped = True
+        if dir_fd is None:
+            return original_open(path, flags, mode)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", swapping_open)
+
+    with pytest.raises(ValueError, match="changed|race"):
+        LocalWikiRetriever(root)
+
+
+def test_platform_without_nofollow_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    root = _wiki(tmp_path)
+    monkeypatch.delattr(os, "O_NOFOLLOW")
+
+    with pytest.raises(RuntimeError, match="O_NOFOLLOW|platform"):
+        LocalWikiRetriever(root)
+
+
 @pytest.mark.parametrize(
     "query",
     [
@@ -324,6 +610,8 @@ def test_query_valid_boundaries(query: WikiQuery) -> None:
     "factory",
     [
         lambda: WikiQuery("   ", 1),
+        lambda: WikiQuery("x" * (1024 * 1024), 1),
+        lambda: WikiQuery(" ".join(f"token{index}" for index in range(300)), 1),
         lambda: WikiQuery("valid", 1, score_threshold=-0.01),
         lambda: WikiQuery("valid", 1, score_threshold=1.01),
         lambda: WikiQuery("valid", 1, score_threshold=float("nan")),
@@ -336,3 +624,9 @@ def test_query_valid_boundaries(query: WikiQuery) -> None:
 def test_query_rejects_invalid_score_and_snippet_boundaries(factory) -> None:
     with pytest.raises((TypeError, ValueError)):
         factory()
+
+
+def test_query_budget_accepts_normal_chinese_text() -> None:
+    query = WikiQuery("红光 吸收 多重共振 发光", 5)
+
+    assert query.text == "红光 吸收 多重共振 发光"

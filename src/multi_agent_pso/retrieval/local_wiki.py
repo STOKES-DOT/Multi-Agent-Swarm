@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import re
+import stat
 import unicodedata
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from multi_agent_pso.protocols import WikiHit, WikiQuery
 
@@ -20,11 +23,32 @@ _EVIDENCE_LAYERS = (
 )
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _EVIDENCE_MARKER_RE = re.compile(
-    r"evidence[ _-]*layer\s*[:=—-]\s*([^\n]+)", re.IGNORECASE
+    r"^\s*-\s*Evidence\s+layer\s*:\s*(\S.*?)\s*$", re.IGNORECASE
 )
-_MARKDOWN_LINK_RE = re.compile(r"\]\(([^)]+)\)")
-_WIKI_LINK_RE = re.compile(r"\[\[([^]|]+)(?:\|[^]]+)?\]\]")
-_CODE_RE = re.compile(r"`([^`\n]+)`")
+_EVIDENCE_BULLET_RE = re.compile(r"^\s*-\s*([^:]+?)\s*:\s*(\S.*?)\s*$")
+_RAW_METADATA_RE = re.compile(
+    r"^-\s*Raw snapshot:\s*"
+    r"(?:`(?P<backtick>raw/[^\s`<>]+)`|"
+    r"<(?P<angle>raw/[^\s`<>]+)>|"
+    r"(?P<plain>raw/[^\s`<>]+))\s*$",
+    re.MULTILINE,
+)
+_WORD_RE = re.compile(r"[^\W_]+", flags=re.UNICODE)
+_DASH_RE = re.compile("[‐‑‒–—―−]")
+_READ_CHUNK_BYTES = 64 * 1024
+_HAS_REQUIRED_FD_CALLS = (
+    os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.stat in os.supports_follow_symlinks
+    and os.listdir in os.supports_fd
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _TokenSpan:
+    value: str
+    start: int
+    end: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,16 +77,12 @@ class LocalWikiRetriever:
     def __init__(self, root: Path) -> None:
         if not isinstance(root, Path):
             raise TypeError("wiki root must be a Path")
-        try:
-            canonical_root = root.resolve(strict=True)
-        except (OSError, RuntimeError) as error:
-            raise ValueError("wiki root must be an existing directory") from error
-        if not canonical_root.is_dir():
-            raise ValueError("wiki root must be an existing directory")
-        self._root = canonical_root
-        self._agents = self._read_anchor("AGENTS.md")
-        self._index = self._read_anchor("index.md")
-        self._sections = tuple(self._build_sections())
+        _require_fd_platform()
+        root_fd = _open_root(root)
+        with _owned_fd(root_fd):
+            self._agents = _read_utf8_at(root_fd, "AGENTS.md", "AGENTS.md")
+            self._index = _read_utf8_at(root_fd, "index.md", "index.md")
+            self._sections = tuple(self._build_sections(root_fd))
 
     def search(self, query: WikiQuery) -> tuple[WikiHit, ...]:
         if not isinstance(query, WikiQuery):
@@ -78,12 +98,11 @@ class LocalWikiRetriever:
             score = overlap / len(query_tokens)
             if score < query.score_threshold:
                 continue
-            heading_overlap = len(query_tokens & section.heading_tokens)
             ranked.append(
                 _RankedSection(
                     section,
                     score,
-                    heading_overlap,
+                    len(query_tokens & section.heading_tokens),
                     int(section.relative_path.startswith("sources/")),
                 )
             )
@@ -101,137 +120,310 @@ class LocalWikiRetriever:
             for item in ranked[: query.max_results]
         )
 
-    def _read_anchor(self, name: str) -> str:
-        path = self._root / name
-        if not path.exists() or path.is_symlink() or not path.is_file():
-            raise ValueError(f"wiki root requires a regular {name}")
-        return self._read_text(path)
-
-    def _build_sections(self) -> Iterator[_Section]:
+    def _build_sections(self, root_fd: int) -> Iterator[_Section]:
         for namespace in _SEARCH_NAMESPACES:
-            directory = self._root / namespace
-            if not directory.exists():
+            namespace_stat = _optional_stat_at(root_fd, namespace)
+            if namespace_stat is None:
                 continue
-            for path in self._markdown_files(directory):
-                relative_path = path.relative_to(self._root).as_posix()
-                text = self._read_text(path)
-                linked_raw_path = self._linked_raw(relative_path, text)
-                yield from _sections(relative_path, text, linked_raw_path)
-
-    def _markdown_files(self, directory: Path) -> tuple[Path, ...]:
-        if directory.is_symlink():
-            raise ValueError("wiki search namespace must not be a symlink")
-        if not directory.is_dir():
-            raise ValueError("wiki search namespace must be a directory")
-        files: list[Path] = []
-        pending = [directory]
-        while pending:
-            current = pending.pop()
-            for child in sorted(current.iterdir(), key=lambda path: path.name):
-                if child.is_symlink():
-                    raise ValueError("wiki search namespace contains a symlink")
-                try:
-                    resolved = child.resolve(strict=True)
-                except (OSError, RuntimeError) as error:
-                    raise ValueError("wiki search path is invalid") from error
-                if not resolved.is_relative_to(self._root):
-                    raise ValueError("wiki search path escapes the root")
-                if resolved.is_dir():
-                    pending.append(resolved)
-                elif resolved.is_file() and resolved.suffix.casefold() == ".md":
-                    files.append(resolved)
-        return tuple(
-            sorted(
-                files,
-                key=lambda path: path.relative_to(self._root).as_posix(),
+            if stat.S_ISLNK(namespace_stat.st_mode):
+                raise ValueError("wiki search namespace contains a symlink")
+            if not stat.S_ISDIR(namespace_stat.st_mode):
+                raise ValueError("wiki search namespace must be a directory")
+            namespace_fd = _open_directory_at(
+                root_fd, namespace, expected=namespace_stat
             )
-        )
-
-    def _read_text(self, path: Path) -> str:
-        try:
-            resolved = path.resolve(strict=True)
-            if not resolved.is_relative_to(self._root) or path.is_symlink():
-                raise ValueError("wiki path escapes the root or is a symlink")
-            return resolved.read_text(encoding="utf-8")
-        except UnicodeError as error:
-            raise ValueError("wiki Markdown must be valid UTF-8") from error
-        except OSError as error:
-            raise ValueError("wiki Markdown could not be read") from error
-
-    def _linked_raw(self, relative_path: str, text: str) -> str | None:
-        if not relative_path.startswith("sources/"):
-            return None
-        source_path = self._root / relative_path
-        candidates = {
-            candidate.strip().split("#", 1)[0]
-            for pattern in (_MARKDOWN_LINK_RE, _WIKI_LINK_RE, _CODE_RE)
-            for candidate in pattern.findall(text)
-        }
-        valid: list[str] = []
-        raw_root = self._root / "raw"
-        for candidate in candidates:
-            if candidate.startswith("raw/"):
-                path = self._root / candidate
-            elif candidate.startswith("../raw/"):
-                path = source_path.parent / candidate
-            else:
-                continue
-            if self._safe_raw_file(path, raw_root):
-                valid.append(path.resolve(strict=True).relative_to(self._root).as_posix())
-        return min(valid) if valid else None
-
-    def _safe_raw_file(self, path: Path, raw_root: Path) -> bool:
-        try:
-            raw = raw_root.resolve(strict=True)
-            resolved = path.resolve(strict=True)
-            relative = resolved.relative_to(raw)
-        except (OSError, RuntimeError, ValueError):
-            return False
-        current = raw
-        if raw_root.is_symlink():
-            return False
-        for part in relative.parts:
-            current /= part
-            if current.is_symlink():
-                return False
-        return resolved.is_file()
+            with _owned_fd(namespace_fd):
+                for relative_path, text in _markdown_documents(
+                    namespace_fd, PurePosixPath(namespace)
+                ):
+                    linked_raw_path = _linked_raw(root_fd, relative_path, text)
+                    yield from _sections(relative_path, text, linked_raw_path)
 
     @staticmethod
     def _hit(
         section: _Section, query_tokens: frozenset[str], max_chars: int
     ) -> WikiHit:
-        line_scores = [
-            len(query_tokens & frozenset(_tokens(line))) for line in section.lines
+        line_matches = [
+            tuple(span for span in _token_spans(line) if span.value in query_tokens)
+            for line in section.lines
         ]
+        line_scores = [len({span.value for span in spans}) for spans in line_matches]
         anchor = max(
             range(len(line_scores)),
             key=lambda index: (line_scores[index], -index),
         )
         selected: list[str] = []
         used = 0
-        for line in section.lines[anchor:]:
+        for offset, line in enumerate(section.lines[anchor:]):
             separator = 1 if selected else 0
             available = max_chars - used - separator
             if available <= 0:
                 break
+            matches = line_matches[anchor + offset]
             fragment = (
-                _relevant_line_fragment(line, query_tokens, available)
+                _line_fragment(line, matches, available)
                 if not selected and len(line) > available
                 else line[:available]
             )
             selected.append(fragment)
-            used += separator + min(len(line), available)
+            used += separator + len(fragment)
             if len(line) > available:
                 break
-        content = "\n".join(selected)
         return WikiHit(
             section.relative_path,
             section.line_start + anchor,
             section.line_start + anchor + len(selected) - 1,
             section.evidence_layer,
-            content,
+            "\n".join(selected),
             section.linked_raw_path,
         )
+
+
+def _require_fd_platform() -> None:
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise RuntimeError("platform lacks O_NOFOLLOW/O_DIRECTORY Wiki safety")
+    if not _HAS_REQUIRED_FD_CALLS:
+        raise RuntimeError("platform lacks required dir_fd Wiki safety")
+
+
+def _base_flags() -> int:
+    return os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _open_root(root: Path) -> int:
+    try:
+        fd = os.open(root, _base_flags() | os.O_DIRECTORY)
+    except OSError as error:
+        raise ValueError("wiki root must be an existing non-symlink directory") from error
+    try:
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise ValueError("wiki root must be an existing directory")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+@contextmanager
+def _owned_fd(fd: int) -> Iterator[int]:
+    primary: BaseException | None = None
+    try:
+        yield fd
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        try:
+            os.close(fd)
+        except Exception as close_error:
+            if primary is None:
+                raise
+            primary.add_note(
+                f"Wiki fd close failed: {type(close_error).__name__}: {close_error}"
+            )
+
+
+def _optional_stat_at(parent_fd: int, name: str) -> os.stat_result | None:
+    try:
+        return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ValueError("wiki path could not be inspected") from error
+
+
+def _open_directory_at(
+    parent_fd: int,
+    name: str,
+    *,
+    expected: os.stat_result | None = None,
+) -> int:
+    try:
+        fd = os.open(name, _base_flags() | os.O_DIRECTORY, dir_fd=parent_fd)
+    except OSError as error:
+        raise ValueError("wiki directory is invalid, changed, or a symlink") from error
+    try:
+        actual = os.fstat(fd)
+        if not stat.S_ISDIR(actual.st_mode):
+            raise ValueError("wiki directory changed during traversal")
+        if expected is not None and _inode(expected) != _inode(actual):
+            raise ValueError("wiki directory changed during traversal")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _open_regular_at(
+    parent_fd: int,
+    name: str,
+    *,
+    expected: os.stat_result | None = None,
+) -> int:
+    flags = _base_flags() | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as error:
+        raise ValueError("wiki file is invalid, changed, or a symlink") from error
+    try:
+        actual = os.fstat(fd)
+        if not stat.S_ISREG(actual.st_mode):
+            raise ValueError("wiki file must be regular")
+        if expected is not None and _inode(expected) != _inode(actual):
+            raise ValueError("wiki file changed during open")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read_utf8_at(parent_fd: int, name: str, label: str) -> str:
+    before_path = _optional_stat_at(parent_fd, name)
+    if before_path is None or stat.S_ISLNK(before_path.st_mode):
+        raise ValueError(f"wiki root requires a regular {label}")
+    if not stat.S_ISREG(before_path.st_mode):
+        raise ValueError(f"wiki root requires a regular {label}")
+    fd = _open_regular_at(parent_fd, name, expected=before_path)
+    with _owned_fd(fd):
+        before = os.fstat(fd)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, _READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(fd)
+        after_path = _optional_stat_at(parent_fd, name)
+        identity = (before.st_dev, before.st_ino)
+        metadata = (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+        if (
+            identity != _inode(before_path)
+            or metadata
+            != (
+                before_path.st_size,
+                before_path.st_mtime_ns,
+                before_path.st_ctime_ns,
+            )
+            or identity != (after.st_dev, after.st_ino)
+            or metadata != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            or after_path is None
+            or stat.S_ISLNK(after_path.st_mode)
+            or identity != (after_path.st_dev, after_path.st_ino)
+            or (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            != (
+                after_path.st_size,
+                after_path.st_mtime_ns,
+                after_path.st_ctime_ns,
+            )
+        ):
+            raise ValueError("wiki file changed or became a symlink while reading")
+    try:
+        return b"".join(chunks).decode("utf-8")
+    except UnicodeError as error:
+        raise ValueError("wiki Markdown must be valid UTF-8") from error
+
+
+def _markdown_documents(
+    directory_fd: int, prefix: PurePosixPath
+) -> Iterator[tuple[str, str]]:
+    try:
+        names = sorted(os.listdir(directory_fd))
+    except OSError as error:
+        raise ValueError("wiki directory could not be listed") from error
+    for name in names:
+        entry_stat = _optional_stat_at(directory_fd, name)
+        if entry_stat is None:
+            raise ValueError("wiki path changed during traversal")
+        if stat.S_ISLNK(entry_stat.st_mode):
+            raise ValueError("wiki search namespace contains a symlink")
+        relative = prefix / name
+        if stat.S_ISDIR(entry_stat.st_mode):
+            child_fd = _open_directory_at(
+                directory_fd, name, expected=entry_stat
+            )
+            with _owned_fd(child_fd):
+                yield from _markdown_documents(child_fd, relative)
+        elif stat.S_ISREG(entry_stat.st_mode) and name.casefold().endswith(".md"):
+            yield relative.as_posix(), _read_utf8_at(
+                directory_fd, name, relative.as_posix()
+            )
+
+
+def _linked_raw(root_fd: int, relative_path: str, text: str) -> str | None:
+    if not relative_path.startswith("sources/"):
+        return None
+    valid: list[str] = []
+    for match in _RAW_METADATA_RE.finditer(text):
+        candidate = next(value for value in match.groupdict().values() if value)
+        if _valid_raw_path(candidate) and _raw_regular_exists(root_fd, candidate):
+            valid.append(candidate)
+    return min(valid) if valid else None
+
+
+def _valid_raw_path(value: str) -> bool:
+    if "\\" in value or "\x00" in value:
+        return False
+    parts = value.split("/")
+    return (
+        len(parts) >= 2
+        and parts[0] == "raw"
+        and all(part not in ("", ".", "..") for part in parts)
+        and PurePosixPath(value).as_posix() == value
+    )
+
+
+def _raw_regular_exists(root_fd: int, relative_path: str) -> bool:
+    parts = relative_path.split("/")
+    opened: list[tuple[int, str, int]] = []
+    parent_fd = root_fd
+    try:
+        for part in parts[:-1]:
+            component_stat = _optional_stat_at(parent_fd, part)
+            if (
+                component_stat is None
+                or stat.S_ISLNK(component_stat.st_mode)
+                or not stat.S_ISDIR(component_stat.st_mode)
+            ):
+                return False
+            child_fd = _open_directory_at(
+                parent_fd, part, expected=component_stat
+            )
+            opened.append((parent_fd, part, child_fd))
+            parent_fd = child_fd
+        final_stat = _optional_stat_at(parent_fd, parts[-1])
+        if (
+            final_stat is None
+            or stat.S_ISLNK(final_stat.st_mode)
+            or not stat.S_ISREG(final_stat.st_mode)
+        ):
+            return False
+        final_fd = _open_regular_at(
+            parent_fd, parts[-1], expected=final_stat
+        )
+        try:
+            after_final = _optional_stat_at(parent_fd, parts[-1])
+            if (
+                after_final is None
+                or stat.S_ISLNK(after_final.st_mode)
+                or _inode(after_final) != _inode(os.fstat(final_fd))
+            ):
+                return False
+            for ancestor_fd, name, child_fd in opened:
+                after_component = _optional_stat_at(ancestor_fd, name)
+                if (
+                    after_component is None
+                    or stat.S_ISLNK(after_component.st_mode)
+                    or _inode(after_component) != _inode(os.fstat(child_fd))
+                ):
+                    return False
+            return True
+        finally:
+            os.close(final_fd)
+    except (OSError, ValueError):
+        return False
+    finally:
+        for _, _, fd in reversed(opened):
+            os.close(fd)
 
 
 def _sections(
@@ -253,7 +445,7 @@ def _sections(
             continue
         while evidence_stack and evidence_stack[-1][0] >= level:
             evidence_stack.pop()
-        declared = _declared_evidence_layer(heading, section_lines)
+        declared = _declared_section_layer(heading, section_lines)
         evidence_layer = (
             declared
             if declared is not None
@@ -262,28 +454,78 @@ def _sections(
             else "open hypothesis"
         )
         evidence_stack.append((level, evidence_layer))
-        yield _Section(
+        if _normalized_words(heading) == "evidence boundary":
+            yield from _evidence_boundary_fragments(
+                relative_path,
+                section_lines,
+                start + 1,
+                linked_raw_path,
+            )
+            continue
+        yield _section(
             relative_path,
             heading,
             section_lines,
             start + 1,
             evidence_layer,
             linked_raw_path,
-            frozenset(_tokens("\n".join(section_lines))),
-            frozenset(_tokens(heading)),
         )
 
 
-def _declared_evidence_layer(
+def _evidence_boundary_fragments(
+    relative_path: str,
+    lines: tuple[str, ...],
+    line_start: int,
+    linked_raw_path: str | None,
+) -> Iterator[_Section]:
+    for offset, line in enumerate(lines[1:], start=1):
+        if not line.strip():
+            continue
+        match = _EVIDENCE_BULLET_RE.match(line)
+        layer = (
+            _canonical_evidence_label(match.group(1))
+            if match is not None
+            else None
+        )
+        yield _section(
+            relative_path,
+            layer or "",
+            (line,),
+            line_start + offset,
+            layer if layer in _EVIDENCE_LAYERS else "open hypothesis",
+            linked_raw_path,
+        )
+
+
+def _section(
+    relative_path: str,
+    heading: str,
+    lines: tuple[str, ...],
+    line_start: int,
+    evidence_layer: str,
+    linked_raw_path: str | None,
+) -> _Section:
+    return _Section(
+        relative_path,
+        heading,
+        lines,
+        line_start,
+        evidence_layer,
+        linked_raw_path,
+        frozenset(_tokens("\n".join(lines))),
+        frozenset(_tokens(heading)),
+    )
+
+
+def _declared_section_layer(
     heading: str, lines: tuple[str, ...]
 ) -> str | None:
-    marker = _EVIDENCE_MARKER_RE.search("\n".join(lines))
-    if marker is not None:
-        declared = _normalize_label(marker.group(1))
-        return declared if declared in _EVIDENCE_LAYERS else "open hypothesis"
-    normalized_heading = _normalize_label(heading)
+    for line in lines:
+        marker = _EVIDENCE_MARKER_RE.match(line)
+        if marker is not None:
+            return _canonical_evidence_label(marker.group(1)) or "open hypothesis"
     heading_segments = {
-        _normalize_label(segment)
+        _canonical_evidence_label(segment)
         for segment in re.split(
             r"\s*(?:—|–|\||:|\s-\s)\s*",
             unicodedata.normalize("NFKC", heading).casefold(),
@@ -292,38 +534,52 @@ def _declared_evidence_layer(
     for layer in _EVIDENCE_LAYERS:
         if layer in heading_segments:
             return layer
-    if normalized_heading.startswith("interpretation"):
+    if _normalized_words(heading).startswith("interpretation"):
         return "author interpretation"
     return None
 
 
-def _relevant_line_fragment(
-    line: str, query_tokens: frozenset[str], max_chars: int
+def _canonical_evidence_label(value: str) -> str | None:
+    normalized = unicodedata.normalize("NFKC", value).casefold().strip()
+    normalized = _DASH_RE.sub("-", normalized)
+    normalized = re.sub(r"\s*-\s*", "-", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized if normalized in _EVIDENCE_LAYERS else None
+
+
+def _normalized_words(value: str) -> str:
+    return " ".join(_tokens(value))
+
+
+def _token_spans(value: str) -> tuple[_TokenSpan, ...]:
+    spans: list[_TokenSpan] = []
+    for match in _WORD_RE.finditer(value):
+        normalized = unicodedata.normalize("NFKC", match.group()).casefold()
+        spans.extend(
+            _TokenSpan(token.group(), match.start(), match.end())
+            for token in _WORD_RE.finditer(normalized)
+        )
+    return tuple(spans)
+
+
+def _tokens(value: str) -> tuple[str, ...]:
+    return tuple(span.value for span in _token_spans(value))
+
+
+def _line_fragment(
+    line: str, matches: tuple[_TokenSpan, ...], max_chars: int
 ) -> str:
-    normalized = unicodedata.normalize("NFKC", line).casefold()
-    positions = [
-        position
-        for token in query_tokens
-        if (position := normalized.find(token)) >= 0
-    ]
-    if not positions:
+    if not matches:
         return line[:max_chars]
-    normalized_start = max(0, min(positions) - max_chars // 3)
-    if normalized:
-        start = round(normalized_start * len(line) / len(normalized))
-    else:
-        start = 0
+    match = matches[0]
+    start = max(0, match.start - max_chars // 3)
+    start = max(start, match.end - max_chars)
     start = min(start, len(line) - max_chars)
     return line[start : start + max_chars]
 
 
-def _normalize_label(value: str) -> str:
-    return " ".join(_tokens(value))
-
-
-def _tokens(value: str) -> tuple[str, ...]:
-    normalized = unicodedata.normalize("NFKC", value).casefold()
-    return tuple(re.findall(r"[^\W_]+", normalized, flags=re.UNICODE))
+def _inode(value: os.stat_result) -> tuple[int, int]:
+    return value.st_dev, value.st_ino
 
 
 __all__ = ["LocalWikiRetriever"]

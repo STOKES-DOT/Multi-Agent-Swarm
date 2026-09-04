@@ -649,6 +649,8 @@ def test_records_are_frozen_deeply_immutable_and_json_serializable() -> None:
         (lambda: EvaluationContext("run", "particle", 0, Path("relative"), HASH), "workspace"),
         (lambda: WikiQuery("", 1), "text"),
         (lambda: WikiQuery("   ", 1), "text"),
+        (lambda: WikiQuery("x" * (1024 * 1024), 1), "text"),
+        (lambda: WikiQuery(" ".join(f"token{index}" for index in range(300)), 1), "text"),
         (lambda: WikiQuery("query", 0), "max_results"),
         (lambda: WikiQuery("query", 101), "max_results"),
         (lambda: WikiQuery("query", 1, score_threshold=-0.1), "score_threshold"),

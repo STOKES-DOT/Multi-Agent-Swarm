@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import AsyncContextManager, Protocol, runtime_checkable
@@ -16,6 +18,8 @@ _WIKI_EVIDENCE_LAYERS = {
     "cross-paper synthesis",
     "open hypothesis",
 }
+_WIKI_QUERY_MAX_UTF8_BYTES = 16 * 1024
+_WIKI_QUERY_MAX_TOKENS = 256
 
 
 @runtime_checkable
@@ -38,6 +42,17 @@ class WikiQuery:
         _require_nonempty(self.text, "text")
         if not self.text.strip():
             raise ValueError("text must not be blank")
+        try:
+            encoded_text = self.text.encode("utf-8")
+        except UnicodeError as error:
+            raise ValueError("text must be valid UTF-8") from error
+        if len(encoded_text) > _WIKI_QUERY_MAX_UTF8_BYTES:
+            raise ValueError("text exceeds the Wiki query UTF-8 byte limit")
+        normalized_text = unicodedata.normalize("NFKC", self.text).casefold()
+        if len(re.findall(r"[^\W_]+", normalized_text, flags=re.UNICODE)) > (
+            _WIKI_QUERY_MAX_TOKENS
+        ):
+            raise ValueError("text exceeds the Wiki query token limit")
         _require_nonnegative(self.max_results, "max_results")
         if not 1 <= self.max_results <= 100:
             raise ValueError("max_results must be between 1 and 100")
