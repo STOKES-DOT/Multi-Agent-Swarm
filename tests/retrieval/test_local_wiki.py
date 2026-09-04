@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import os
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
 
 import multi_agent_pso.retrieval.local_wiki as local_wiki_module
 from multi_agent_pso.protocols import WikiHit, WikiRetriever
-from multi_agent_pso.retrieval import LocalWikiRetriever, WikiQuery
+from multi_agent_pso.retrieval import LocalWikiRetriever, WikiIndexLimits, WikiQuery
 
 
 FIXTURE_WIKI = Path(__file__).parents[1] / "fixtures" / "wiki"
@@ -805,3 +807,177 @@ def test_query_budget_accepts_normal_chinese_text() -> None:
     query = WikiQuery("红光 吸收 多重共振 发光", 5)
 
     assert query.text == "红光 吸收 多重共振 发光"
+
+
+def test_wiki_index_limits_are_frozen_and_have_explicit_defaults() -> None:
+    limits = WikiIndexLimits()
+
+    assert limits == WikiIndexLimits(
+        max_files=10_000,
+        max_file_bytes=2 * 1024 * 1024,
+        max_total_bytes=64 * 1024 * 1024,
+        max_depth=16,
+        max_sections=100_000,
+        max_total_tokens=2_000_000,
+    )
+    with pytest.raises(FrozenInstanceError):
+        limits.max_files = 1  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: WikiIndexLimits(max_files=0),
+        lambda: WikiIndexLimits(max_file_bytes=True),
+        lambda: WikiIndexLimits(max_total_bytes=0),
+        lambda: WikiIndexLimits(max_depth=-1),
+        lambda: WikiIndexLimits(max_sections=0),
+        lambda: WikiIndexLimits(max_total_tokens=0),
+    ],
+)
+def test_wiki_index_limits_reject_invalid_values(factory) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        factory()
+
+
+def _tracked_fds(monkeypatch) -> set[int]:
+    opened: set[int] = set()
+    original_open = os.open
+    original_close = os.close
+
+    def tracked_open(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is None:
+            fd = original_open(path, flags, mode)
+        else:
+            fd = original_open(path, flags, mode, dir_fd=dir_fd)
+        opened.add(fd)
+        return fd
+
+    def tracked_close(fd: int) -> None:
+        original_close(fd)
+        opened.discard(fd)
+
+    monkeypatch.setattr(os, "open", tracked_open)
+    monkeypatch.setattr(os, "close", tracked_close)
+    return opened
+
+
+def _limit_case(tmp_path: Path, case: str) -> tuple[Path, WikiIndexLimits, str]:
+    defaults = WikiIndexLimits()
+    if case in {"large", "sparse"}:
+        root = _wiki(tmp_path)
+        page = root / "sources/page.md"
+        page.parent.mkdir()
+        if case == "large":
+            page.write_bytes(b"# Large\n" + b"x" * 512)
+        else:
+            with page.open("wb") as stream:
+                stream.truncate(4096)
+        return root, replace(defaults, max_file_bytes=256), "max_file_bytes"
+    if case == "total":
+        root = _wiki(
+            tmp_path,
+            {
+                "sources/a.md": "# A\n" + "a" * 80,
+                "sources/b.md": "# B\n" + "b" * 80,
+            },
+        )
+        declared = sum(path.stat().st_size for path in (root / "sources").iterdir())
+        return root, replace(defaults, max_total_bytes=declared - 1), "max_total_bytes"
+    if case == "files":
+        root = _wiki(
+            tmp_path,
+            {"sources/a.md": "# A\na", "sources/b.md": "# B\nb"},
+        )
+        return root, replace(defaults, max_files=1), "max_files"
+    if case == "depth":
+        root = _wiki(tmp_path, {"sources/a/b/page.md": "# Deep\ndeep"})
+        return root, replace(defaults, max_depth=1), "max_depth"
+    if case == "sections":
+        root = _wiki(tmp_path, {"sources/page.md": "# One\none\n# Two\ntwo"})
+        return root, replace(defaults, max_sections=1), "max_sections"
+    if case == "tokens":
+        root = _wiki(
+            tmp_path,
+            {"sources/page.md": "# Heading\none two three four five"},
+        )
+        return root, replace(defaults, max_total_tokens=3), "max_total_tokens"
+    raise AssertionError(f"unknown limit case: {case}")
+
+
+@pytest.mark.parametrize(
+    "case", ["large", "sparse", "total", "files", "depth", "sections", "tokens"]
+)
+def test_index_limits_fail_closed_and_release_all_fds(
+    tmp_path: Path, monkeypatch, case: str
+) -> None:
+    root, limits, match = _limit_case(tmp_path, case)
+    opened = _tracked_fds(monkeypatch)
+
+    with pytest.raises(ValueError, match=match):
+        LocalWikiRetriever(root, limits=limits)
+
+    assert opened == set()
+
+
+def test_failed_construction_does_not_publish_partial_index(tmp_path: Path) -> None:
+    root, limits, _ = _limit_case(tmp_path, "sections")
+    retriever = object.__new__(LocalWikiRetriever)
+
+    with pytest.raises(ValueError, match="max_sections"):
+        retriever.__init__(root, limits=limits)
+
+    assert not hasattr(retriever, "_agents")
+    assert not hasattr(retriever, "_index")
+    assert not hasattr(retriever, "_sections")
+
+
+def test_section_limit_stops_heading_scan_without_materializing_all_sections(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = _wiki(
+        tmp_path,
+        {
+            "sources/page.md": "\n".join(
+                f"# Heading {index}\nvalue{index}" for index in range(100)
+            )
+        },
+    )
+    original = local_wiki_module._HEADING_RE
+
+    class CountingHeadingPattern:
+        calls = 0
+
+        @classmethod
+        def match(cls, value: str):
+            cls.calls += 1
+            return original.match(value)
+
+    monkeypatch.setattr(local_wiki_module, "_HEADING_RE", CountingHeadingPattern)
+    with pytest.raises(ValueError, match="max_sections"):
+        LocalWikiRetriever(
+            root,
+            limits=replace(WikiIndexLimits(), max_sections=1),
+        )
+
+    assert CountingHeadingPattern.calls <= 5
+
+
+@pytest.mark.parametrize(
+    "primary", [RuntimeError("read failed"), asyncio.CancelledError("cancelled")]
+)
+def test_read_exception_and_cancellation_release_all_fds(
+    tmp_path: Path, monkeypatch, primary: BaseException
+) -> None:
+    root = _wiki(tmp_path, {"sources/page.md": "# Page\ncontent"})
+    opened = _tracked_fds(monkeypatch)
+
+    def failing_read(fd: int, size: int) -> bytes:
+        raise primary
+
+    monkeypatch.setattr(os, "read", failing_read)
+    with pytest.raises(type(primary)) as raised:
+        LocalWikiRetriever(root)
+
+    assert raised.value is primary
+    assert opened == set()

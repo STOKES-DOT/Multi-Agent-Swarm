@@ -45,6 +45,66 @@ _HAS_REQUIRED_FD_CALLS = (
 )
 
 
+def _require_limit(value: object, name: str, *, minimum: int) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{name} must be an integer")
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class WikiIndexLimits:
+    """Hard limits for one immutable Wiki index construction."""
+
+    max_files: int = 10_000
+    max_file_bytes: int = 2 * 1024 * 1024
+    max_total_bytes: int = 64 * 1024 * 1024
+    max_depth: int = 16
+    max_sections: int = 100_000
+    max_total_tokens: int = 2_000_000
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_files",
+            "max_file_bytes",
+            "max_total_bytes",
+            "max_sections",
+            "max_total_tokens",
+        ):
+            _require_limit(getattr(self, name), name, minimum=1)
+        _require_limit(self.max_depth, "max_depth", minimum=0)
+
+
+@dataclass(slots=True)
+class _IndexBudget:
+    limits: WikiIndexLimits
+    file_count: int = 0
+    total_declared_bytes: int = 0
+    section_count: int = 0
+    total_tokens: int = 0
+
+    def reserve_file(self, size: int, label: str) -> None:
+        if size > self.limits.max_file_bytes:
+            raise ValueError(f"{label} exceeds max_file_bytes")
+        if self.file_count >= self.limits.max_files:
+            raise ValueError("Wiki index exceeds max_files")
+        if self.total_declared_bytes + size > self.limits.max_total_bytes:
+            raise ValueError("Wiki index exceeds max_total_bytes")
+        self.file_count += 1
+        self.total_declared_bytes += size
+
+    def begin_section(self) -> None:
+        if self.section_count >= self.limits.max_sections:
+            raise ValueError("Wiki index exceeds max_sections")
+        self.section_count += 1
+
+    def consume_token(self) -> None:
+        if self.total_tokens >= self.limits.max_total_tokens:
+            raise ValueError("Wiki index exceeds max_total_tokens")
+        self.total_tokens += 1
+
+
 @dataclass(frozen=True, slots=True)
 class _TokenSpan:
     value: str
@@ -75,15 +135,37 @@ class _RankedSection:
 class LocalWikiRetriever:
     """Build an immutable in-memory index over approved Markdown namespaces."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        limits: WikiIndexLimits = WikiIndexLimits(),
+    ) -> None:
         if not isinstance(root, Path):
             raise TypeError("wiki root must be a Path")
+        if not isinstance(limits, WikiIndexLimits):
+            raise TypeError("limits must be a WikiIndexLimits")
         _require_fd_platform()
+        budget = _IndexBudget(limits)
         root_fd = _open_root(root)
         with _owned_fd(root_fd):
-            self._agents = _read_utf8_at(root_fd, "AGENTS.md", "AGENTS.md")
-            self._index = _read_utf8_at(root_fd, "index.md", "index.md")
-            self._sections = tuple(self._build_sections(root_fd))
+            agents = _read_utf8_at(
+                root_fd,
+                "AGENTS.md",
+                "AGENTS.md",
+                max_bytes=limits.max_file_bytes,
+            )
+            index = _read_utf8_at(
+                root_fd,
+                "index.md",
+                "index.md",
+                max_bytes=limits.max_file_bytes,
+            )
+            sections = tuple(self._build_sections(root_fd, budget))
+        self._limits = limits
+        self._agents = agents
+        self._index = index
+        self._sections = sections
 
     def search(self, query: WikiQuery) -> tuple[WikiHit, ...]:
         if not isinstance(query, WikiQuery):
@@ -121,7 +203,9 @@ class LocalWikiRetriever:
             for item in ranked[: query.max_results]
         )
 
-    def _build_sections(self, root_fd: int) -> Iterator[_Section]:
+    def _build_sections(
+        self, root_fd: int, budget: _IndexBudget
+    ) -> Iterator[_Section]:
         for namespace in _SEARCH_NAMESPACES:
             namespace_stat = _optional_stat_at(root_fd, namespace)
             if namespace_stat is None:
@@ -135,14 +219,20 @@ class LocalWikiRetriever:
             )
             with _owned_fd(namespace_fd):
                 for relative_path, text in _markdown_documents(
-                    namespace_fd, PurePosixPath(namespace)
+                    namespace_fd,
+                    PurePosixPath(namespace),
+                    budget,
+                    depth=0,
                 ):
                     semantic_lines = _markdown_semantic_lines(text)
                     linked_raw_path = _linked_raw(
                         root_fd, relative_path, semantic_lines
                     )
                     yield from _sections(
-                        relative_path, semantic_lines, linked_raw_path
+                        relative_path,
+                        semantic_lines,
+                        linked_raw_path,
+                        budget,
                     )
 
     @staticmethod
@@ -283,21 +373,43 @@ def _open_regular_at(
         raise
 
 
-def _read_utf8_at(parent_fd: int, name: str, label: str) -> str:
+def _read_utf8_at(
+    parent_fd: int,
+    name: str,
+    label: str,
+    *,
+    max_bytes: int,
+    expected: os.stat_result | None = None,
+) -> str:
     before_path = _optional_stat_at(parent_fd, name)
     if before_path is None or stat.S_ISLNK(before_path.st_mode):
         raise ValueError(f"wiki root requires a regular {label}")
     if not stat.S_ISREG(before_path.st_mode):
         raise ValueError(f"wiki root requires a regular {label}")
+    if expected is not None and (
+        _inode(expected) != _inode(before_path)
+        or _file_metadata(expected) != _file_metadata(before_path)
+    ):
+        raise ValueError("wiki file changed before reading")
+    if before_path.st_size > max_bytes:
+        raise ValueError(f"{label} exceeds max_file_bytes")
     fd = _open_regular_at(parent_fd, name, expected=before_path)
     with _owned_fd(fd):
         before = os.fstat(fd)
-        chunks: list[bytes] = []
+        if before.st_size > max_bytes:
+            raise ValueError(f"{label} exceeds max_file_bytes")
+        data = bytearray()
+        declared_size = before.st_size
         while True:
-            chunk = os.read(fd, _READ_CHUNK_BYTES)
+            remaining = declared_size - len(data)
+            chunk = os.read(fd, min(_READ_CHUNK_BYTES, remaining + 1))
             if not chunk:
                 break
-            chunks.append(chunk)
+            if len(data) + len(chunk) > declared_size:
+                raise ValueError("wiki file exceeds its declared byte size")
+            data.extend(chunk)
+        if len(data) != declared_size:
+            raise ValueError("wiki file length differs from its declared byte size")
         after = os.fstat(fd)
         after_path = _optional_stat_at(parent_fd, name)
         identity = (before.st_dev, before.st_ino)
@@ -324,13 +436,17 @@ def _read_utf8_at(parent_fd: int, name: str, label: str) -> str:
         ):
             raise ValueError("wiki file changed or became a symlink while reading")
     try:
-        return b"".join(chunks).decode("utf-8")
+        return data.decode("utf-8")
     except UnicodeError as error:
         raise ValueError("wiki Markdown must be valid UTF-8") from error
 
 
 def _markdown_documents(
-    directory_fd: int, prefix: PurePosixPath
+    directory_fd: int,
+    prefix: PurePosixPath,
+    budget: _IndexBudget,
+    *,
+    depth: int,
 ) -> Iterator[tuple[str, str]]:
     try:
         names = sorted(os.listdir(directory_fd))
@@ -344,14 +460,27 @@ def _markdown_documents(
             raise ValueError("wiki search namespace contains a symlink")
         relative = prefix / name
         if stat.S_ISDIR(entry_stat.st_mode):
+            if depth >= budget.limits.max_depth:
+                raise ValueError("Wiki index exceeds max_depth")
             child_fd = _open_directory_at(
                 directory_fd, name, expected=entry_stat
             )
             with _owned_fd(child_fd):
-                yield from _markdown_documents(child_fd, relative)
+                yield from _markdown_documents(
+                    child_fd,
+                    relative,
+                    budget,
+                    depth=depth + 1,
+                )
         elif stat.S_ISREG(entry_stat.st_mode) and name.casefold().endswith(".md"):
+            label = relative.as_posix()
+            budget.reserve_file(entry_stat.st_size, label)
             yield relative.as_posix(), _read_utf8_at(
-                directory_fd, name, relative.as_posix()
+                directory_fd,
+                name,
+                label,
+                max_bytes=budget.limits.max_file_bytes,
+                expected=entry_stat,
             )
 
 
@@ -441,47 +570,93 @@ def _sections(
     relative_path: str,
     lines: tuple[str, ...],
     linked_raw_path: str | None,
+    budget: _IndexBudget,
 ) -> Iterator[_Section]:
-    starts = [
-        (index, len(match.group(1)), match.group(2))
-        for index, line in enumerate(lines)
-        if (match := _HEADING_RE.match(line)) is not None
-    ]
-    if not starts and lines:
-        starts = [(0, 1, "")]
     evidence_stack: list[tuple[int, str]] = []
-    for position, (start, level, heading) in enumerate(starts):
-        end = starts[position + 1][0] if position + 1 < len(starts) else len(lines)
-        section_lines = tuple(lines[start:end])
-        if not section_lines:
+    current: tuple[int, int, str] | None = None
+    for index, line in enumerate(lines):
+        match = _HEADING_RE.match(line)
+        if match is None:
             continue
-        while evidence_stack and evidence_stack[-1][0] >= level:
-            evidence_stack.pop()
-        declared = _declared_section_layer(heading, section_lines)
-        evidence_layer = (
-            declared
-            if declared is not None
-            else evidence_stack[-1][1]
-            if evidence_stack
-            else "open hypothesis"
-        )
-        evidence_stack.append((level, evidence_layer))
-        if _normalized_words(heading) == "evidence boundary":
-            yield from _evidence_boundary_fragments(
+        if current is not None:
+            start, level, heading = current
+            yield from _emit_markdown_section(
                 relative_path,
-                section_lines,
+                heading,
+                level,
+                lines[start:index],
                 start + 1,
                 linked_raw_path,
+                evidence_stack,
+                budget,
             )
-            continue
-        yield _section(
+        current = (index, len(match.group(1)), match.group(2))
+    if current is not None:
+        start, level, heading = current
+        yield from _emit_markdown_section(
             relative_path,
             heading,
-            section_lines,
+            level,
+            lines[start:],
             start + 1,
-            evidence_layer,
             linked_raw_path,
+            evidence_stack,
+            budget,
         )
+    elif lines:
+        yield from _emit_markdown_section(
+            relative_path,
+            "",
+            1,
+            lines,
+            1,
+            linked_raw_path,
+            evidence_stack,
+            budget,
+        )
+
+
+def _emit_markdown_section(
+    relative_path: str,
+    heading: str,
+    level: int,
+    section_lines: tuple[str, ...],
+    line_start: int,
+    linked_raw_path: str | None,
+    evidence_stack: list[tuple[int, str]],
+    budget: _IndexBudget,
+) -> Iterator[_Section]:
+    if not section_lines:
+        return
+    while evidence_stack and evidence_stack[-1][0] >= level:
+        evidence_stack.pop()
+    declared = _declared_section_layer(heading, section_lines)
+    evidence_layer = (
+        declared
+        if declared is not None
+        else evidence_stack[-1][1]
+        if evidence_stack
+        else "open hypothesis"
+    )
+    evidence_stack.append((level, evidence_layer))
+    if _normalized_words(heading) == "evidence boundary":
+        yield from _evidence_boundary_fragments(
+            relative_path,
+            section_lines,
+            line_start,
+            linked_raw_path,
+            budget,
+        )
+        return
+    yield _section(
+        relative_path,
+        heading,
+        section_lines,
+        line_start,
+        evidence_layer,
+        linked_raw_path,
+        budget,
+    )
 
 
 def _evidence_boundary_fragments(
@@ -489,6 +664,7 @@ def _evidence_boundary_fragments(
     lines: tuple[str, ...],
     line_start: int,
     linked_raw_path: str | None,
+    budget: _IndexBudget,
 ) -> Iterator[_Section]:
     for offset, line in enumerate(lines[1:], start=1):
         if not line.strip():
@@ -506,6 +682,7 @@ def _evidence_boundary_fragments(
             line_start + offset,
             layer if layer in _EVIDENCE_LAYERS else "open hypothesis",
             linked_raw_path,
+            budget,
         )
 
 
@@ -516,7 +693,13 @@ def _section(
     line_start: int,
     evidence_layer: str,
     linked_raw_path: str | None,
+    budget: _IndexBudget,
 ) -> _Section:
+    budget.begin_section()
+    content_token_values: set[str] = set()
+    for token in _iter_token_spans("\n".join(lines)):
+        budget.consume_token()
+        content_token_values.add(token.value)
     return _Section(
         relative_path,
         heading,
@@ -524,7 +707,7 @@ def _section(
         line_start,
         evidence_layer,
         linked_raw_path,
-        frozenset(_tokens("\n".join(lines))),
+        frozenset(content_token_values),
         frozenset(_tokens(heading)),
     )
 
@@ -570,14 +753,14 @@ def _normalized_words(value: str) -> str:
 
 
 def _token_spans(value: str) -> tuple[_TokenSpan, ...]:
-    spans: list[_TokenSpan] = []
+    return tuple(_iter_token_spans(value))
+
+
+def _iter_token_spans(value: str) -> Iterator[_TokenSpan]:
     for match in _WORD_RE.finditer(value):
         normalized = unicodedata.normalize("NFKC", match.group()).casefold()
-        spans.extend(
-            _TokenSpan(token.group(), match.start(), match.end())
-            for token in _WORD_RE.finditer(normalized)
-        )
-    return tuple(spans)
+        for token in _WORD_RE.finditer(normalized):
+            yield _TokenSpan(token.group(), match.start(), match.end())
 
 
 def _tokens(value: str) -> tuple[str, ...]:
@@ -630,4 +813,8 @@ def _inode(value: os.stat_result) -> tuple[int, int]:
     return value.st_dev, value.st_ino
 
 
-__all__ = ["LocalWikiRetriever"]
+def _file_metadata(value: os.stat_result) -> tuple[int, int, int]:
+    return value.st_size, value.st_mtime_ns, value.st_ctime_ns
+
+
+__all__ = ["LocalWikiRetriever", "WikiIndexLimits"]

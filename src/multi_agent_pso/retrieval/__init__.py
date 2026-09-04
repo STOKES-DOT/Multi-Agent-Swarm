@@ -2,6 +2,6 @@
 
 from multi_agent_pso.protocols import WikiHit, WikiQuery
 
-from .local_wiki import LocalWikiRetriever
+from .local_wiki import LocalWikiRetriever, WikiIndexLimits
 
-__all__ = ["LocalWikiRetriever", "WikiHit", "WikiQuery"]
+__all__ = ["LocalWikiRetriever", "WikiHit", "WikiIndexLimits", "WikiQuery"]
