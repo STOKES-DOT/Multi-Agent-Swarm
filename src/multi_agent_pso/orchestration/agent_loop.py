@@ -77,7 +77,13 @@ class AgentLoop:
         adherence: Mapping[str, JsonValue] = {}
         context = dict(self._context(run_id, particle_id, iteration_id))
         try:
-            thread = await self._start_thread(particle_id)
+            self._started(run_id, particle_id, iteration_id, AgentStage.PENDING, 0, {"workspace": str(self._workspace)})
+            try:
+                thread = await self._start_thread(particle_id)
+            except Exception as error:
+                self._terminal_event(run_id, particle_id, iteration_id, AgentStage.PENDING, "failed", events, payload={"type": type(error).__name__, "message": str(error)[:512]})
+                return await self._finish_episode(None, run_id, particle_id, iteration_id, events, EpisodeStatus.FAILED, self._failed_evaluation(), evaluated, realized, adherence)
+            self._store.append_stage_event(StageEvent(run_id=run_id, particle_id=particle_id, iteration_id=iteration_id, stage=AgentStage.PENDING, attempt=0, event_type="completed", payload={"thread": thread.to_json()}))
             proposal: Mapping[str, JsonValue] = {}
             for stage in (AgentStage.HYPOTHESIZING, AgentStage.PROPOSING_ACTION):
                 current_stage = stage
@@ -110,8 +116,11 @@ class AgentLoop:
                 candidate = self._adapter.candidate_from_tool_result(tool_result, tool_context)
                 context["candidate"] = candidate.to_json()
                 realized = self._adapter.realized_position(candidate)
-                evaluated = self._adapter.evaluated_position(self._target, realized)
-                adherence = self._adapter.position_adherence(self._target, realized)
+                evaluated = self._adapter.evaluated_position(self._copy_json(self._target), self._copy_json(realized))
+                adherence = self._adapter.position_adherence(self._copy_json(self._target), self._copy_json(realized))
+                realized = self._copy_json(realized)
+                evaluated = self._copy_json(evaluated)
+                adherence = self._copy_json(adherence)
             except ValueError as error:
                 self._terminal_event(run_id, particle_id, iteration_id, current_stage, "invalid", events, payload={"tool_request": request.to_json(), "tool_result": tool_result.to_json(), "cached": cached, "type": type(error).__name__, "message": str(error)[:512]})
                 return await self._finish_episode(thread, run_id, particle_id, iteration_id, events, EpisodeStatus.INVALID, self._invalid_evaluation(), evaluated, realized, adherence)
@@ -190,7 +199,8 @@ class AgentLoop:
             else:
                 self._terminal_event(run_id, particle_id, iteration_id, AgentStage.COMPLETED, "cleanup_failed", events, payload={"type": type(close_error).__name__, "message": str(close_error)[:512]})
         elif close_error is not None:
-            self._terminal_event(run_id, particle_id, iteration_id, events[-1].stage if events else AgentStage.PENDING, "cleanup_failed", events, payload={"type": type(close_error).__name__, "message": str(close_error)[:512]})
+            self._started(run_id, particle_id, iteration_id, AgentStage.COMPLETED, 0, {"episode": "cleanup"})
+            self._terminal_event(run_id, particle_id, iteration_id, AgentStage.COMPLETED, "cleanup_failed", events, payload={"type": type(close_error).__name__, "message": str(close_error)[:512]})
         return self._terminal_episode(run_id, particle_id, iteration_id, events, status, evaluation, evaluated, realized, adherence)
 
     async def _agent_stage(
@@ -201,7 +211,7 @@ class AgentLoop:
         events: list[StageEvent],
     ) -> Mapping[str, JsonValue] | None:
         for attempt in range(3):
-            request = self._adapter.build_stage_request(stage, context)
+            request = self._adapter.build_stage_request(stage, self._copy_json(context))
             self._started(str(context["run_id"]), str(context["particle_id"]), int(context["iteration_id"]), stage, attempt, {"request": request.to_json(), "context": context})
             async with self._resources.agent_slot():
                 response = await self._runtime.run_stage(thread, request)
@@ -215,6 +225,7 @@ class AgentLoop:
                     return None
                 self._terminal_event(str(context["run_id"]), str(context["particle_id"]), int(context["iteration_id"]), stage, "failed", events, attempt, diagnostic)
                 continue
+            parsed = self._copy_json(parsed)
             context.pop("correction", None)
             self._terminal_event(str(context["run_id"]), str(context["particle_id"]), int(context["iteration_id"]), stage, "completed", events, attempt, {"output": parsed, "usage": response.usage.to_json(), "provider_metadata": dict(response.provider_metadata)})
             return parsed

@@ -27,7 +27,11 @@ async def test_agent_loop_runs_terminal_stages_in_order_and_pairs_persistence(tm
     assert episode.evaluation is not None
     assert episode.evaluation.status is EvaluationStatus.SUCCESS
     stored = dependencies["run_store"].events
-    assert [(event.stage, event.event_type) for event in stored] == [
+    assert [(event.stage, event.event_type) for event in stored[:2]] == [
+        (AgentStage.PENDING, "started"),
+        (AgentStage.PENDING, "completed"),
+    ]
+    assert [(event.stage, event.event_type) for event in stored[2:]] == [
         (stage, kind)
         for stage in [
             AgentStage.HYPOTHESIZING,
@@ -107,7 +111,7 @@ async def test_stage_audit_payloads_carry_context_outputs_and_reflection_inputs(
     reflection_context = dependencies["task_adapter"].contexts[AgentStage.REFLECTING][-1]
     assert {"hypothesis", "proposal", "tool_request", "tool_result", "candidate", "evaluation"} <= set(reflection_context)
     assert dependencies["run_store"].events[0].event_type == "started"
-    assert "request" in dependencies["run_store"].events[0].payload
+    assert "request" in dependencies["run_store"].events[2].payload
 
 
 @pytest.mark.asyncio
