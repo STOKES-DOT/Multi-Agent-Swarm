@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
@@ -11,7 +12,6 @@ from pydantic import JsonValue
 
 from multi_agent_pso.core import (
     AgentEpisode,
-    EpisodeCheckpoint,
     IterationSnapshot,
     PositionSpace,
     RunStatus,
@@ -155,23 +155,23 @@ class SynchronousSwarmRunner(Generic[P, V]):
             if not isinstance(particle_id, str):
                 raise ValueError("serialized particle_id must be a string")
             loop = self.episode_factory(serialized_particle["position"])
-            checkpoint_json = self.store.get_latest_stage_checkpoint_json(
-                self.run_id, particle_id, snapshot.iteration_id
-            )
-            checkpoint = (
-                None
-                if checkpoint_json is None
-                else EpisodeCheckpoint.model_validate(checkpoint_json)
-            )
             return await loop.run_particle(
                 self.run_id,
                 particle_id,
                 snapshot.iteration_id,
-                resume=checkpoint,
+                resume=None,
             )
 
         serialized = [particle.model_dump(mode="json") for particle in snapshot.particles]
-        gathered = await asyncio.gather(*(run_particle(particle) for particle in serialized))
+        tasks = [asyncio.create_task(run_particle(particle)) for particle in serialized]
+        try:
+            gathered = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         episodes = tuple(sorted(gathered, key=lambda episode: episode.particle_id))
         expected = tuple(particle.particle_id for particle in snapshot.particles)
         actual = tuple(episode.particle_id for episode in episodes)
@@ -201,6 +201,27 @@ class SynchronousSwarmRunner(Generic[P, V]):
             or snapshot.state_format_version != 1
         ):
             raise IncompatibleCheckpointError("iteration snapshot identity is incompatible")
+        rng_state = snapshot.rng_state
+        if not isinstance(rng_state, Mapping):
+            raise IncompatibleCheckpointError("snapshot RNG state must be an object")
+        stored_seed = rng_state.get("run_seed")
+        if type(stored_seed) is not int or stored_seed != self.run_seed:
+            raise IncompatibleCheckpointError("snapshot run seed is incompatible")
+        stored_iteration = rng_state.get("iteration")
+        if type(stored_iteration) is not int or stored_iteration != snapshot.iteration_id:
+            raise IncompatibleCheckpointError("snapshot RNG iteration is incompatible")
+        snapshot_budget = snapshot.model_dump(mode="json")["resource_budget"]
+        if self._canonical_json(snapshot_budget) != self._canonical_json(
+            self.resource_budget
+        ):
+            raise IncompatibleCheckpointError("snapshot resource budget is incompatible")
+
+    @staticmethod
+    def _canonical_json(value: object) -> str:
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            allow_nan=False,
+        )
 
     def _validated_snapshot(self, payload: Mapping[str, JsonValue]) -> IterationSnapshot:
         try:
@@ -214,7 +235,11 @@ class SynchronousSwarmRunner(Generic[P, V]):
 
     def resume(self) -> "SynchronousSwarmRunner[P, V]":
         recovered = RecoveryManager(
-            self.store, self.run_id, self.config_snapshot_hash
+            self.store,
+            self.run_id,
+            self.config_snapshot_hash,
+            self.run_seed,
+            self.resource_budget,
         ).load_latest_snapshot()
         return SynchronousSwarmRunner(
             run_id=self.run_id,

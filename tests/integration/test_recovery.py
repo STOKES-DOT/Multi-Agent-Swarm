@@ -23,6 +23,29 @@ async def test_resume_reuses_committed_tool_result(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_checkpoint_decision_occurs_inside_episode_claim(tmp_path) -> None:
+    runner, tool = make_interruptible_runner(tmp_path, interrupt_after=AgentStage.EXECUTING)
+    with pytest.raises(asyncio.CancelledError):
+        await runner.run(iterations=1)
+    store = runner.store
+    original = store.get_latest_stage_checkpoint_json
+
+    def claimed_read(run_id, particle_id, iteration_id):
+        claim = store._episode_claims[(run_id, particle_id, iteration_id)]
+        assert claim.locked(), "checkpoint was read before acquiring episode claim"
+        return original(run_id, particle_id, iteration_id)
+
+    store.get_latest_stage_checkpoint_json = claimed_read
+    before_started = len(runner.external_call_counts()) and runner.external_call_counts()[0]
+
+    result = await runner.resume().run(iterations=1)
+
+    assert result.final_snapshot.iteration_id == 1
+    assert runner.external_call_counts()[0] == before_started
+    assert tool.executions_for("run-1", "p0", 0, "EXECUTING") == 1
+
+
+@pytest.mark.asyncio
 async def test_resume_rebuilds_completed_particle_without_external_calls(tmp_path) -> None:
     runner, tool = make_interruptible_runner(tmp_path, interrupt_after=AgentStage.COMPLETED)
     with pytest.raises(asyncio.CancelledError):

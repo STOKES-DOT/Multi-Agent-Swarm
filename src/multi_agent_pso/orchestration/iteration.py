@@ -164,6 +164,31 @@ def advance_snapshot(
         for episode in episodes
     ):
         raise ValueError("episode identity does not match the source snapshot")
+    terminal_statuses = {
+        EpisodeStatus.COMPLETED,
+        EpisodeStatus.INVALID,
+        EpisodeStatus.FAILED,
+        EpisodeStatus.TIMEOUT,
+    }
+    for episode in episodes:
+        if episode.status not in terminal_statuses:
+            raise ValueError("episodes must have a terminal status")
+        if episode.status is EpisodeStatus.COMPLETED:
+            evaluation = episode.evaluation
+            references = (
+                episode.candidate_reference,
+                episode.candidate_hash,
+                episode.hypothesis_reference,
+                episode.evaluation_reference,
+            )
+            if (
+                evaluation is None
+                or evaluation.status is not EvaluationStatus.SUCCESS
+                or not all(references)
+            ):
+                raise ValueError(
+                    "completed episodes require a successful evaluation and references"
+                )
 
     updated_bests: dict[str, PersonalBest | None] = {}
     generation_success = False

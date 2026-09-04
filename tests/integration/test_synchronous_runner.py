@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import numpy as np
@@ -18,6 +19,7 @@ from multi_agent_pso.core.randomness import derive_seed
 from multi_agent_pso.core.topology import RingTopology
 from multi_agent_pso.core.update_rule import ConstrictedUpdateRule
 from multi_agent_pso.orchestration.iteration import advance_snapshot, initial_snapshot
+from multi_agent_pso.orchestration import IncompatibleCheckpointError
 from tests.orchestration.fakes import make_fake_runner
 
 
@@ -198,6 +200,44 @@ def test_null_pbest_and_sbest_do_not_consume_rng_when_generation_updates() -> No
     assert trace.social_rng_state_before == trace.social_rng_state_after
 
 
+@pytest.mark.parametrize("status", [EpisodeStatus.PENDING, EpisodeStatus.INTERRUPTED])
+def test_advance_snapshot_rejects_nonterminal_episode_status(status) -> None:
+    space = ContinuousBoxPositionSpace([-1.0], [1.0])
+    snapshot = initial_snapshot(
+        run_id="run-1", run_seed=23, config_snapshot_hash="f" * 64,
+        particle_ids=("p0",), space=space,
+    )
+    episode = _episode("p0", 0, quality=None).model_copy(update={"status": status})
+    with pytest.raises(ValueError, match="terminal"):
+        advance_snapshot(
+            snapshot, (episode,), run_seed=23, space=space,
+            adapter=QualityAdapter(), topology=RingTopology(),
+            update_rule=ConstrictedUpdateRule(), failure_threshold=2,
+        )
+
+
+def test_advance_snapshot_rejects_malformed_completed_success() -> None:
+    space = ContinuousBoxPositionSpace([-1.0], [1.0])
+    snapshot = initial_snapshot(
+        run_id="run-1", run_seed=29, config_snapshot_hash="1" * 64,
+        particle_ids=("p0",), space=space,
+    )
+    malformed = AgentEpisode(
+        episode_id="episode", run_id="run-1", particle_id="p0", iteration_id=0,
+        target_position=[0.0], evaluated_position=[0.0],
+        evaluation=Evaluation(
+            status=EvaluationStatus.SUCCESS, feasible=True, fitness=1.0
+        ),
+        status=EpisodeStatus.COMPLETED,
+    )
+    with pytest.raises(ValueError, match="successful|reference"):
+        advance_snapshot(
+            snapshot, (malformed,), run_seed=29, space=space,
+            adapter=QualityAdapter(), topology=RingTopology(),
+            update_rule=ConstrictedUpdateRule(), failure_threshold=2,
+        )
+
+
 async def test_completion_order_does_not_change_next_snapshot(tmp_path) -> None:
     fast_first = make_fake_runner(
         tmp_path / "a", delays={"p0": 0.0, "p1": 0.02}, seed=42
@@ -249,3 +289,56 @@ async def test_no_success_generation_commits_pause_and_stops(tmp_path) -> None:
     ]
     latest = runner.store.get_latest_committed_snapshot_json("run-1")
     assert latest["run_status"] == RunStatus.PAUSED_NO_SUCCESS.value
+
+
+async def test_generation_failure_cancels_and_drains_sibling_tasks(tmp_path) -> None:
+    runner = make_fake_runner(tmp_path, delays={}, seed=31)
+    primary = RuntimeError("particle primary")
+    sibling_cancelled = asyncio.Event()
+    sibling_completed = asyncio.Event()
+
+    class SupervisedLoop:
+        async def run_particle(self, run_id, particle_id, iteration_id, *, resume=None):
+            if particle_id == "p0":
+                await asyncio.sleep(0)
+                raise primary
+            try:
+                await asyncio.sleep(0.2)
+                sibling_completed.set()
+            except asyncio.CancelledError:
+                sibling_cancelled.set()
+                raise
+
+    runner.episode_factory = lambda target: SupervisedLoop()
+    with pytest.raises(RuntimeError) as raised:
+        await runner.run(iterations=1)
+    assert raised.value is primary
+    assert sibling_cancelled.is_set()
+    await asyncio.sleep(0.25)
+    assert not sibling_completed.is_set()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("run_seed", 999),
+        ("run_seed", True),
+        ("iteration", 999),
+        ("iteration", False),
+        ("resource_budget", {"evaluations": 999}),
+    ],
+)
+def test_recovery_rejects_snapshot_authority_mismatch_without_external_calls(
+    tmp_path, field, value
+) -> None:
+    runner = make_fake_runner(tmp_path, delays={}, seed=37)
+    runner.ensure_initial_snapshot()
+    stored = runner.store.snapshots[("run-1", 0)]
+    if field == "resource_budget":
+        stored["resource_budget"] = value
+    else:
+        stored["rng_state"][field] = value
+    before = list(runner.episode_calls)
+    with pytest.raises(IncompatibleCheckpointError, match="seed|iteration|resource"):
+        runner.resume()
+    assert runner.episode_calls == before

@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from collections.abc import Mapping
+
+from pydantic import JsonValue
 
 from multi_agent_pso.core import IterationSnapshot
 from multi_agent_pso.protocols import RunStore
@@ -15,6 +19,8 @@ class RecoveryManager:
     store: RunStore
     run_id: str
     config_snapshot_hash: str
+    run_seed: int
+    resource_budget: Mapping[str, JsonValue]
 
     def load_latest_snapshot(self) -> IterationSnapshot:
         stored_hash = self.store.get_run_snapshot_hash(self.run_id)
@@ -33,7 +39,27 @@ class RecoveryManager:
             or snapshot.state_format_version != 1
         ):
             raise IncompatibleCheckpointError("committed iteration snapshot is incompatible")
+        if not isinstance(snapshot.rng_state, Mapping):
+            raise IncompatibleCheckpointError("snapshot RNG state must be an object")
+        stored_seed = snapshot.rng_state.get("run_seed")
+        if type(stored_seed) is not int or stored_seed != self.run_seed:
+            raise IncompatibleCheckpointError("snapshot run seed is incompatible")
+        stored_iteration = snapshot.rng_state.get("iteration")
+        if type(stored_iteration) is not int or stored_iteration != snapshot.iteration_id:
+            raise IncompatibleCheckpointError("snapshot RNG iteration is incompatible")
+        snapshot_budget = snapshot.model_dump(mode="json")["resource_budget"]
+        if self._canonical_json(snapshot_budget) != self._canonical_json(
+            self.resource_budget
+        ):
+            raise IncompatibleCheckpointError("snapshot resource budget is incompatible")
         return snapshot
+
+    @staticmethod
+    def _canonical_json(value: object) -> str:
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            allow_nan=False,
+        )
 
 
 __all__ = ["RecoveryManager"]

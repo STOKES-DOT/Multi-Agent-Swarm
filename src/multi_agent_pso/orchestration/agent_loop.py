@@ -315,6 +315,17 @@ class AgentLoop:
         if resume is not None and not isinstance(resume, EpisodeCheckpoint):
             raise IncompatibleCheckpointError("resume must be an EpisodeCheckpoint")
         with self._store.episode_claim(run_id, particle_id, iteration_id):
+            if resume is None:
+                checkpoint_json = self._store.get_latest_stage_checkpoint_json(
+                    run_id, particle_id, iteration_id
+                )
+                if checkpoint_json is not None:
+                    try:
+                        resume = EpisodeCheckpoint.model_validate(checkpoint_json)
+                    except (TypeError, ValueError) as error:
+                        raise IncompatibleCheckpointError(
+                            "latest episode checkpoint is invalid"
+                        ) from error
             return await self._run_claimed_particle(
                 run_id, particle_id, iteration_id, resume
             )
