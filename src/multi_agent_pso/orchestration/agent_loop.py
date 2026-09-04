@@ -436,7 +436,7 @@ class AgentLoop:
                     raise AssertionError("resume cursor must be nonterminal")
 
             start_index = _STAGE_ORDER.index(start_stage)
-            if self._is_non_success_finalization(resume, context):
+            if self._is_non_success_finalization(resume, events):
                 (
                     resumed_status,
                     resumed_evaluation,
@@ -990,7 +990,15 @@ class AgentLoop:
             raise IncompatibleCheckpointError(
                 "checkpoint persistence records are invalid"
             ) from error
-        return latest, context_value, events
+        episode_events = [
+            event
+            for event in events
+            if not (
+                event.stage is AgentStage.PENDING
+                and event.event_type == "completed"
+            )
+        ]
+        return latest, context_value, episode_events
 
     def _validated_resume_events(
         self, checkpoint: EpisodeCheckpoint, stored_events: object
@@ -1058,8 +1066,7 @@ class AgentLoop:
             latest_terminal_sequence = sequence
             if sequence == checkpoint.terminal_event_sequence:
                 selected = event
-            if event.stage is not AgentStage.PENDING:
-                restored.append(event)
+            restored.append(event)
         if selected is None or latest_terminal_sequence != checkpoint.terminal_event_sequence:
             raise IncompatibleCheckpointError(
                 "checkpoint does not identify the latest terminal event"
@@ -1139,7 +1146,26 @@ class AgentLoop:
                     "checkpoint tool result does not match committed tool result"
                 )
             self._verify_tool_result_artifacts(committed_result)
-        self._validate_context_evidence(checkpoint, context, events)
+        authority = (
+            self._derive_terminal_authority(checkpoint, events)
+            if checkpoint.completed_stage is AgentStage.COMPLETED
+            else None
+        )
+        if authority is not None:
+            primary_status, final_status, finalization = authority
+            if context.get("primary_status") != primary_status.value:
+                raise IncompatibleCheckpointError(
+                    "checkpoint primary status differs from stage evidence"
+                )
+            if context.get("episode_status") != final_status.value:
+                raise IncompatibleCheckpointError(
+                    "checkpoint episode status differs from stage evidence"
+                )
+            if context.get("finalization") != finalization:
+                raise IncompatibleCheckpointError(
+                    "checkpoint finalization differs from stage evidence"
+                )
+        self._validate_context_evidence(checkpoint, context, events, authority)
         if checkpoint.next_stage is None:
             self._terminal_fields_from_context(context)
             return
@@ -1148,7 +1174,7 @@ class AgentLoop:
                 "resumable checkpoint is missing thread identity"
             )
         self._hydrate_checkpoint_thread(checkpoint.thread_json, checkpoint.particle_id)
-        if self._is_non_success_finalization(checkpoint, context):
+        if self._is_non_success_finalization(checkpoint, events):
             self._terminal_fields_from_context(context)
             return
         stage_index = _STAGE_ORDER.index(checkpoint.next_stage)
@@ -1180,11 +1206,15 @@ class AgentLoop:
         checkpoint: EpisodeCheckpoint,
         context: Mapping[str, JsonValue],
         events: list[StageEvent],
+        authority: tuple[EpisodeStatus, EpisodeStatus, str] | None,
     ) -> None:
         completed_indices: list[int] = []
         completed_stages: set[AgentStage] = set()
         for event in events:
-            if event.event_type != "completed" or event.stage is AgentStage.COMPLETED:
+            if event.event_type != "completed" or event.stage in {
+                AgentStage.PENDING,
+                AgentStage.COMPLETED,
+            }:
                 continue
             index = _STAGE_ORDER.index(event.stage)
             if event.stage in completed_stages:
@@ -1201,7 +1231,7 @@ class AgentLoop:
             )
 
         non_success_finalization = self._is_non_success_finalization(
-            checkpoint, context
+            checkpoint, events
         )
         if checkpoint.next_stage is not None and not non_success_finalization:
             cursor_index = _STAGE_ORDER.index(checkpoint.next_stage)
@@ -1250,7 +1280,9 @@ class AgentLoop:
             ):
                 continue
             if not matching and self._matches_terminal_default(
-                context_key, context
+                context_key,
+                context,
+                None if authority is None else authority[0],
             ):
                 continue
             if not matching or matching[-1].payload.get("truncated") is True:
@@ -1276,9 +1308,10 @@ class AgentLoop:
                     "checkpoint episode references are incomplete"
                 )
             references = tuple(context[key] for key in reference_keys)
-            completed_episode = (
-                context.get("episode_status") == EpisodeStatus.COMPLETED.value
+            final_status = (
+                None if authority is None else authority[1]
             )
+            completed_episode = final_status is EpisodeStatus.COMPLETED
             if completed_episode and not all(
                 isinstance(value, str) and value for value in references
             ):
@@ -1383,35 +1416,141 @@ class AgentLoop:
             self._canonical_json(cached.to_json()),
         }
 
-    @staticmethod
+    def _derive_terminal_authority(
+        self,
+        checkpoint: EpisodeCheckpoint,
+        events: list[StageEvent],
+    ) -> tuple[EpisodeStatus, EpisodeStatus, str]:
+        business_events = [
+            event for event in events if event.stage is not AgentStage.COMPLETED
+        ]
+        effective_failure: tuple[int, StageEvent] | None = None
+        for index, event in enumerate(business_events):
+            if event.event_type not in {"invalid", "failed", "timeout"}:
+                continue
+            is_schema_correction = (
+                event.event_type == "failed"
+                and event.stage
+                in {
+                    AgentStage.HYPOTHESIZING,
+                    AgentStage.PROPOSING_ACTION,
+                    AgentStage.REFLECTING,
+                }
+                and any(
+                    later.stage is event.stage
+                    and later.attempt > event.attempt
+                    and later.event_type != "interrupted"
+                    for later in business_events[index + 1 :]
+                )
+            )
+            if not is_schema_correction:
+                effective_failure = (index, event)
+        if effective_failure is None:
+            if not any(
+                event.stage is AgentStage.REFLECTING
+                and event.event_type == "completed"
+                for event in business_events
+            ):
+                raise IncompatibleCheckpointError(
+                    "terminal episode has no authoritative business outcome"
+                )
+            primary_status = EpisodeStatus.COMPLETED
+        else:
+            failure_index, failure = effective_failure
+            if any(
+                later.event_type != "interrupted"
+                for later in business_events[failure_index + 1 :]
+            ):
+                raise IncompatibleCheckpointError(
+                    "stage evidence continues after a terminal business failure"
+                )
+            primary_status = {
+                "invalid": EpisodeStatus.INVALID,
+                "failed": EpisodeStatus.FAILED,
+                "timeout": EpisodeStatus.TIMEOUT,
+            }[failure.event_type]
+
+        completed_events = [
+            event for event in events if event.stage is AgentStage.COMPLETED
+        ]
+        if not completed_events:
+            raise IncompatibleCheckpointError(
+                "terminal episode has no COMPLETED finalization event"
+            )
+        final_event = completed_events[-1]
+        if final_event.payload.get("truncated") is True:
+            raise IncompatibleCheckpointError(
+                "COMPLETED finalization evidence is truncated"
+            )
+        expected_finalization = {
+            "completed": "completed",
+            "cleanup_failed": "cleanup_failed",
+            "interrupted": "interrupted",
+        }.get(final_event.event_type)
+        if expected_finalization is None:
+            raise IncompatibleCheckpointError(
+                "COMPLETED finalization event type is invalid"
+            )
+        if final_event.payload.get("primary_status") != primary_status.value:
+            raise IncompatibleCheckpointError(
+                "COMPLETED primary status differs from business evidence"
+            )
+        if final_event.payload.get("finalization") != expected_finalization:
+            raise IncompatibleCheckpointError(
+                "COMPLETED finalization payload is inconsistent"
+            )
+        if final_event.event_type == "cleanup_failed":
+            final_status = (
+                EpisodeStatus.FAILED
+                if primary_status is EpisodeStatus.COMPLETED
+                else primary_status
+            )
+        else:
+            final_status = primary_status
+        if (
+            final_event.stage,
+            final_event.attempt,
+            final_event.event_type,
+        ) != (
+            checkpoint.completed_stage,
+            checkpoint.completed_attempt,
+            checkpoint.terminal_event_type,
+        ):
+            raise IncompatibleCheckpointError(
+                "checkpoint does not identify the authoritative finalization"
+            )
+        return primary_status, final_status, expected_finalization
+
     def _is_non_success_finalization(
+        self,
         checkpoint: EpisodeCheckpoint | None,
-        context: Mapping[str, JsonValue],
+        events: list[StageEvent],
     ) -> bool:
-        return (
+        if not (
             checkpoint is not None
             and checkpoint.completed_stage is AgentStage.COMPLETED
             and checkpoint.terminal_event_type == "interrupted"
             and checkpoint.next_stage is AgentStage.COMPLETED
-            and context.get("episode_status")
-            in {
-                EpisodeStatus.INVALID.value,
-                EpisodeStatus.FAILED.value,
-                EpisodeStatus.TIMEOUT.value,
-            }
+        ):
+            return False
+        primary_status, _, _ = self._derive_terminal_authority(
+            checkpoint, events
         )
+        return primary_status is not EpisodeStatus.COMPLETED
 
     def _matches_terminal_default(
-        self, key: str, context: Mapping[str, JsonValue]
+        self,
+        key: str,
+        context: Mapping[str, JsonValue],
+        primary_status: EpisodeStatus | None,
     ) -> bool:
         if key == "evaluation":
             try:
-                status = EpisodeStatus(context["episode_status"])
                 expected_status = {
                     EpisodeStatus.INVALID: EvaluationStatus.INVALID,
                     EpisodeStatus.FAILED: EvaluationStatus.FAILED,
                     EpisodeStatus.TIMEOUT: EvaluationStatus.TIMEOUT,
-                }[status]
+                }[primary_status]
                 expected = Evaluation(status=expected_status, feasible=False)
                 actual = Evaluation.model_validate(context[key])
             except (KeyError, TypeError, ValueError):

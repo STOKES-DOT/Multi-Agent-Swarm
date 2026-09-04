@@ -2241,6 +2241,109 @@ async def test_partial_candidate_invalid_terminal_is_resumable(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source_status", [ToolStatus.REJECTED, ToolStatus.FAILED])
+async def test_terminal_resume_rejects_context_status_self_authentication(
+    tmp_path, source_status
+):
+    dependencies = make_fake_dependencies(tmp_path, tool_status=source_status)
+    loop = AgentLoop(**dependencies)
+    await loop.run_particle("run-1", "p0", 0)
+    store = dependencies["run_store"]
+    context = store.checkpoints[("run-1", "p0", 0)][-1]["context"]
+    tampered_status = (
+        EpisodeStatus.FAILED
+        if source_status is ToolStatus.REJECTED
+        else EpisodeStatus.INVALID
+    )
+    context["primary_status"] = tampered_status.value
+    context["episode_status"] = tampered_status.value
+    context["evaluation"] = {
+        "status": (
+            EvaluationStatus.FAILED.value
+            if tampered_status is EpisodeStatus.FAILED
+            else EvaluationStatus.INVALID.value
+        ),
+        "feasible": False,
+        "metrics": {},
+        "constraints": [],
+        "fitness": None,
+        "uncertainty": None,
+        "provenance": {},
+    }
+    checkpoint = EpisodeCheckpoint.model_validate(
+        store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    )
+
+    with pytest.raises(IncompatibleCheckpointError, match="status"):
+        await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+
+@pytest.mark.asyncio
+async def test_terminal_resume_rejects_tampered_completed_cleanup_payload(tmp_path):
+    dependencies = make_fake_dependencies(
+        tmp_path, close_failure=RuntimeError("close failed")
+    )
+    loop = AgentLoop(**dependencies)
+    await loop.run_particle("run-1", "p0", 0)
+    store = dependencies["run_store"]
+    final_index = next(
+        index
+        for index in range(len(store.stored_events) - 1, -1, -1)
+        if store.stored_events[index].event.stage is AgentStage.COMPLETED
+        and store.stored_events[index].event.event_type == "cleanup_failed"
+    )
+    final_stored = store.stored_events[final_index]
+    payload = dict(final_stored.event.payload)
+    payload["primary_status"] = "FAILED"
+    store.stored_events[final_index] = StoredStageEvent(
+        sequence=final_stored.sequence,
+        event=final_stored.event.model_copy(update={"payload": payload}),
+    )
+    context = store.checkpoints[("run-1", "p0", 0)][-1]["context"]
+    context["primary_status"] = "FAILED"
+    checkpoint = EpisodeCheckpoint.model_validate(
+        store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    )
+
+    with pytest.raises(IncompatibleCheckpointError, match="primary status"):
+        await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    ["tool_invalid", "evaluation_invalid", "agent_invalid", "reflection_invalid", "cleanup_failed"],
+)
+async def test_terminal_resume_rebuilds_authoritative_nonhappy_outcomes(
+    tmp_path, case
+):
+    options = {
+        "tool_invalid": {"tool_status": ToolStatus.REJECTED},
+        "evaluation_invalid": {"evaluator_status": EvaluationStatus.INVALID},
+        "agent_invalid": {"invalid_responses": 3},
+        "reflection_invalid": {
+            "raw_responses": {AgentStage.REFLECTING: "not-json"}
+        },
+        "cleanup_failed": {"close_failure": RuntimeError("close failed")},
+    }[case]
+    dependencies = make_fake_dependencies(tmp_path, **options)
+    loop = AgentLoop(**dependencies)
+    original = await loop.run_particle("run-1", "p0", 0)
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json(
+            "run-1", "p0", 0
+        )
+    )
+
+    rebuilt = await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert rebuilt.model_dump(mode="json") == original.model_dump(mode="json")
+    if case == "reflection_invalid":
+        assert rebuilt.status is EpisodeStatus.INVALID
+        assert rebuilt.evaluation.status is EvaluationStatus.SUCCESS
+
+
+@pytest.mark.asyncio
 async def test_fake_store_rejects_missing_persisted_prefix_terminal(tmp_path):
     dependencies = make_fake_dependencies(
         tmp_path,
