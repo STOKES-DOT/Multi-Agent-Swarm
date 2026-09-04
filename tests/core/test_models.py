@@ -4,6 +4,8 @@ import math
 import pytest
 from pydantic import ValidationError
 
+import multi_agent_pso.core.models as core_models
+
 from multi_agent_pso.core.models import (
     AgentEpisode,
     AgentStage,
@@ -17,6 +19,16 @@ from multi_agent_pso.core.models import (
     PersonalBest,
     StageEvent,
 )
+
+
+def _success_evaluation(fitness: float = 1.0) -> Evaluation:
+    return Evaluation(
+        status=EvaluationStatus.SUCCESS,
+        feasible=True,
+        fitness=fitness,
+        metrics={"score": fitness},
+        provenance={"source": "test"},
+    )
 
 
 def test_success_requires_finite_fitness() -> None:
@@ -147,6 +159,7 @@ def test_required_positions_accept_json_lists_but_not_null() -> None:
         hypothesis_reference="hypothesis-1",
         evaluation_reference="evaluation-1",
         candidate_hash="a" * 64,
+        evaluation=_success_evaluation(),
         fitness=1.0,
         iteration_id=0,
     )
@@ -159,6 +172,7 @@ def test_required_positions_accept_json_lists_but_not_null() -> None:
             hypothesis_reference="hypothesis-1",
             evaluation_reference="evaluation-1",
             candidate_hash="a" * 64,
+            evaluation=_success_evaluation(),
             fitness=1.0,
             iteration_id=0,
         )
@@ -273,6 +287,7 @@ def test_frozen_positions_can_be_reused_directly_by_core_models() -> None:
         hypothesis_reference="hypothesis-1",
         evaluation_reference="evaluation-1",
         candidate_hash="a" * 64,
+        evaluation=_success_evaluation(),
         fitness=1.0,
         iteration_id=0,
     )
@@ -345,6 +360,9 @@ def test_snapshot_serialization_is_immutable_and_round_trips_as_standard_json() 
         particles=(particle,),
         config_snapshot_hash="a" * 64,
         rng_state=position,
+        sbest_particle_ids={"p1": None},
+        resource_budget={},
+        update_traces={},
     )
     before = snapshot.model_dump(mode="json")
     with pytest.raises((TypeError, AttributeError)):
@@ -366,6 +384,7 @@ def test_extra_fields_hashes_and_counters_are_validated() -> None:
             hypothesis_reference="hypothesis-1",
             evaluation_reference="evaluation-1",
             candidate_hash="invalid",
+            evaluation=_success_evaluation(),
             fitness=1.0,
             iteration_id=0,
         )
@@ -376,6 +395,7 @@ def test_extra_fields_hashes_and_counters_are_validated() -> None:
             hypothesis_reference="hypothesis-1",
             evaluation_reference="evaluation-1",
             candidate_hash="a" * 64,
+            evaluation=_success_evaluation(),
             fitness=1.0,
             iteration_id=-1,
         )
@@ -467,6 +487,7 @@ def test_all_records_retain_their_approved_fields() -> None:
         hypothesis_reference="hypothesis-1",
         evaluation_reference="evaluation-1",
         candidate_hash=digest,
+        evaluation=_success_evaluation(-1.5),
         fitness=-1.5,
         iteration_id=0,
     )
@@ -513,10 +534,205 @@ def test_all_records_retain_their_approved_fields() -> None:
         gbest=pbest,
         config_snapshot_hash=digest,
         rng_state={"seed": 2},
+        sbest_particle_ids={"particle-1": "particle-1"},
+        resource_budget={"agent_slots": 1},
+        update_traces={},
     )
     assert snapshot.particles[0].pbest == pbest
     assert episode.events == (event,)
     assert artifact.committed is True
+
+
+def test_personal_best_embeds_authoritative_success_evaluation() -> None:
+    evaluation = _success_evaluation(2.5)
+    best = PersonalBest(
+        evaluated_position={"x": 1.0},
+        candidate_reference="candidate-1",
+        hypothesis_reference="hypothesis-1",
+        evaluation_reference="evaluation-1",
+        candidate_hash="a" * 64,
+        evaluation=evaluation,
+        fitness=2.5,
+        iteration_id=0,
+    )
+    assert best.evaluation == evaluation
+    assert best.model_dump(mode="json")["evaluation"]["metrics"] == {"score": 2.5}
+    for invalid_evaluation, fitness in (
+        (Evaluation(status=EvaluationStatus.FAILED, feasible=False), 2.5),
+        (_success_evaluation(2.5), 3.0),
+    ):
+        with pytest.raises(ValidationError):
+            PersonalBest(
+                evaluated_position={"x": 1.0},
+                candidate_reference="candidate-1",
+                hypothesis_reference="hypothesis-1",
+                evaluation_reference="evaluation-1",
+                candidate_hash="a" * 64,
+                evaluation=invalid_evaluation,
+                fitness=fitness,
+                iteration_id=0,
+            )
+
+
+def test_agent_episode_best_references_are_all_or_none() -> None:
+    complete = AgentEpisode(
+        episode_id="episode-1",
+        run_id="run-1",
+        particle_id="p0",
+        iteration_id=0,
+        target_position={"x": 0},
+        evaluated_position={"x": 1},
+        candidate_reference="candidate-1",
+        candidate_hash="b" * 64,
+        hypothesis_reference="hypothesis-1",
+        evaluation_reference="evaluation-1",
+        evaluation=_success_evaluation(),
+        status=EpisodeStatus.COMPLETED,
+    )
+    assert complete.candidate_hash == "b" * 64
+    with pytest.raises(ValidationError):
+        AgentEpisode(
+            episode_id="episode-1",
+            run_id="run-1",
+            particle_id="p0",
+            iteration_id=0,
+            target_position={},
+            evaluated_position={},
+            candidate_reference="candidate-only",
+            status=EpisodeStatus.COMPLETED,
+        )
+
+
+def test_update_trace_and_snapshot_invariants_are_frozen() -> None:
+    assert hasattr(core_models, "RunStatus")
+    assert hasattr(core_models, "UpdateTrace")
+    trace = core_models.UpdateTrace(
+        particle_id="p1",
+        sbest_particle_id="p0",
+        cognitive_seed=1,
+        social_seed=2,
+        cognitive_rng_state_before={"state": [1]},
+        cognitive_rng_state_after={"state": [2]},
+        social_rng_state_before={"state": [3]},
+        social_rng_state_after={"state": [4]},
+        resampled=False,
+        projected_dimensions=(0, 2),
+    )
+    pbest = PersonalBest(
+        evaluated_position={"x": 1},
+        candidate_reference="candidate-1",
+        hypothesis_reference="hypothesis-1",
+        evaluation_reference="evaluation-1",
+        candidate_hash="c" * 64,
+        evaluation=_success_evaluation(),
+        fitness=1.0,
+        iteration_id=0,
+    )
+    p0 = ParticleState(particle_id="p0", position={}, velocity={}, pbest=pbest, rng_state={})
+    p1 = ParticleState(particle_id="p1", position={}, velocity={}, rng_state={})
+    snapshot = IterationSnapshot(
+        run_id="run-1",
+        iteration_id=1,
+        particles=(p0, p1),
+        gbest=pbest,
+        config_snapshot_hash="d" * 64,
+        rng_state={},
+        sbest_particle_ids={"p0": "p0", "p1": "p0"},
+        resource_budget={"agent_slots": 2},
+        update_traces={"p0": core_models.UpdateTrace(
+            particle_id="p0", sbest_particle_id="p0", cognitive_seed=3, social_seed=4,
+            cognitive_rng_state_before={}, cognitive_rng_state_after={},
+            social_rng_state_before={}, social_rng_state_after={},
+            resampled=False, projected_dimensions=(),
+        ), "p1": trace},
+        run_status=core_models.RunStatus.RUNNING,
+    )
+    dumped = snapshot.model_dump(mode="json")
+    assert dumped["state_format_version"] == 1
+    assert dumped["sbest_particle_ids"] == {"p0": "p0", "p1": "p0"}
+    with pytest.raises((TypeError, AttributeError)):
+        snapshot.resource_budget["agent_slots"] = 3
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["version", "order", "duplicate", "map_keys", "trace_keys", "sbest", "gbest"],
+)
+def test_snapshot_rejects_inconsistent_generation_state(mutation: str) -> None:
+    evaluation = _success_evaluation()
+    best = PersonalBest(
+        evaluated_position={}, candidate_reference="c", hypothesis_reference="h",
+        evaluation_reference="e", candidate_hash="e" * 64,
+        evaluation=evaluation, fitness=1.0, iteration_id=0,
+    )
+    p0 = ParticleState(particle_id="p0", position={}, velocity={}, pbest=best, rng_state={})
+    p1 = ParticleState(particle_id="p1", position={}, velocity={}, rng_state={})
+    particles = (p0, p1)
+    kwargs = {
+        "run_id": "run-1", "iteration_id": 1, "particles": particles,
+        "gbest": best, "config_snapshot_hash": "f" * 64, "rng_state": {},
+        "sbest_particle_ids": {"p0": "p0", "p1": "p0"},
+        "resource_budget": {},
+        "update_traces": {
+            pid: core_models.UpdateTrace(
+                particle_id=pid, sbest_particle_id="p0", cognitive_seed=1,
+                social_seed=2, cognitive_rng_state_before={},
+                cognitive_rng_state_after={}, social_rng_state_before={},
+                social_rng_state_after={}, resampled=False,
+                projected_dimensions=(),
+            ) for pid in ("p0", "p1")
+        },
+        "run_status": core_models.RunStatus.RUNNING,
+    }
+    if mutation == "version": kwargs["state_format_version"] = 2
+    elif mutation == "order": kwargs["particles"] = (p1, p0)
+    elif mutation == "duplicate": kwargs["particles"] = (p0, p0)
+    elif mutation == "map_keys": kwargs["sbest_particle_ids"] = {"p0": "p0"}
+    elif mutation == "trace_keys": kwargs["update_traces"] = {"p0": kwargs["update_traces"]["p0"]}
+    elif mutation == "sbest": kwargs["sbest_particle_ids"] = {"p0": "p1", "p1": "p1"}
+    elif mutation == "gbest": kwargs["gbest"] = PersonalBest(
+        evaluated_position={}, candidate_reference="other", hypothesis_reference="h",
+        evaluation_reference="e", candidate_hash="1" * 64,
+        evaluation=_success_evaluation(2.0), fitness=2.0, iteration_id=0,
+    )
+    with pytest.raises(ValidationError):
+        IterationSnapshot(**kwargs)
+
+
+def test_initial_snapshot_allows_no_update_traces() -> None:
+    particle = ParticleState(particle_id="p0", position={}, velocity={}, rng_state={})
+    snapshot = IterationSnapshot(
+        run_id="run-1", iteration_id=0, particles=(particle,), gbest=None,
+        config_snapshot_hash="a" * 64, rng_state={},
+        sbest_particle_ids={"p0": None}, resource_budget={}, update_traces={},
+        run_status=core_models.RunStatus.RUNNING,
+    )
+    assert snapshot.update_traces == {}
+
+
+def test_stored_stage_event_and_episode_checkpoint_validate_identity() -> None:
+    assert hasattr(core_models, "StoredStageEvent")
+    assert hasattr(core_models, "EpisodeCheckpoint")
+    event = StageEvent(
+        run_id="run-1", particle_id="p0", iteration_id=2,
+        stage=AgentStage.EXECUTING, attempt=0, event_type="completed",
+    )
+    stored = core_models.StoredStageEvent(sequence=7, event=event)
+    assert stored.sequence == 7
+    checkpoint = core_models.EpisodeCheckpoint(
+        run_id="run-1", particle_id="p0", iteration_id=2,
+        completed_stage=AgentStage.EXECUTING,
+        next_stage=AgentStage.EVALUATING, next_attempt=0,
+        context={"run_id": "run-1", "particle_id": "p0", "iteration_id": 2,
+                 "protocol_snapshot_hash": "a" * 64},
+        thread_json={"logical_id": "thread-p0"},
+        protocol_snapshot_hash="a" * 64,
+    )
+    assert checkpoint.state_format_version == 1
+    with pytest.raises(ValidationError):
+        core_models.EpisodeCheckpoint(
+            **{**checkpoint.model_dump(mode="json"), "particle_id": "different"}
+        )
 
 
 @pytest.mark.parametrize("bad_hash", ["A" * 64, "a" * 63, "g" * 64])
@@ -528,4 +744,21 @@ def test_artifact_hash_must_be_lowercase_sha256(bad_hash: str) -> None:
             size_bytes=0,
             media_type="application/json",
             committed=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    ["", ".", "../x", "a/../x", "a/./x", "a//x", "a/x/", "/absolute", r"a\x"],
+)
+def test_artifact_reference_requires_normalized_relative_posix_path(
+    relative_path: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        ArtifactRef(
+            relative_path=relative_path,
+            sha256="a" * 64,
+            size_bytes=0,
+            media_type="application/octet-stream",
+            committed=True,
         )

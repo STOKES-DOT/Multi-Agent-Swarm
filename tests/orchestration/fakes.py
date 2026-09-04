@@ -11,7 +11,15 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
-from multi_agent_pso.core import AgentStage, EpisodeStatus, Evaluation, EvaluationStatus, StageEvent
+from multi_agent_pso.core import (
+    AgentStage,
+    EpisodeCheckpoint,
+    EpisodeStatus,
+    Evaluation,
+    EvaluationStatus,
+    StageEvent,
+    StoredStageEvent,
+)
 from multi_agent_pso.protocols import (
     AgentRuntime,
     CandidateRef,
@@ -45,6 +53,9 @@ class FakeRunStore:
         self.append_attempts: list[StageEvent] = []
         self.cached = cached
         self.recorded: dict[str, ToolResult] = {}
+        self.run_hashes: dict[str, str] = {}
+        self.snapshots: dict[tuple[str, int], dict[str, object]] = {}
+        self.checkpoints: dict[tuple[str, str, int], list[dict[str, object]]] = {}
         self.audit_failure = audit_failure
         self.audit_failure_stage = audit_failure_stage
         self.audit_failure_event_type = audit_failure_event_type
@@ -69,7 +80,50 @@ class FakeRunStore:
         self.events.append(event)
 
     def create_run(self, run_id: str, snapshot_hash: str) -> None:
-        return None
+        self.run_hashes.setdefault(run_id, snapshot_hash)
+
+    def get_run_snapshot_hash(self, run_id: str) -> str | None:
+        return self.run_hashes.get(run_id)
+
+    def list_stage_events(
+        self, run_id: str, particle_id: str, iteration_id: int
+    ) -> tuple[StoredStageEvent, ...]:
+        return tuple(
+            StoredStageEvent(sequence=index, event=event)
+            for index, event in enumerate(self.events, start=1)
+            if event.run_id == run_id
+            and event.particle_id == particle_id
+            and event.iteration_id == iteration_id
+        )
+
+    def commit_stage_transition(
+        self, event: StageEvent, checkpoint: EpisodeCheckpoint
+    ) -> None:
+        self.append_stage_event(event)
+        key = (checkpoint.run_id, checkpoint.particle_id, checkpoint.iteration_id)
+        self.checkpoints.setdefault(key, []).append(checkpoint.model_dump(mode="json"))
+
+    def get_latest_stage_checkpoint_json(
+        self, run_id: str, particle_id: str, iteration_id: int
+    ) -> Mapping[str, object] | None:
+        values = self.checkpoints.get((run_id, particle_id, iteration_id), [])
+        return None if not values else copy.deepcopy(values[-1])
+
+    def get_iteration_snapshot_json(
+        self, run_id: str, iteration_id: int
+    ) -> Mapping[str, object] | None:
+        value = self.snapshots.get((run_id, iteration_id))
+        return None if value is None else copy.deepcopy(value)
+
+    def get_latest_committed_snapshot_json(
+        self, run_id: str
+    ) -> Mapping[str, object] | None:
+        matches = [
+            (iteration_id, value)
+            for (candidate_run, iteration_id), value in self.snapshots.items()
+            if candidate_run == run_id
+        ]
+        return None if not matches else copy.deepcopy(max(matches, key=lambda item: item[0])[1])
 
     def get_committed_tool_result(self, key: str) -> ToolResult | None:
         return self.recorded.get(key, self.cached)

@@ -13,7 +13,9 @@ from types import MappingProxyType
 
 import pytest
 
+from multi_agent_pso.core import ArtifactRef
 from multi_agent_pso.storage import FileArtifactStore
+import multi_agent_pso.storage as storage_module
 from multi_agent_pso.storage.file_artifacts import _require_root
 
 
@@ -435,3 +437,94 @@ def _assert_traversal_closes_opened_child_after_intermediate_close_failure(
     assert {identity for _, identity in opened_children} <= {
         identity for _, identity in close_attempts
     }
+
+
+def test_artifact_verify_accepts_exact_published_content_without_mutation(tmp_path: Path) -> None:
+    assert hasattr(storage_module, "ArtifactIntegrityError")
+    store = FileArtifactStore(tmp_path)
+    reference = store.publish_bytes("nested/value.bin", b"payload", "application/octet-stream")
+    before = (tmp_path / reference.relative_path).stat()
+
+    store.verify(reference)
+
+    after = (tmp_path / reference.relative_path).stat()
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+
+
+@pytest.mark.parametrize("failure", ["committed", "size", "hash", "tamper"])
+def test_artifact_verify_rejects_uncommitted_or_mismatched_content(
+    tmp_path: Path, failure: str
+) -> None:
+    store = FileArtifactStore(tmp_path)
+    reference = store.publish_bytes("value.bin", b"payload", "application/octet-stream")
+    candidate = reference
+    if failure == "committed":
+        candidate = ArtifactRef(**{**reference.model_dump(), "committed": False})
+    elif failure == "size":
+        candidate = ArtifactRef(**{**reference.model_dump(), "size_bytes": reference.size_bytes + 1})
+    elif failure == "hash":
+        candidate = ArtifactRef(**{**reference.model_dump(), "sha256": "0" * 64})
+    else:
+        (tmp_path / reference.relative_path).write_bytes(b"tampered")
+    with pytest.raises(storage_module.ArtifactIntegrityError):
+        store.verify(candidate)
+
+
+@pytest.mark.parametrize("target_kind", ["symlink", "directory", "missing", "invalid_path"])
+def test_artifact_verify_rejects_unsafe_or_missing_target(
+    tmp_path: Path, target_kind: str
+) -> None:
+    store = FileArtifactStore(tmp_path)
+    target = tmp_path / "target"
+    if target_kind == "symlink":
+        external = tmp_path / "external"
+        external.write_bytes(b"payload")
+        target.symlink_to(external)
+    elif target_kind == "directory":
+        target.mkdir()
+    elif target_kind == "invalid_path":
+        reference = ArtifactRef.model_construct(
+            relative_path="../target",
+            sha256=hashlib.sha256(b"payload").hexdigest(),
+            size_bytes=7,
+            media_type="application/octet-stream",
+            committed=True,
+        )
+        with pytest.raises(storage_module.ArtifactIntegrityError):
+            store.verify(reference)
+        return
+    reference = ArtifactRef(
+        relative_path="target",
+        sha256=hashlib.sha256(b"payload").hexdigest(),
+        size_bytes=7,
+        media_type="application/octet-stream",
+        committed=True,
+    )
+    with pytest.raises(storage_module.ArtifactIntegrityError):
+        store.verify(reference)
+
+
+def test_artifact_verify_preserves_integrity_primary_when_close_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileArtifactStore(tmp_path)
+    reference = store.publish_bytes("nested/value.bin", b"payload", "application/octet-stream")
+    wrong = ArtifactRef(**{**reference.model_dump(), "sha256": "0" * 64})
+    real_close = os.close
+    failed = False
+
+    def fail_first_close(fd: int) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("close failed")
+        real_close(fd)
+
+    monkeypatch.setattr(os, "close", fail_first_close)
+    with pytest.raises(storage_module.ArtifactIntegrityError, match="hash") as raised:
+        store.verify(wrong)
+    assert any("close failed" in note for note in raised.value.__notes__)

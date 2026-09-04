@@ -14,7 +14,7 @@ from typing import Self
 
 from pydantic import JsonValue
 
-from multi_agent_pso.core import ArtifactRef, StageEvent
+from multi_agent_pso.core import ArtifactRef, EpisodeCheckpoint, StageEvent, StoredStageEvent
 from multi_agent_pso.protocols import ToolResult, ToolStatus
 
 
@@ -293,6 +293,18 @@ class SQLiteRunStore:
             connection.close()
             self._secure_database_files(suppress_errors=True)
 
+    def get_run_snapshot_hash(self, run_id: str) -> str | None:
+        run = _require_identifier(run_id, "run_id")
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT snapshot_hash FROM runs WHERE run_id = ?", (run,)
+            ).fetchone()
+        finally:
+            connection.close()
+            self._secure_database_files(suppress_errors=True)
+        return None if row is None else str(row["snapshot_hash"])
+
     def append_stage_event(self, event: StageEvent) -> None:
         if not isinstance(event, StageEvent):
             raise TypeError("event must be a StageEvent")
@@ -300,18 +312,104 @@ class SQLiteRunStore:
         try:
             connection.execute("BEGIN IMMEDIATE")
             self._secure_database_files()
+            self._insert_stage_event(connection, event)
+            self._secure_database_files()
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+            self._secure_database_files(suppress_errors=True)
+
+    @staticmethod
+    def _insert_stage_event(connection: sqlite3.Connection, event: StageEvent) -> int:
+        cursor = connection.execute(
+            """INSERT INTO stage_events
+            (run_id, particle_id, iteration_id, stage, attempt, event_type, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                event.run_id,
+                event.particle_id,
+                event.iteration_id,
+                event.stage.value,
+                event.attempt,
+                event.event_type,
+                _canonical_json(event.payload),
+            ),
+        )
+        if cursor.lastrowid is None:
+            raise RuntimeError("stage event insert did not return a sequence")
+        return int(cursor.lastrowid)
+
+    def list_stage_events(
+        self, run_id: str, particle_id: str, iteration_id: int
+    ) -> tuple[StoredStageEvent, ...]:
+        run = _require_identifier(run_id, "run_id")
+        particle = _require_identifier(particle_id, "particle_id")
+        iteration = _require_iteration(iteration_id)
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """SELECT event_id, run_id, particle_id, iteration_id, stage,
+                attempt, event_type, payload_json FROM stage_events
+                WHERE run_id = ? AND particle_id = ? AND iteration_id = ?
+                ORDER BY event_id ASC""",
+                (run, particle, iteration),
+            ).fetchall()
+        finally:
+            connection.close()
+            self._secure_database_files(suppress_errors=True)
+        return tuple(
+            StoredStageEvent(
+                sequence=row["event_id"],
+                event=StageEvent(
+                    run_id=row["run_id"],
+                    particle_id=row["particle_id"],
+                    iteration_id=row["iteration_id"],
+                    stage=row["stage"],
+                    attempt=row["attempt"],
+                    event_type=row["event_type"],
+                    payload=json.loads(row["payload_json"]),
+                ),
+            )
+            for row in rows
+        )
+
+    def commit_stage_transition(
+        self, event: StageEvent, checkpoint: EpisodeCheckpoint
+    ) -> None:
+        if not isinstance(event, StageEvent):
+            raise TypeError("event must be a StageEvent")
+        if not isinstance(checkpoint, EpisodeCheckpoint):
+            raise TypeError("checkpoint must be an EpisodeCheckpoint")
+        if event.event_type == "started":
+            raise ValueError("stage transition requires a terminal event")
+        if (
+            event.run_id,
+            event.particle_id,
+            event.iteration_id,
+        ) != (
+            checkpoint.run_id,
+            checkpoint.particle_id,
+            checkpoint.iteration_id,
+        ):
+            raise ValueError("event and checkpoint identities must match")
+        checkpoint_json = _canonical_json(checkpoint.model_dump(mode="json"))
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._secure_database_files()
+            self._insert_stage_event(connection, event)
             connection.execute(
-                """INSERT INTO stage_events
-                (run_id, particle_id, iteration_id, stage, attempt, event_type, payload_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO thread_checkpoints
+                (run_id, particle_id, iteration_id, payload_json)
+                VALUES (?, ?, ?, ?)""",
                 (
-                    event.run_id,
-                    event.particle_id,
-                    event.iteration_id,
-                    event.stage.value,
-                    event.attempt,
-                    event.event_type,
-                    _canonical_json(event.payload),
+                    checkpoint.run_id,
+                    checkpoint.particle_id,
+                    checkpoint.iteration_id,
+                    checkpoint_json,
                 ),
             )
             self._secure_database_files()
@@ -322,6 +420,20 @@ class SQLiteRunStore:
         finally:
             connection.close()
             self._secure_database_files(suppress_errors=True)
+
+    def get_latest_stage_checkpoint_json(
+        self, run_id: str, particle_id: str, iteration_id: int
+    ) -> dict[str, JsonValue] | None:
+        return self._get_json(
+            """SELECT payload_json FROM thread_checkpoints
+            WHERE run_id = ? AND particle_id = ? AND iteration_id = ?
+            ORDER BY checkpoint_id DESC LIMIT 1""",
+            (
+                _require_identifier(run_id, "run_id"),
+                _require_identifier(particle_id, "particle_id"),
+                _require_iteration(iteration_id),
+            ),
+        )
 
     def get_committed_tool_result(self, idempotency_key: str) -> ToolResult | None:
         key = _require_identifier(idempotency_key, "idempotency_key")
@@ -385,6 +497,15 @@ class SQLiteRunStore:
         return self._get_json(
             "SELECT snapshot_json FROM iterations WHERE run_id = ? AND iteration_id = ?",
             (_require_identifier(run_id, "run_id"), _require_iteration(iteration_id)),
+        )
+
+    def get_latest_committed_snapshot_json(
+        self, run_id: str
+    ) -> dict[str, JsonValue] | None:
+        return self._get_json(
+            """SELECT snapshot_json FROM iterations WHERE run_id = ?
+            ORDER BY iteration_id DESC LIMIT 1""",
+            (_require_identifier(run_id, "run_id"),),
         )
 
     def _get_json(self, query: str, parameters: tuple[object, ...]) -> dict[str, JsonValue] | None:

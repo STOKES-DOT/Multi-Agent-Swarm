@@ -15,10 +15,12 @@ from pydantic import JsonValue
 from multi_agent_pso.core import (
     AgentStage,
     ArtifactRef,
+    EpisodeCheckpoint,
     Evaluation,
     EvaluationStatus,
     PersonalBest,
     StageEvent,
+    StoredStageEvent,
 )
 from multi_agent_pso.protocols import (
     AgentRuntime,
@@ -141,7 +143,13 @@ def test_protocol_method_names_and_async_boundaries_are_exact() -> None:
     }
     assert _protocol_methods(RunStore) == {
         "create_run",
+        "get_run_snapshot_hash",
         "append_stage_event",
+        "list_stage_events",
+        "commit_stage_transition",
+        "get_latest_stage_checkpoint_json",
+        "get_iteration_snapshot_json",
+        "get_latest_committed_snapshot_json",
         "get_committed_tool_result",
         "record_tool_result",
         "iteration_transaction",
@@ -150,6 +158,7 @@ def test_protocol_method_names_and_async_boundaries_are_exact() -> None:
         "publish_bytes",
         "publish_text",
         "publish_json",
+        "verify",
     }
     assert _protocol_methods(TaskAdapter) == {
         "build_stage_request",
@@ -173,8 +182,8 @@ def test_protocol_method_names_and_async_boundaries_are_exact() -> None:
     for protocol, methods in (
         (ResourceManager, ("agent_slot", "evaluation_slot")),
         (IterationTransaction, ("put_particle_json", "put_pbest_json", "put_gbest_json", "put_snapshot_json", "commit", "rollback")),
-        (RunStore, ("create_run", "append_stage_event", "get_committed_tool_result", "iteration_transaction")),
-        (ArtifactStore, ("publish_bytes", "publish_text", "publish_json")),
+        (RunStore, tuple(_protocol_methods(RunStore))),
+        (ArtifactStore, ("publish_bytes", "publish_text", "publish_json", "verify")),
         (TaskAdapter, tuple(_protocol_methods(TaskAdapter))),
         (WikiRetriever, ("search",)),
     ):
@@ -245,7 +254,35 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
         def create_run(self, run_id: str, snapshot_hash: str) -> None:
             return None
 
+        def get_run_snapshot_hash(self, run_id: str) -> str | None:
+            return None
+
         def append_stage_event(self, event: StageEvent) -> None:
+            return None
+
+        def list_stage_events(
+            self, run_id: str, particle_id: str, iteration_id: int
+        ) -> tuple[StoredStageEvent, ...]:
+            return ()
+
+        def commit_stage_transition(
+            self, event: StageEvent, checkpoint: EpisodeCheckpoint
+        ) -> None:
+            return None
+
+        def get_latest_stage_checkpoint_json(
+            self, run_id: str, particle_id: str, iteration_id: int
+        ) -> Mapping[str, JsonValue] | None:
+            return None
+
+        def get_iteration_snapshot_json(
+            self, run_id: str, iteration_id: int
+        ) -> Mapping[str, JsonValue] | None:
+            return None
+
+        def get_latest_committed_snapshot_json(
+            self, run_id: str
+        ) -> Mapping[str, JsonValue] | None:
             return None
 
         def get_committed_tool_result(self, idempotency_key: str) -> ToolResult | None:
@@ -268,6 +305,9 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
 
         def publish_json(self, relative_path: str, payload: Mapping[str, JsonValue]) -> ArtifactRef:
             return ARTIFACT
+
+        def verify(self, reference: ArtifactRef) -> None:
+            return None
 
     class AdapterFake:
         def build_stage_request(
@@ -357,7 +397,13 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
             RunStoreFake(),
             {
                 "create_run": (("self", "run_id", "snapshot_hash"), {"run_id": str, "snapshot_hash": str, "return": type(None)}),
+                "get_run_snapshot_hash": (("self", "run_id"), {"run_id": str, "return": str | None}),
                 "append_stage_event": (("self", "event"), {"event": StageEvent, "return": type(None)}),
+                "list_stage_events": (("self", "run_id", "particle_id", "iteration_id"), {"run_id": str, "particle_id": str, "iteration_id": int, "return": tuple[StoredStageEvent, ...]}),
+                "commit_stage_transition": (("self", "event", "checkpoint"), {"event": StageEvent, "checkpoint": EpisodeCheckpoint, "return": type(None)}),
+                "get_latest_stage_checkpoint_json": (("self", "run_id", "particle_id", "iteration_id"), {"run_id": str, "particle_id": str, "iteration_id": int, "return": Mapping[str, JsonValue] | None}),
+                "get_iteration_snapshot_json": (("self", "run_id", "iteration_id"), {"run_id": str, "iteration_id": int, "return": Mapping[str, JsonValue] | None}),
+                "get_latest_committed_snapshot_json": (("self", "run_id"), {"run_id": str, "return": Mapping[str, JsonValue] | None}),
                 "get_committed_tool_result": (("self", "idempotency_key"), {"idempotency_key": str, "return": ToolResult | None}),
                 "record_tool_result": (("self", "idempotency_key", "result"), {"idempotency_key": str, "result": ToolResult, "return": type(None)}),
                 "iteration_transaction": (("self", "run_id", "iteration_id"), {"run_id": str, "iteration_id": int, "return": ContextManager[IterationTransaction]}),
@@ -370,6 +416,7 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
                 "publish_bytes": (("self", "relative_path", "data", "media_type"), {"relative_path": str, "data": bytes, "media_type": str, "return": ArtifactRef}),
                 "publish_text": (("self", "relative_path", "text", "media_type"), {"relative_path": str, "text": str, "media_type": str, "return": ArtifactRef}),
                 "publish_json": (("self", "relative_path", "payload"), {"relative_path": str, "payload": Mapping[str, JsonValue], "return": ArtifactRef}),
+                "verify": (("self", "reference"), {"reference": ArtifactRef, "return": type(None)}),
             },
         ),
         (

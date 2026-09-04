@@ -7,7 +7,12 @@ from typing import ContextManager, Protocol, runtime_checkable
 
 from pydantic import JsonValue
 
-from multi_agent_pso.core import ArtifactRef, StageEvent
+from multi_agent_pso.core import (
+    ArtifactRef,
+    EpisodeCheckpoint,
+    StageEvent,
+    StoredStageEvent,
+)
 
 from .tools import ToolResult
 
@@ -35,7 +40,29 @@ class RunStore(Protocol):
 
     def create_run(self, run_id: str, snapshot_hash: str) -> None: ...
 
+    def get_run_snapshot_hash(self, run_id: str) -> str | None: ...
+
     def append_stage_event(self, event: StageEvent) -> None: ...
+
+    def list_stage_events(
+        self, run_id: str, particle_id: str, iteration_id: int
+    ) -> tuple[StoredStageEvent, ...]: ...
+
+    def commit_stage_transition(
+        self, event: StageEvent, checkpoint: EpisodeCheckpoint
+    ) -> None: ...
+
+    def get_latest_stage_checkpoint_json(
+        self, run_id: str, particle_id: str, iteration_id: int
+    ) -> Mapping[str, JsonValue] | None: ...
+
+    def get_iteration_snapshot_json(
+        self, run_id: str, iteration_id: int
+    ) -> Mapping[str, JsonValue] | None: ...
+
+    def get_latest_committed_snapshot_json(
+        self, run_id: str
+    ) -> Mapping[str, JsonValue] | None: ...
 
     def get_committed_tool_result(self, idempotency_key: str) -> ToolResult | None: ...
 
@@ -59,6 +86,8 @@ class ArtifactStore(Protocol):
     def publish_json(
         self, relative_path: str, payload: Mapping[str, JsonValue]
     ) -> ArtifactRef: ...
+
+    def verify(self, reference: ArtifactRef) -> None: ...
 
 
 __all__ = ["ArtifactStore", "IterationTransaction", "RunStore"]

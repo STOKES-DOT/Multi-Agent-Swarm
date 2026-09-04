@@ -17,6 +17,10 @@ from pydantic import JsonValue
 from multi_agent_pso.core import ArtifactRef
 
 
+class ArtifactIntegrityError(RuntimeError):
+    """A committed artifact reference does not match immutable storage."""
+
+
 def _close_fds(*descriptors: int | None, primary_error: BaseException | None = None) -> None:
     """Close each unique descriptor while preserving a preceding primary error."""
     errors: list[BaseException] = []
@@ -231,6 +235,52 @@ class FileArtifactStore:
         except (TypeError, ValueError) as error:
             raise ValueError("payload must be finite JSON") from error
         return self.publish_bytes(relative_path, serialized, "application/json")
+
+    def verify(self, reference: ArtifactRef) -> None:
+        if not isinstance(reference, ArtifactRef):
+            raise TypeError("reference must be an ArtifactRef")
+        if not reference.committed:
+            raise ArtifactIntegrityError("artifact reference is not committed")
+        try:
+            parts = _relative_parts(reference.relative_path)
+        except (TypeError, ValueError) as error:
+            raise ArtifactIntegrityError("artifact reference path is invalid") from error
+
+        root_fd: int | None = None
+        parent_fd: int | None = None
+        artifact_fd: int | None = None
+        try:
+            root_fd = self._open_root()
+            parent_fd = self._reopen_parent(root_fd, parts[:-1])
+            artifact_fd = os.open(
+                parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd
+            )
+            metadata = os.fstat(artifact_fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ArtifactIntegrityError("artifact target is not a regular file")
+            digest = hashlib.sha256()
+            size = 0
+            while True:
+                chunk = os.read(artifact_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                digest.update(chunk)
+            if size != reference.size_bytes:
+                raise ArtifactIntegrityError("artifact size does not match reference")
+            if digest.hexdigest() != reference.sha256:
+                raise ArtifactIntegrityError("artifact hash does not match reference")
+        except ArtifactIntegrityError:
+            raise
+        except BaseException as error:
+            raise ArtifactIntegrityError("artifact could not be verified safely") from error
+        finally:
+            _close_fds(
+                artifact_fd,
+                parent_fd if parent_fd is not None and parent_fd != root_fd else None,
+                root_fd,
+                primary_error=sys.exception(),
+            )
 
     @staticmethod
     def _require_secure_dir_fd_support() -> None:

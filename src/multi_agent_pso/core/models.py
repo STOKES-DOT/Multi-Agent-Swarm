@@ -2,9 +2,9 @@
 
 import math
 from enum import StrEnum
-from pathlib import PurePath
+from pathlib import PurePosixPath
 from types import MappingProxyType
-from typing import Mapping
+from typing import Literal, Mapping
 
 from pydantic import (
     BaseModel,
@@ -41,6 +41,12 @@ class EpisodeStatus(StrEnum):
     FAILED = "FAILED"
     TIMEOUT = "TIMEOUT"
     INTERRUPTED = "INTERRUPTED"
+
+
+class RunStatus(StrEnum):
+    RUNNING = "RUNNING"
+    PAUSED_NO_SUCCESS = "PAUSED_NO_SUCCESS"
+    COMPLETED = "COMPLETED"
 
 
 class _FrozenDict(Mapping[str, object]):
@@ -161,8 +167,16 @@ class ArtifactRef(_FrozenModel):
     @field_validator("relative_path")
     @classmethod
     def validate_relative_path(cls, value: str) -> str:
-        if PurePath(value).is_absolute():
-            raise ValueError("relative_path must be relative")
+        if not value or "\\" in value:
+            raise ValueError("relative_path must be a nonempty POSIX path")
+        raw_parts = value.split("/")
+        path = PurePosixPath(value)
+        if (
+            path.is_absolute()
+            or any(part in {"", ".", ".."} for part in raw_parts)
+            or "/".join(path.parts) != value
+        ):
+            raise ValueError("relative_path must be normalized below the artifact root")
         return value
 
 
@@ -172,6 +186,7 @@ class PersonalBest(_FrozenModel):
     hypothesis_reference: str = Field(min_length=1)
     evaluation_reference: str = Field(min_length=1)
     candidate_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evaluation: Evaluation
     fitness: float
     iteration_id: int = Field(ge=0)
 
@@ -195,6 +210,14 @@ class PersonalBest(_FrozenModel):
         if not math.isfinite(value):
             raise ValueError("fitness must be finite")
         return value
+
+    @model_validator(mode="after")
+    def validate_authoritative_evaluation(self) -> "PersonalBest":
+        if self.evaluation.status is not EvaluationStatus.SUCCESS:
+            raise ValueError("personal best requires a successful evaluation")
+        if self.evaluation.fitness != self.fitness:
+            raise ValueError("personal-best fitness must equal evaluation fitness")
+        return self
 
 
 class ParticleState(_FrozenModel):
@@ -263,6 +286,10 @@ class AgentEpisode(_FrozenModel):
     evaluated_position: JsonValue
     position_adherence: Mapping[str, JsonValue] = Field(default_factory=dict)
     evaluation: Evaluation | None = None
+    candidate_reference: str | None = Field(default=None, min_length=1)
+    candidate_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    hypothesis_reference: str | None = Field(default=None, min_length=1)
+    evaluation_reference: str | None = Field(default=None, min_length=1)
     events: tuple[StageEvent, ...] = ()
     status: EpisodeStatus
 
@@ -296,25 +323,194 @@ class AgentEpisode(_FrozenModel):
     def serialize_json_fields(self, value: JsonValue) -> JsonValue:
         return _thaw_json(value)  # type: ignore[return-value]
 
+    @model_validator(mode="after")
+    def validate_best_references(self) -> "AgentEpisode":
+        references = (
+            self.candidate_reference,
+            self.candidate_hash,
+            self.hypothesis_reference,
+            self.evaluation_reference,
+        )
+        if any(value is not None for value in references) and not all(
+            value is not None for value in references
+        ):
+            raise ValueError("episode best references must be supplied together")
+        if all(value is not None for value in references) and self.evaluation is None:
+            raise ValueError("episode references require an evaluation")
+        return self
+
+
+class UpdateTrace(_FrozenModel):
+    particle_id: str = Field(min_length=1)
+    sbest_particle_id: str | None = Field(default=None, min_length=1)
+    cognitive_seed: int = Field(ge=0, strict=True)
+    social_seed: int = Field(ge=0, strict=True)
+    cognitive_rng_state_before: JsonValue
+    cognitive_rng_state_after: JsonValue
+    social_rng_state_before: JsonValue
+    social_rng_state_after: JsonValue
+    resampled: bool = False
+    projected_dimensions: tuple[int, ...] = ()
+
+    @field_validator(
+        "cognitive_rng_state_before",
+        "cognitive_rng_state_after",
+        "social_rng_state_before",
+        "social_rng_state_after",
+        mode="before",
+    )
+    @classmethod
+    def normalize_rng_states(cls, value: object) -> object:
+        return _normalize_json_input(value)
+
+    @field_validator(
+        "cognitive_rng_state_before",
+        "cognitive_rng_state_after",
+        "social_rng_state_before",
+        "social_rng_state_after",
+    )
+    @classmethod
+    def validate_rng_states(cls, value: JsonValue) -> JsonValue:
+        return _freeze_finite_json(value)
+
+    @field_serializer(
+        "cognitive_rng_state_before",
+        "cognitive_rng_state_after",
+        "social_rng_state_before",
+        "social_rng_state_after",
+    )
+    def serialize_rng_states(self, value: JsonValue) -> JsonValue:
+        return _thaw_json(value)  # type: ignore[return-value]
+
+    @field_validator("projected_dimensions")
+    @classmethod
+    def validate_projected_dimensions(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if any(type(index) is not int or index < 0 for index in value):
+            raise ValueError("projected dimensions must be nonnegative integers")
+        if tuple(sorted(set(value))) != value:
+            raise ValueError("projected dimensions must be unique and sorted")
+        return value
+
 
 class IterationSnapshot(_FrozenModel):
+    state_format_version: Literal[1] = 1
     run_id: str = Field(min_length=1)
     iteration_id: int = Field(ge=0)
     particles: tuple[ParticleState, ...] = ()
     gbest: PersonalBest | None = None
     config_snapshot_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     rng_state: JsonValue
+    sbest_particle_ids: Mapping[str, str | None] = Field(default_factory=dict)
+    resource_budget: Mapping[str, JsonValue] = Field(default_factory=dict)
+    update_traces: Mapping[str, UpdateTrace] = Field(default_factory=dict)
+    run_status: RunStatus = RunStatus.RUNNING
 
-    @field_validator("rng_state", mode="before")
+    @field_validator("rng_state", "resource_budget", "sbest_particle_ids", mode="before")
     @classmethod
     def normalize_rng_state(cls, value: object) -> object:
         return _normalize_json_input(value)
 
-    @field_validator("rng_state")
+    @field_validator("rng_state", "resource_budget", "sbest_particle_ids")
     @classmethod
     def validate_rng_state(cls, value: JsonValue) -> JsonValue:
         return _freeze_finite_json(value)
 
-    @field_serializer("rng_state")
+    @field_serializer("rng_state", "resource_budget", "sbest_particle_ids")
     def serialize_rng_state(self, value: JsonValue) -> JsonValue:
         return _thaw_json(value)  # type: ignore[return-value]
+
+    @field_validator("update_traces")
+    @classmethod
+    def freeze_update_traces(
+        cls, value: Mapping[str, UpdateTrace]
+    ) -> Mapping[str, UpdateTrace]:
+        return _FrozenDict(dict(value))  # type: ignore[return-value]
+
+    @field_serializer("update_traces")
+    def serialize_update_traces(
+        self, value: Mapping[str, UpdateTrace]
+    ) -> dict[str, object]:
+        return {key: trace.model_dump(mode="json") for key, trace in value.items()}
+
+    @model_validator(mode="after")
+    def validate_generation_state(self) -> "IterationSnapshot":
+        particle_ids = tuple(particle.particle_id for particle in self.particles)
+        if particle_ids != tuple(sorted(particle_ids)) or len(set(particle_ids)) != len(
+            particle_ids
+        ):
+            raise ValueError("snapshot particles must have unique, stable-sorted IDs")
+        particle_id_set = set(particle_ids)
+        if set(self.sbest_particle_ids) != particle_id_set:
+            raise ValueError("sbest keys must exactly match snapshot particles")
+        if self.iteration_id == 0:
+            if self.update_traces and set(self.update_traces) != particle_id_set:
+                raise ValueError("initial update traces must be empty or complete")
+        elif set(self.update_traces) != particle_id_set:
+            raise ValueError("update trace keys must exactly match snapshot particles")
+        bests = {
+            particle.particle_id: particle.pbest
+            for particle in self.particles
+            if particle.pbest is not None
+        }
+        for particle_id, selected_id in self.sbest_particle_ids.items():
+            if selected_id is not None and selected_id not in bests:
+                raise ValueError("sbest must identify a particle with a personal best")
+            trace = self.update_traces.get(particle_id)
+            if trace is not None:
+                if trace.particle_id != particle_id:
+                    raise ValueError("update trace key must match trace particle_id")
+                if trace.sbest_particle_id != selected_id:
+                    raise ValueError("update trace sbest must match snapshot sbest")
+        if self.gbest is not None and self.gbest not in bests.values():
+            raise ValueError("global best must match a snapshot personal best")
+        return self
+
+
+class StoredStageEvent(_FrozenModel):
+    sequence: int = Field(ge=1, strict=True)
+    event: StageEvent
+
+
+class EpisodeCheckpoint(_FrozenModel):
+    state_format_version: Literal[1] = 1
+    run_id: str = Field(min_length=1)
+    particle_id: str = Field(min_length=1)
+    iteration_id: int = Field(ge=0)
+    completed_stage: AgentStage
+    next_stage: AgentStage | None
+    next_attempt: int = Field(ge=0)
+    context: Mapping[str, JsonValue]
+    thread_json: Mapping[str, JsonValue] | None = None
+    protocol_snapshot_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("context", "thread_json", mode="before")
+    @classmethod
+    def normalize_checkpoint_json(cls, value: object) -> object:
+        return _normalize_json_input(value)
+
+    @field_validator("context", "thread_json")
+    @classmethod
+    def validate_checkpoint_json(cls, value: JsonValue) -> JsonValue:
+        return _freeze_finite_json(value)
+
+    @field_serializer("context", "thread_json")
+    def serialize_checkpoint_json(self, value: JsonValue) -> JsonValue:
+        return _thaw_json(value)  # type: ignore[return-value]
+
+    @model_validator(mode="after")
+    def validate_checkpoint_identity(self) -> "EpisodeCheckpoint":
+        expected = {
+            "run_id": self.run_id,
+            "particle_id": self.particle_id,
+            "iteration_id": self.iteration_id,
+            "protocol_snapshot_hash": self.protocol_snapshot_hash,
+        }
+        for key, value in expected.items():
+            if self.context.get(key) != value:
+                raise ValueError(f"checkpoint context {key} does not match checkpoint")
+        if self.next_stage is None:
+            if self.completed_stage is not AgentStage.COMPLETED or self.next_attempt != 0:
+                raise ValueError("terminal checkpoint must complete the COMPLETED stage")
+        elif self.completed_stage is AgentStage.COMPLETED:
+            raise ValueError("completed checkpoint must not have a next stage")
+        return self

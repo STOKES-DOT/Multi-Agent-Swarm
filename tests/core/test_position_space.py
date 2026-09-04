@@ -222,6 +222,7 @@ def test_core_all_preserves_the_exact_public_contract() -> None:
         "ArtifactRef",
         "ConstraintResult",
         "ContinuousBoxPositionSpace",
+        "EpisodeCheckpoint",
         "EpisodeStatus",
         "Evaluation",
         "EvaluationStatus",
@@ -230,7 +231,10 @@ def test_core_all_preserves_the_exact_public_contract() -> None:
         "PositionSpace",
         "PersonalBest",
         "Projection",
+        "RunStatus",
         "StageEvent",
+        "StoredStageEvent",
+        "UpdateTrace",
         "FloatArray",
     ]
 

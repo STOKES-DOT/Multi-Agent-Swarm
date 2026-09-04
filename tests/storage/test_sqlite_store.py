@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import os
 import threading
@@ -9,11 +10,46 @@ from pathlib import Path
 
 import pytest
 
-from multi_agent_pso.core import AgentStage, ArtifactRef, StageEvent
+from multi_agent_pso.core import (
+    AgentStage,
+    ArtifactRef,
+    EpisodeCheckpoint,
+    StageEvent,
+    StoredStageEvent,
+)
 from multi_agent_pso.protocols import ToolResult, ToolStatus
 from multi_agent_pso.storage import SQLiteRunStore
 from multi_agent_pso.storage.sqlite_store import _SCHEMA
 import multi_agent_pso.storage.sqlite_store as sqlite_store_module
+
+
+def _checkpoint(
+    *,
+    run_id: str = "run-1",
+    particle_id: str = "p0",
+    iteration_id: int = 0,
+    completed_stage: AgentStage = AgentStage.EXECUTING,
+    next_stage: AgentStage | None = AgentStage.EVALUATING,
+    next_attempt: int = 0,
+) -> EpisodeCheckpoint:
+    protocol_hash = "f" * 64
+    return EpisodeCheckpoint(
+        run_id=run_id,
+        particle_id=particle_id,
+        iteration_id=iteration_id,
+        completed_stage=completed_stage,
+        next_stage=next_stage,
+        next_attempt=next_attempt,
+        context={
+            "run_id": run_id,
+            "particle_id": particle_id,
+            "iteration_id": iteration_id,
+            "protocol_snapshot_hash": protocol_hash,
+            "nested": {"values": [1, 2]},
+        },
+        thread_json={"logical_id": f"thread-{particle_id}"},
+        protocol_snapshot_hash=protocol_hash,
+    )
 
 
 def test_iteration_transaction_rolls_back_all_state(tmp_path: Path) -> None:
@@ -431,3 +467,153 @@ def test_store_rejects_noncanonical_json_and_unknown_event_run(tmp_path: Path) -
             tx.put_snapshot_json({"bad": float("nan")})
     with pytest.raises(sqlite3.IntegrityError):
         store.append_stage_event(StageEvent(run_id="missing", particle_id="p0", iteration_id=0, stage=AgentStage.PENDING, attempt=0, event_type="x"))
+
+
+def test_store_reads_run_hash_and_latest_committed_snapshot_in_order(tmp_path: Path) -> None:
+    path = tmp_path / "runs.sqlite"
+    store = SQLiteRunStore(path)
+    store.create_run("run-1", "a" * 64)
+    for iteration in (0, 2, 1):
+        with store.iteration_transaction("run-1", iteration) as tx:
+            tx.put_snapshot_json({"iteration": iteration, "nested": {"items": [iteration]}})
+
+    reopened = SQLiteRunStore(path)
+    assert reopened.get_run_snapshot_hash("run-1") == "a" * 64
+    assert reopened.get_run_snapshot_hash("missing") is None
+    assert reopened.get_iteration_snapshot_json("run-1", 1) == {
+        "iteration": 1,
+        "nested": {"items": [1]},
+    }
+    latest = reopened.get_latest_committed_snapshot_json("run-1")
+    assert latest == {"iteration": 2, "nested": {"items": [2]}}
+    latest["nested"]["items"].append(99)
+    assert reopened.get_latest_committed_snapshot_json("run-1") == {
+        "iteration": 2,
+        "nested": {"items": [2]},
+    }
+
+
+def test_stage_transition_commits_event_and_checkpoint_atomically_and_reopens(tmp_path: Path) -> None:
+    path = tmp_path / "runs.sqlite"
+    store = SQLiteRunStore(path)
+    store.create_run("run-1", "a" * 64)
+    store.append_stage_event(
+        StageEvent(
+            run_id="run-1", particle_id="p0", iteration_id=0,
+            stage=AgentStage.EXECUTING, attempt=0, event_type="started",
+        )
+    )
+    terminal = StageEvent(
+        run_id="run-1", particle_id="p0", iteration_id=0,
+        stage=AgentStage.EXECUTING, attempt=0, event_type="completed",
+        payload={"z": 2, "a": 1},
+    )
+    store.commit_stage_transition(terminal, _checkpoint())
+
+    reopened = SQLiteRunStore(path)
+    events = reopened.list_stage_events("run-1", "p0", 0)
+    assert all(isinstance(item, StoredStageEvent) for item in events)
+    assert [item.sequence for item in events] == sorted(item.sequence for item in events)
+    assert [item.event.event_type for item in events] == ["started", "completed"]
+    assert events[-1].event.payload == {"a": 1, "z": 2}
+    checkpoint = reopened.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    assert checkpoint == _checkpoint().model_dump(mode="json")
+    checkpoint["context"]["nested"]["values"].append(3)
+    assert reopened.get_latest_stage_checkpoint_json("run-1", "p0", 0) == _checkpoint().model_dump(mode="json")
+
+    with sqlite3.connect(path) as connection:
+        stored_json = connection.execute(
+            "SELECT payload_json FROM thread_checkpoints"
+        ).fetchone()[0]
+    assert stored_json == json.dumps(
+        _checkpoint().model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+@pytest.mark.parametrize("field", ["run_id", "particle_id", "iteration_id"])
+def test_stage_transition_rejects_identity_mismatch_without_writes(
+    tmp_path: Path, field: str
+) -> None:
+    store = SQLiteRunStore(tmp_path / "runs.sqlite")
+    store.create_run("run-1", "a" * 64)
+    event = StageEvent(
+        run_id="run-1", particle_id="p0", iteration_id=0,
+        stage=AgentStage.EXECUTING, attempt=0, event_type="completed",
+    )
+    values = {"run_id": "run-1", "particle_id": "p0", "iteration_id": 0}
+    values[field] = {"run_id": "other", "particle_id": "p1", "iteration_id": 1}[field]
+    with pytest.raises(ValueError, match="match"):
+        store.commit_stage_transition(event, _checkpoint(**values))
+    assert store.list_stage_events("run-1", "p0", 0) == ()
+    assert store.get_latest_stage_checkpoint_json("run-1", "p0", 0) is None
+
+
+def test_stage_transition_rolls_back_event_when_checkpoint_insert_fails(tmp_path: Path) -> None:
+    path = tmp_path / "runs.sqlite"
+    store = SQLiteRunStore(path)
+    store.create_run("run-1", "a" * 64)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_checkpoint BEFORE INSERT ON thread_checkpoints
+            BEGIN SELECT RAISE(ABORT, 'checkpoint rejected'); END"""
+        )
+    event = StageEvent(
+        run_id="run-1", particle_id="p0", iteration_id=0,
+        stage=AgentStage.EXECUTING, attempt=0, event_type="completed",
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="checkpoint rejected"):
+        store.commit_stage_transition(event, _checkpoint())
+    assert store.list_stage_events("run-1", "p0", 0) == ()
+
+
+def test_stage_transition_concurrent_writers_are_serialized(tmp_path: Path) -> None:
+    path = tmp_path / "runs.sqlite"
+    store = SQLiteRunStore(path)
+    store.create_run("run-1", "a" * 64)
+    barrier = threading.Barrier(2)
+    failures: list[BaseException] = []
+
+    def write(particle_id: str) -> None:
+        try:
+            barrier.wait()
+            store.commit_stage_transition(
+                StageEvent(
+                    run_id="run-1", particle_id=particle_id, iteration_id=0,
+                    stage=AgentStage.EXECUTING, attempt=0, event_type="completed",
+                ),
+                _checkpoint(particle_id=particle_id),
+            )
+        except BaseException as error:
+            failures.append(error)
+
+    threads = [threading.Thread(target=write, args=(particle_id,)) for particle_id in ("p0", "p1")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert failures == []
+    assert len(store.list_stage_events("run-1", "p0", 0)) == 1
+    assert len(store.list_stage_events("run-1", "p1", 0)) == 1
+
+
+def test_stage_transition_requires_terminal_event_and_known_run(tmp_path: Path) -> None:
+    store = SQLiteRunStore(tmp_path / "runs.sqlite")
+    store.create_run("run-1", "a" * 64)
+    with pytest.raises(ValueError, match="terminal"):
+        store.commit_stage_transition(
+            StageEvent(
+                run_id="run-1", particle_id="p0", iteration_id=0,
+                stage=AgentStage.EXECUTING, attempt=0, event_type="started",
+            ),
+            _checkpoint(),
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        store.commit_stage_transition(
+            StageEvent(
+                run_id="missing", particle_id="p0", iteration_id=0,
+                stage=AgentStage.EXECUTING, attempt=0, event_type="completed",
+            ),
+            _checkpoint(run_id="missing"),
+        )
