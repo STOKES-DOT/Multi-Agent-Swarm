@@ -384,3 +384,80 @@ async def test_close_primary_survives_cleanup_terminal_audit_failure(tmp_path):
         event.stage is AgentStage.COMPLETED and event.event_type == "cleanup_failed"
         for event in attempts
     ) == 1
+
+
+@pytest.mark.asyncio
+async def test_system_exit_primary_survives_keyboard_interrupt_during_close(tmp_path):
+    primary = SystemExit("runtime exit")
+    cleanup = KeyboardInterrupt("close interrupt")
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        stage_exceptions={AgentStage.HYPOTHESIZING: primary},
+        close_failure=cleanup,
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert raised.value is primary
+    assert any("KeyboardInterrupt" in note for note in raised.value.__notes__)
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_primary_survives_system_exit_during_close(tmp_path):
+    primary = asyncio.CancelledError("cancel primary")
+    cleanup = SystemExit("close exit")
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        stage_exceptions={AgentStage.HYPOTHESIZING: primary},
+        close_failure=cleanup,
+    )
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert raised.value is primary
+    assert any("SystemExit" in note for note in raised.value.__notes__)
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+
+
+@pytest.mark.asyncio
+async def test_system_exit_during_normal_close_propagates_original(tmp_path):
+    cleanup = SystemExit("close exit")
+    dependencies = make_fake_dependencies(tmp_path, close_failure=cleanup)
+
+    with pytest.raises(SystemExit) as raised:
+        await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert raised.value is cleanup
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_kind", ["wrong_type", "wrong_stage"])
+async def test_agent_stage_rejects_invalid_request_before_runtime(tmp_path, invalid_kind):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        invalid_stage_request=invalid_kind == "wrong_type",
+        request_stage_override=(
+            AgentStage.PROPOSING_ACTION if invalid_kind == "wrong_stage" else None
+        ),
+    )
+
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert episode.status is EpisodeStatus.FAILED
+    assert dependencies["runtime"].stages == []
+    stage_attempts = [
+        event
+        for event in dependencies["run_store"].append_attempts
+        if event.stage is AgentStage.HYPOTHESIZING
+    ]
+    assert [event.event_type for event in stage_attempts] == ["started", "failed"]
+    if invalid_kind == "wrong_type":
+        assert dict(stage_attempts[0].payload["request"]) == {"type": "dict"}
+    else:
+        assert stage_attempts[0].payload["request"]["stage"] == "PROPOSING_ACTION"
+    assert len(stage_attempts[-1].payload["message"]) <= 512
+    assert stage_attempts[-1].payload["type"] in {"TypeError", "ValueError"}

@@ -181,16 +181,27 @@ class FakeRuntime:
 
 
 class FakeAdapter:
-    def __init__(self, candidate_failure: bool = False, mutate_context: bool = False) -> None:
+    def __init__(
+        self,
+        candidate_failure: bool = False,
+        mutate_context: bool = False,
+        request_stage_override: AgentStage | None = None,
+        invalid_stage_request: bool = False,
+    ) -> None:
         self.contexts: dict[AgentStage, list[dict[str, object]]] = {stage: [] for stage in AgentStage}
         self.candidate_failure = candidate_failure
         self.mutate_context = mutate_context
+        self.request_stage_override = request_stage_override
+        self.invalid_stage_request = invalid_stage_request
 
     def build_stage_request(self, stage: AgentStage, context: Mapping[str, object]) -> StageRequest:
         self.contexts[stage].append(copy.deepcopy(dict(context)))
         if self.mutate_context and stage is AgentStage.HYPOTHESIZING:
             context["target_position"]["x"] = 999  # type: ignore[index]
-        return StageRequest(stage, f"{stage.value}:{context['particle_id']}")
+        if self.invalid_stage_request:
+            return {"invalid": "request"}  # type: ignore[return-value]
+        request_stage = self.request_stage_override or stage
+        return StageRequest(request_stage, f"{stage.value}:{context['particle_id']}")
 
     def parse_stage_response(self, stage: AgentStage, response: StageResponse) -> Mapping[str, object]:
         value = json.loads(response.raw_text)
@@ -270,6 +281,8 @@ def make_fake_dependencies(
     audit_failure_persistent: bool = False,
     start_exception: BaseException | None = None,
     mutate_context: bool = False,
+    request_stage_override: AgentStage | None = None,
+    invalid_stage_request: bool = False,
 ) -> dict[str, object]:
     workspace = (tmp_path / "workspace").resolve()
     workspace.mkdir()
@@ -280,7 +293,12 @@ def make_fake_dependencies(
     resources = FakeResources()
     return {
         "runtime": FakeRuntime(resources=resources, invalid_responses=invalid_responses, cancel_stage=cancel_stage, payload=payload, close_failure=close_failure, stage_exceptions=stage_exceptions, start_exception=start_exception),
-        "task_adapter": FakeAdapter(candidate_failure, mutate_context),
+        "task_adapter": FakeAdapter(
+            candidate_failure,
+            mutate_context,
+            request_stage_override,
+            invalid_stage_request,
+        ),
         "evaluator": FakeEvaluator(resources, evaluator_status, evaluator_exception),
         "tool_provider": FakeTool(tool_status, tool_exception),
         "resource_manager": resources,

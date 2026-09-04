@@ -21,6 +21,7 @@ from multi_agent_pso.protocols import (
     Evaluator,
     ResourceManager,
     RunStore,
+    StageRequest,
     TaskAdapter,
     ThreadRef,
     ToolContext,
@@ -247,7 +248,7 @@ class AgentLoop:
             except AuditPersistenceError as audit_error:
                 self._add_secondary(close_error, "cleanup audit failed", audit_error)
                 raise close_error from audit_error
-        if isinstance(close_error, asyncio.CancelledError):
+        if close_error is not None and not isinstance(close_error, Exception):
             raise close_error
         return self._terminal_episode(run_id, particle_id, iteration_id, events, status, evaluation, evaluated, realized, adherence)
 
@@ -258,9 +259,7 @@ class AgentLoop:
         try:
             async with self._resources.agent_slot():
                 await self._runtime.close_thread(owner.thread)
-        except asyncio.CancelledError as error:
-            return error
-        except Exception as error:
+        except BaseException as error:
             return error
         return None
 
@@ -273,7 +272,16 @@ class AgentLoop:
     ) -> Mapping[str, JsonValue] | None:
         for attempt in range(3):
             request = self._adapter.build_stage_request(stage, self._copy_json(context))
-            self._started(str(context["run_id"]), str(context["particle_id"]), int(context["iteration_id"]), stage, attempt, {"request": request.to_json(), "context": context})
+            request_payload: Mapping[str, JsonValue]
+            if isinstance(request, StageRequest):
+                request_payload = request.to_json()
+            else:
+                request_payload = {"type": type(request).__name__[:128]}
+            self._started(str(context["run_id"]), str(context["particle_id"]), int(context["iteration_id"]), stage, attempt, {"request": request_payload, "context": context})
+            if not isinstance(request, StageRequest):
+                raise TypeError("task adapter must return a StageRequest")
+            if request.stage is not stage:
+                raise ValueError("task adapter returned a request for the wrong stage")
             async with self._resources.agent_slot():
                 response = await self._runtime.run_stage(thread, request)
             try:
