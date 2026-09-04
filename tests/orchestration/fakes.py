@@ -30,12 +30,15 @@ from multi_agent_pso.protocols import (
 
 
 class FakeRunStore:
-    def __init__(self, cached: ToolResult | None = None) -> None:
+    def __init__(self, cached: ToolResult | None = None, audit_failure: bool = False) -> None:
         self.events: list[StageEvent] = []
         self.cached = cached
         self.recorded: dict[str, ToolResult] = {}
+        self.audit_failure = audit_failure
 
     def append_stage_event(self, event: StageEvent) -> None:
+        if self.audit_failure and event.event_type == "interrupted":
+            raise RuntimeError("fake audit failure")
         self.events.append(event)
 
     def create_run(self, run_id: str, snapshot_hash: str) -> None:
@@ -104,7 +107,7 @@ class FakeResources:
 
 
 class FakeRuntime:
-    def __init__(self, *, resources: FakeResources, invalid_responses: int, cancel_stage: AgentStage | None, payload: Mapping[str, object], close_failure: bool) -> None:
+    def __init__(self, *, resources: FakeResources, invalid_responses: int, cancel_stage: AgentStage | None, payload: Mapping[str, object], close_failure: bool, stage_exceptions: Mapping[AgentStage, BaseException] | None = None) -> None:
         self.resources = resources
         self.invalid_remaining = invalid_responses
         self.cancel_stage = cancel_stage
@@ -112,6 +115,7 @@ class FakeRuntime:
         self.stages: list[AgentStage] = []
         self.closed_threads: list[str] = []
         self.close_failure = close_failure
+        self.stage_exceptions = dict(stage_exceptions or {})
 
     async def start_thread(self, particle_id: str, workspace: Path) -> ThreadRef:
         assert self.resources.agent_active
@@ -122,6 +126,8 @@ class FakeRuntime:
         self.stages.append(request.stage)
         if self.cancel_stage is request.stage:
             raise asyncio.CancelledError
+        if request.stage in self.stage_exceptions:
+            raise self.stage_exceptions[request.stage]
         if self.invalid_remaining:
             self.invalid_remaining -= 1
             return StageResponse("not-json", TokenUsage(1, 1))
@@ -139,8 +145,9 @@ class FakeRuntime:
 
 
 class FakeAdapter:
-    def __init__(self) -> None:
+    def __init__(self, candidate_failure: bool = False) -> None:
         self.contexts: dict[AgentStage, list[dict[str, object]]] = {stage: [] for stage in AgentStage}
+        self.candidate_failure = candidate_failure
 
     def build_stage_request(self, stage: AgentStage, context: Mapping[str, object]) -> StageRequest:
         self.contexts[stage].append(dict(context))
@@ -153,6 +160,8 @@ class FakeAdapter:
         return value
 
     def candidate_from_tool_result(self, result: ToolResult, context: ToolContext) -> CandidateRef:
+        if self.candidate_failure:
+            raise ValueError("fake candidate failure")
         return CandidateRef("candidate-p0", "a" * 64, metadata=result.payload)
 
     def realized_position(self, candidate: CandidateRef) -> object:
@@ -172,23 +181,30 @@ class FakeAdapter:
 
 
 class FakeTool:
-    def __init__(self) -> None:
+    def __init__(self, status: ToolStatus = ToolStatus.SUCCESS, exception: BaseException | None = None) -> None:
         self.executed_keys: list[str] = []
+        self.status = status
+        self.exception = exception
 
     async def execute(self, request: ToolRequest, context: ToolContext) -> ToolResult:
         self.executed_keys.append(request.idempotency_key)
-        return ToolResult(ToolStatus.SUCCESS, {"tool": "ok"})
+        if self.exception is not None:
+            raise self.exception
+        return ToolResult(self.status, {"tool": "ok"}, error="fake tool failure" if self.status is not ToolStatus.SUCCESS else None)
 
 
 class FakeEvaluator:
     fixed_fitness = 1.25
 
-    def __init__(self, resources: FakeResources, status: EvaluationStatus = EvaluationStatus.SUCCESS) -> None:
+    def __init__(self, resources: FakeResources, status: EvaluationStatus = EvaluationStatus.SUCCESS, exception: BaseException | None = None) -> None:
         self.resources = resources
         self.status = status
+        self.exception = exception
 
     async def evaluate(self, candidate: CandidateRef, context: EvaluationContext) -> Evaluation:
         assert self.resources.evaluation_active
+        if self.exception is not None:
+            raise self.exception
         if self.status is EvaluationStatus.SUCCESS:
             return Evaluation(status=self.status, feasible=True, fitness=self.fixed_fitness)
         return Evaluation(status=self.status, feasible=False)
@@ -203,6 +219,12 @@ def make_fake_dependencies(
     cancel_stage: AgentStage | None = None,
     evaluator_status: EvaluationStatus = EvaluationStatus.SUCCESS,
     close_failure: bool = False,
+    tool_status: ToolStatus = ToolStatus.SUCCESS,
+    tool_exception: BaseException | None = None,
+    evaluator_exception: BaseException | None = None,
+    candidate_failure: bool = False,
+    stage_exceptions: Mapping[AgentStage, BaseException] | None = None,
+    audit_failure: bool = False,
 ) -> dict[str, object]:
     workspace = (tmp_path / "workspace").resolve()
     workspace.mkdir()
@@ -212,12 +234,12 @@ def make_fake_dependencies(
     cached = ToolResult(ToolStatus.SUCCESS, {"tool": "cached"}) if cached_tool_result else None
     resources = FakeResources()
     return {
-        "runtime": FakeRuntime(resources=resources, invalid_responses=invalid_responses, cancel_stage=cancel_stage, payload=payload, close_failure=close_failure),
-        "task_adapter": FakeAdapter(),
-        "evaluator": FakeEvaluator(resources, evaluator_status),
-        "tool_provider": FakeTool(),
+        "runtime": FakeRuntime(resources=resources, invalid_responses=invalid_responses, cancel_stage=cancel_stage, payload=payload, close_failure=close_failure, stage_exceptions=stage_exceptions),
+        "task_adapter": FakeAdapter(candidate_failure),
+        "evaluator": FakeEvaluator(resources, evaluator_status, evaluator_exception),
+        "tool_provider": FakeTool(tool_status, tool_exception),
         "resource_manager": resources,
-        "run_store": FakeRunStore(cached),
+        "run_store": FakeRunStore(cached, audit_failure),
         "target_position": {"x": 1},
         "workspace": workspace,
         "protocol_snapshot_hash": hashlib.sha256(b"protocol").hexdigest(),

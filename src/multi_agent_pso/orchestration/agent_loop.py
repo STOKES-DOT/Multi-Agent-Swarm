@@ -105,11 +105,15 @@ class AgentLoop:
                 )
             self._terminal_event(run_id, particle_id, iteration_id, current_stage, "completed", events, payload={"tool_request": request.to_json(), "tool_result": tool_result.to_json(), "cached": cached})
             tool_context = ToolContext(run_id, particle_id, iteration_id, current_stage, 0, self._workspace)
-            candidate = self._adapter.candidate_from_tool_result(tool_result, tool_context)
-            context["candidate"] = candidate.to_json()
-            realized = self._adapter.realized_position(candidate)
-            evaluated = self._adapter.evaluated_position(self._target, realized)
-            adherence = self._adapter.position_adherence(self._target, realized)
+            try:
+                candidate = self._adapter.candidate_from_tool_result(tool_result, tool_context)
+                context["candidate"] = candidate.to_json()
+                realized = self._adapter.realized_position(candidate)
+                evaluated = self._adapter.evaluated_position(self._target, realized)
+                adherence = self._adapter.position_adherence(self._target, realized)
+            except ValueError as error:
+                self._terminal_event(run_id, particle_id, iteration_id, current_stage, "invalid", events, payload={"type": type(error).__name__, "message": str(error)[:512]})
+                return await self._finish_episode(thread, run_id, particle_id, iteration_id, events, EpisodeStatus.INVALID, self._invalid_evaluation(), evaluated, realized, adherence)
             context["realized_position"] = realized
             context["evaluated_position"] = evaluated
             context["adherence"] = adherence

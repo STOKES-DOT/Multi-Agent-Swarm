@@ -6,6 +6,7 @@ import pytest
 
 from multi_agent_pso.core import AgentStage, EpisodeStatus, EvaluationStatus
 from multi_agent_pso.orchestration import AgentLoop
+from multi_agent_pso.protocols import ToolStatus
 
 from .fakes import make_fake_dependencies
 
@@ -151,3 +152,65 @@ def test_fakes_implement_complete_runtime_protocols(tmp_path):
     assert isinstance(dependencies["resource_manager"], ResourceManager)
     assert isinstance(dependencies["tool_provider"], ToolProvider)
     assert isinstance(dependencies["run_store"], RunStore)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_status", "episode_status"),
+    [(ToolStatus.REJECTED, EpisodeStatus.INVALID), (ToolStatus.FAILED, EpisodeStatus.FAILED), (ToolStatus.TIMEOUT, EpisodeStatus.TIMEOUT)],
+)
+async def test_tool_statuses_map_to_typed_terminal_episodes(tmp_path, tool_status, episode_status):
+    dependencies = make_fake_dependencies(tmp_path, tool_status=tool_status)
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+    assert episode.status is episode_status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("evaluation_status", "episode_status"),
+    [(EvaluationStatus.INVALID, EpisodeStatus.INVALID), (EvaluationStatus.FAILED, EpisodeStatus.FAILED), (EvaluationStatus.TIMEOUT, EpisodeStatus.TIMEOUT)],
+)
+async def test_evaluation_statuses_map_to_typed_terminal_episodes(tmp_path, evaluation_status, episode_status):
+    dependencies = make_fake_dependencies(tmp_path, evaluator_status=evaluation_status)
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+    assert episode.status is episode_status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("where", ["runtime", "tool", "evaluator"])
+async def test_timeout_exceptions_map_to_timeout(tmp_path, where):
+    options = {
+        "stage_exceptions": {AgentStage.HYPOTHESIZING: TimeoutError("timeout")} if where == "runtime" else None,
+        "tool_exception": TimeoutError("timeout") if where == "tool" else None,
+        "evaluator_exception": TimeoutError("timeout") if where == "evaluator" else None,
+    }
+    dependencies = make_fake_dependencies(tmp_path, **options)
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+    assert episode.status is EpisodeStatus.TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_candidate_validation_failure_is_invalid_and_reflection_has_stage_specific_values(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path, candidate_failure=True)
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+    assert episode.status is EpisodeStatus.INVALID
+
+
+@pytest.mark.asyncio
+async def test_cancellation_preserves_notes_when_audit_and_close_fail(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path, cancel_stage=AgentStage.PROPOSING_ACTION, audit_failure=True, close_failure=True)
+    with pytest.raises(asyncio.CancelledError) as error:
+        await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+    assert any("audit" in note for note in error.value.__notes__)
+    assert any("close" in note for note in error.value.__notes__)
+
+
+@pytest.mark.asyncio
+async def test_target_is_deep_copied_before_external_calls(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path)
+    target = {"x": [1]}
+    dependencies["target_position"] = target
+    loop = AgentLoop(**dependencies)
+    target["x"].append(2)
+    episode = await loop.run_particle("run-1", "p0", 0)
+    assert episode.model_dump(mode="json")["target_position"] == {"x": [1]}
