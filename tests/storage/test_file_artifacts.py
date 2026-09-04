@@ -528,3 +528,94 @@ def test_artifact_verify_preserves_integrity_primary_when_close_fails(
     with pytest.raises(storage_module.ArtifactIntegrityError, match="hash") as raised:
         store.verify(wrong)
     assert any("close failed" in note for note in raised.value.__notes__)
+
+
+def test_artifact_verify_rejects_metadata_size_before_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileArtifactStore(tmp_path)
+    reference = store.publish_bytes("value.bin", b"payload", "application/octet-stream")
+    wrong = ArtifactRef(**{**reference.model_dump(), "size_bytes": 8})
+    reads = 0
+    real_read = os.read
+
+    def track_read(fd: int, size: int) -> bytes:
+        nonlocal reads
+        reads += 1
+        return real_read(fd, size)
+
+    monkeypatch.setattr(os, "read", track_read)
+    with pytest.raises(storage_module.ArtifactIntegrityError, match="size"):
+        store.verify(wrong)
+    assert reads == 0
+
+
+def test_artifact_verify_stops_when_read_exceeds_reference_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileArtifactStore(tmp_path)
+    reference = store.publish_bytes("value.bin", b"payload", "application/octet-stream")
+    reads = 0
+
+    def oversized_read(_fd: int, _size: int) -> bytes:
+        nonlocal reads
+        reads += 1
+        if reads > 1:
+            raise AssertionError("verify read beyond the first oversized chunk")
+        return b"x" * (reference.size_bytes + 1)
+
+    monkeypatch.setattr(os, "read", oversized_read)
+    with pytest.raises(storage_module.ArtifactIntegrityError, match="size"):
+        store.verify(reference)
+    assert reads == 1
+
+
+def test_artifact_verify_rejects_file_changed_at_eof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileArtifactStore(tmp_path)
+    reference = store.publish_bytes("value.bin", b"payload", "application/octet-stream")
+    target = tmp_path / reference.relative_path
+    real_read = os.read
+    appended = False
+
+    def append_at_eof(fd: int, size: int) -> bytes:
+        nonlocal appended
+        chunk = real_read(fd, size)
+        if not chunk and not appended:
+            appended = True
+            with target.open("ab") as handle:
+                handle.write(b"changed")
+        return chunk
+
+    monkeypatch.setattr(os, "read", append_at_eof)
+    with pytest.raises(storage_module.ArtifactIntegrityError, match="changed"):
+        store.verify(reference)
+    assert appended
+
+
+def test_artifact_verify_preserves_keyboard_interrupt_identity_and_close_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileArtifactStore(tmp_path)
+    reference = store.publish_bytes("nested/value.bin", b"payload", "application/octet-stream")
+    primary = KeyboardInterrupt("stop verification")
+    real_close = os.close
+    failed_close = False
+
+    def interrupt_read(_fd: int, _size: int) -> bytes:
+        raise primary
+
+    def close_with_secondary(fd: int) -> None:
+        nonlocal failed_close
+        if not failed_close:
+            failed_close = True
+            raise OSError("secondary close failure")
+        real_close(fd)
+
+    monkeypatch.setattr(os, "read", interrupt_read)
+    monkeypatch.setattr(os, "close", close_with_secondary)
+    with pytest.raises(KeyboardInterrupt) as raised:
+        store.verify(reference)
+    assert raised.value is primary
+    assert any("secondary close failure" in note for note in raised.value.__notes__)

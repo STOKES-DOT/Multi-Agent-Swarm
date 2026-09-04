@@ -6,12 +6,30 @@ from collections.abc import Mapping
 
 import pytest
 
-from multi_agent_pso.core import AgentStage, EpisodeStatus, EvaluationStatus
+from multi_agent_pso.core import (
+    AgentStage,
+    EpisodeCheckpoint,
+    EpisodeStatus,
+    EvaluationStatus,
+    StageEvent,
+)
 from multi_agent_pso.orchestration import AgentLoop, AuditPersistenceError
 import multi_agent_pso.orchestration.agent_loop as agent_loop_module
 from multi_agent_pso.protocols import ToolStatus
 
-from .fakes import make_fake_dependencies
+from .fakes import FakeRunStore, make_fake_dependencies
+
+
+def _fake_checkpoint() -> EpisodeCheckpoint:
+    return EpisodeCheckpoint(
+        run_id="run-1", particle_id="p0", iteration_id=0,
+        completed_stage=AgentStage.EXECUTING, completed_attempt=0,
+        terminal_event_type="completed", terminal_event_sequence=None,
+        next_stage=AgentStage.EVALUATING, next_attempt=0,
+        context={"run_id": "run-1", "particle_id": "p0", "iteration_id": 0,
+                 "protocol_snapshot_hash": "a" * 64},
+        protocol_snapshot_hash="a" * 64,
+    )
 
 
 JSON_BYTES = 256 * 1024
@@ -1205,3 +1223,66 @@ def test_audit_payload_catches_unexpected_validator_exception(tmp_path, monkeypa
     event = dependencies["run_store"].events[-1]
     assert event.payload["truncated"] is True
     assert_audit_events_within_v1_budget(dependencies)
+
+
+def test_fake_run_store_create_run_and_transition_match_real_first_wins() -> None:
+    store = FakeRunStore()
+    store.create_run("run-1", "a" * 64)
+    store.create_run("run-1", "a" * 64)
+    with pytest.raises(ValueError, match="snapshot"):
+        store.create_run("run-1", "b" * 64)
+    event = StageEvent(
+        run_id="run-1", particle_id="p0", iteration_id=0,
+        stage=AgentStage.EXECUTING, attempt=0, event_type="completed",
+        payload={"value": 1},
+    )
+    checkpoint = _fake_checkpoint()
+    store.commit_stage_transition(event, checkpoint)
+    store.commit_stage_transition(event, checkpoint)
+    stored = store.list_stage_events("run-1", "p0", 0)
+    assert len(stored) == 1
+    latest = store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    assert latest["terminal_event_sequence"] == stored[0].sequence
+    with pytest.raises(ValueError, match="conflict"):
+        store.commit_stage_transition(
+            event.model_copy(update={"payload": {"value": 2}}), checkpoint
+        )
+    with pytest.raises(ValueError, match="conflict"):
+        store.commit_stage_transition(
+            event.model_copy(update={"payload": {"value": 1.0}}), checkpoint
+        )
+
+
+def test_fake_iteration_transaction_commits_and_rolls_back_atomically() -> None:
+    store = FakeRunStore()
+    store.create_run("run-1", "a" * 64)
+    with store.iteration_transaction("run-1", 0) as tx:
+        tx.put_particle_json("p0", {"position": [0]})
+        tx.put_pbest_json("p0", {"fitness": 1})
+        tx.put_gbest_json({"particle_id": "p0"})
+        tx.put_snapshot_json({"iteration": 0})
+    assert store.get_iteration_snapshot_json("run-1", 0) == {"iteration": 0}
+    assert store.get_latest_committed_snapshot_json("run-1") == {"iteration": 0}
+    assert store.particles[("run-1", "p0")] == {"position": [0]}
+    assert store.pbest_history[("run-1", 0, "p0")] == {"fitness": 1}
+    assert store.gbest_history[("run-1", 0)] == {"particle_id": "p0"}
+    with pytest.raises(ValueError, match="conflict"):
+        with store.iteration_transaction("run-1", 0) as tx:
+            tx.put_particle_json("p0", {"position": [0.0]})
+            tx.put_pbest_json("p0", {"fitness": 1})
+            tx.put_gbest_json({"particle_id": "p0"})
+            tx.put_snapshot_json({"iteration": 0})
+
+    with pytest.raises(RuntimeError):
+        with store.iteration_transaction("run-1", 1) as tx:
+            tx.put_particle_json("p0", {"position": [1]})
+            tx.put_snapshot_json({"iteration": 1})
+            raise RuntimeError("rollback")
+    assert store.get_iteration_snapshot_json("run-1", 1) is None
+    assert store.particles[("run-1", "p0")] == {"position": [0]}
+
+    tx = store.iteration_transaction("run-1", 1)
+    tx.put_particle_json("p0", {"position": [1]})
+    with pytest.raises(ValueError, match="snapshot"):
+        tx.commit()
+    assert store.get_iteration_snapshot_json("run-1", 1) is None

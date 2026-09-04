@@ -167,7 +167,7 @@ class ArtifactRef(_FrozenModel):
     @field_validator("relative_path")
     @classmethod
     def validate_relative_path(cls, value: str) -> str:
-        if not value or "\\" in value:
+        if not value or "\\" in value or "\x00" in value:
             raise ValueError("relative_path must be a nonempty POSIX path")
         raw_parts = value.split("/")
         path = PurePosixPath(value)
@@ -452,6 +452,10 @@ class IterationSnapshot(_FrozenModel):
             for particle in self.particles
             if particle.pbest is not None
         }
+        if any(
+            best.iteration_id > self.iteration_id for best in bests.values()
+        ):
+            raise ValueError("snapshot personal best cannot come from a future iteration")
         for particle_id, selected_id in self.sbest_particle_ids.items():
             if selected_id is not None and selected_id not in bests:
                 raise ValueError("sbest must identify a particle with a personal best")
@@ -463,6 +467,8 @@ class IterationSnapshot(_FrozenModel):
                     raise ValueError("update trace sbest must match snapshot sbest")
         if self.gbest is not None and self.gbest not in bests.values():
             raise ValueError("global best must match a snapshot personal best")
+        if self.gbest is not None and self.gbest.iteration_id > self.iteration_id:
+            raise ValueError("snapshot global best cannot come from a future iteration")
         return self
 
 
@@ -477,6 +483,11 @@ class EpisodeCheckpoint(_FrozenModel):
     particle_id: str = Field(min_length=1)
     iteration_id: int = Field(ge=0)
     completed_stage: AgentStage
+    completed_attempt: int = Field(ge=0, strict=True)
+    terminal_event_type: Literal[
+        "completed", "failed", "invalid", "timeout", "interrupted", "cleanup_failed"
+    ]
+    terminal_event_sequence: int | None = Field(default=None, ge=1, strict=True)
     next_stage: AgentStage | None
     next_attempt: int = Field(ge=0)
     context: Mapping[str, JsonValue]
@@ -508,9 +519,48 @@ class EpisodeCheckpoint(_FrozenModel):
         for key, value in expected.items():
             if self.context.get(key) != value:
                 raise ValueError(f"checkpoint context {key} does not match checkpoint")
-        if self.next_stage is None:
-            if self.completed_stage is not AgentStage.COMPLETED or self.next_attempt != 0:
-                raise ValueError("terminal checkpoint must complete the COMPLETED stage")
-        elif self.completed_stage is AgentStage.COMPLETED:
-            raise ValueError("completed checkpoint must not have a next stage")
+        schema_stages = {
+            AgentStage.HYPOTHESIZING,
+            AgentStage.PROPOSING_ACTION,
+            AgentStage.REFLECTING,
+        }
+        if self.completed_stage in schema_stages:
+            if self.completed_attempt > 2:
+                raise ValueError("agent stage attempts must be between zero and two")
+        elif self.completed_attempt != 0:
+            raise ValueError("non-agent stages only support attempt zero")
+
+        if self.terminal_event_type == "completed":
+            expected_next = {
+                AgentStage.PENDING: AgentStage.HYPOTHESIZING,
+                AgentStage.HYPOTHESIZING: AgentStage.PROPOSING_ACTION,
+                AgentStage.PROPOSING_ACTION: AgentStage.EXECUTING,
+                AgentStage.EXECUTING: AgentStage.EVALUATING,
+                AgentStage.EVALUATING: AgentStage.REFLECTING,
+                AgentStage.REFLECTING: AgentStage.COMPLETED,
+                AgentStage.COMPLETED: None,
+            }[self.completed_stage]
+            if self.next_stage is not expected_next or self.next_attempt != 0:
+                raise ValueError("completed checkpoint must advance to the fixed next stage")
+        elif self.terminal_event_type == "failed" and self.next_stage is self.completed_stage:
+            if (
+                self.completed_stage not in schema_stages
+                or self.completed_attempt >= 2
+                or self.next_attempt != self.completed_attempt + 1
+            ):
+                raise ValueError("schema correction must advance exactly one bounded attempt")
+        elif self.terminal_event_type == "interrupted":
+            if (
+                self.next_stage is not self.completed_stage
+                or self.next_attempt != self.completed_attempt
+            ):
+                raise ValueError("interrupted checkpoint must resume the same stage attempt")
+        else:
+            if self.next_stage is not None or self.next_attempt != 0:
+                raise ValueError("terminal failure checkpoint must not have a next stage")
+            if (
+                self.terminal_event_type == "cleanup_failed"
+                and self.completed_stage is not AgentStage.COMPLETED
+            ):
+                raise ValueError("cleanup failure belongs to the COMPLETED stage")
         return self

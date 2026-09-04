@@ -237,6 +237,12 @@ class FileArtifactStore:
         return self.publish_bytes(relative_path, serialized, "application/json")
 
     def verify(self, reference: ArtifactRef) -> None:
+        """Verify one immutable artifact through a single opened file descriptor.
+
+        V1 assumes external writers do not mutate artifact paths or contents outside
+        ``FileArtifactStore``. A mutation after the final descriptor metadata check
+        is the documented residual POSIX namespace/content race and is out of scope.
+        """
         if not isinstance(reference, ArtifactRef):
             raise TypeError("reference must be an ArtifactRef")
         if not reference.committed:
@@ -258,21 +264,45 @@ class FileArtifactStore:
             metadata = os.fstat(artifact_fd)
             if not stat.S_ISREG(metadata.st_mode):
                 raise ArtifactIntegrityError("artifact target is not a regular file")
+            if metadata.st_size != reference.size_bytes:
+                raise ArtifactIntegrityError("artifact size does not match reference")
+            original_identity = (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            )
             digest = hashlib.sha256()
             size = 0
             while True:
-                chunk = os.read(artifact_fd, 1024 * 1024)
+                remaining_with_sentinel = reference.size_bytes - size + 1
+                chunk = os.read(
+                    artifact_fd, min(1024 * 1024, max(1, remaining_with_sentinel))
+                )
                 if not chunk:
                     break
                 size += len(chunk)
+                if size > reference.size_bytes:
+                    raise ArtifactIntegrityError("artifact size exceeds reference")
                 digest.update(chunk)
+            final_metadata = os.fstat(artifact_fd)
+            final_identity = (
+                final_metadata.st_dev,
+                final_metadata.st_ino,
+                final_metadata.st_size,
+                final_metadata.st_mtime_ns,
+                final_metadata.st_ctime_ns,
+            )
+            if final_identity != original_identity:
+                raise ArtifactIntegrityError("artifact changed during verification")
             if size != reference.size_bytes:
                 raise ArtifactIntegrityError("artifact size does not match reference")
             if digest.hexdigest() != reference.sha256:
                 raise ArtifactIntegrityError("artifact hash does not match reference")
         except ArtifactIntegrityError:
             raise
-        except BaseException as error:
+        except Exception as error:
             raise ArtifactIntegrityError("artifact could not be verified safely") from error
         finally:
             _close_fds(

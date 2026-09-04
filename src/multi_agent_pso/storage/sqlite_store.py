@@ -342,6 +342,18 @@ class SQLiteRunStore:
             raise RuntimeError("stage event insert did not return a sequence")
         return int(cursor.lastrowid)
 
+    @staticmethod
+    def _stage_event_from_row(row: sqlite3.Row) -> StageEvent:
+        return StageEvent(
+            run_id=row["run_id"],
+            particle_id=row["particle_id"],
+            iteration_id=row["iteration_id"],
+            stage=row["stage"],
+            attempt=row["attempt"],
+            event_type=row["event_type"],
+            payload=json.loads(row["payload_json"]),
+        )
+
     def list_stage_events(
         self, run_id: str, particle_id: str, iteration_id: int
     ) -> tuple[StoredStageEvent, ...]:
@@ -363,15 +375,7 @@ class SQLiteRunStore:
         return tuple(
             StoredStageEvent(
                 sequence=row["event_id"],
-                event=StageEvent(
-                    run_id=row["run_id"],
-                    particle_id=row["particle_id"],
-                    iteration_id=row["iteration_id"],
-                    stage=row["stage"],
-                    attempt=row["attempt"],
-                    event_type=row["event_type"],
-                    payload=json.loads(row["payload_json"]),
-                ),
+                event=self._stage_event_from_row(row),
             )
             for row in rows
         )
@@ -395,12 +399,74 @@ class SQLiteRunStore:
             checkpoint.iteration_id,
         ):
             raise ValueError("event and checkpoint identities must match")
-        checkpoint_json = _canonical_json(checkpoint.model_dump(mode="json"))
+        if (
+            event.stage is not checkpoint.completed_stage
+            or event.attempt != checkpoint.completed_attempt
+            or event.event_type != checkpoint.terminal_event_type
+        ):
+            raise ValueError("event and checkpoint terminal fields must match")
+        if checkpoint.terminal_event_sequence is not None:
+            raise ValueError("input checkpoint sequence must be empty")
+        input_checkpoint = checkpoint.model_dump(mode="json")
+        canonical_input_checkpoint = _canonical_json(input_checkpoint)
+        canonical_event = _canonical_json(event.model_dump(mode="json"))
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             self._secure_database_files()
-            self._insert_stage_event(connection, event)
+            run_row = connection.execute(
+                "SELECT snapshot_hash FROM runs WHERE run_id = ?", (event.run_id,)
+            ).fetchone()
+            if run_row is None:
+                raise sqlite3.IntegrityError("unknown run_id")
+            if run_row["snapshot_hash"] != checkpoint.protocol_snapshot_hash:
+                raise ValueError("checkpoint protocol hash does not match run snapshot hash")
+            existing_rows = connection.execute(
+                """SELECT event_id, run_id, particle_id, iteration_id, stage,
+                attempt, event_type, payload_json FROM stage_events
+                WHERE run_id = ? AND particle_id = ? AND iteration_id = ?
+                AND stage = ? AND attempt = ? AND event_type <> 'started'
+                ORDER BY event_id ASC""",
+                (
+                    event.run_id,
+                    event.particle_id,
+                    event.iteration_id,
+                    event.stage.value,
+                    event.attempt,
+                ),
+            ).fetchall()
+            if existing_rows:
+                if len(existing_rows) != 1:
+                    raise ValueError("stage transition conflict: multiple terminal events")
+                existing_row = existing_rows[0]
+                existing_event = self._stage_event_from_row(existing_row)
+                if _canonical_json(existing_event.model_dump(mode="json")) != canonical_event:
+                    raise ValueError("stage transition conflict: terminal event differs")
+                checkpoint_rows = connection.execute(
+                    """SELECT payload_json FROM thread_checkpoints
+                    WHERE run_id = ? AND particle_id = ? AND iteration_id = ?
+                    ORDER BY checkpoint_id DESC""",
+                    (event.run_id, event.particle_id, event.iteration_id),
+                ).fetchall()
+                matching_checkpoint: EpisodeCheckpoint | None = None
+                for row in checkpoint_rows:
+                    candidate = EpisodeCheckpoint.model_validate(json.loads(row["payload_json"]))
+                    if candidate.terminal_event_sequence == existing_row["event_id"]:
+                        matching_checkpoint = candidate
+                        break
+                if matching_checkpoint is None:
+                    raise ValueError("stage transition conflict: checkpoint is missing")
+                comparable = matching_checkpoint.model_dump(mode="json")
+                comparable["terminal_event_sequence"] = None
+                if _canonical_json(comparable) != canonical_input_checkpoint:
+                    raise ValueError("stage transition conflict: checkpoint differs")
+                connection.commit()
+                return
+            sequence = self._insert_stage_event(connection, event)
+            stored_checkpoint_payload = dict(input_checkpoint)
+            stored_checkpoint_payload["terminal_event_sequence"] = sequence
+            stored_checkpoint = EpisodeCheckpoint.model_validate(stored_checkpoint_payload)
+            checkpoint_json = _canonical_json(stored_checkpoint.model_dump(mode="json"))
             connection.execute(
                 """INSERT INTO thread_checkpoints
                 (run_id, particle_id, iteration_id, payload_json)

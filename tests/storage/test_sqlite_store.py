@@ -29,15 +29,22 @@ def _checkpoint(
     particle_id: str = "p0",
     iteration_id: int = 0,
     completed_stage: AgentStage = AgentStage.EXECUTING,
+    completed_attempt: int = 0,
+    terminal_event_type: str = "completed",
+    terminal_event_sequence: int | None = None,
     next_stage: AgentStage | None = AgentStage.EVALUATING,
     next_attempt: int = 0,
+    thread_json: dict[str, object] | None = None,
 ) -> EpisodeCheckpoint:
-    protocol_hash = "f" * 64
+    protocol_hash = "a" * 64
     return EpisodeCheckpoint(
         run_id=run_id,
         particle_id=particle_id,
         iteration_id=iteration_id,
         completed_stage=completed_stage,
+        completed_attempt=completed_attempt,
+        terminal_event_type=terminal_event_type,
+        terminal_event_sequence=terminal_event_sequence,
         next_stage=next_stage,
         next_attempt=next_attempt,
         context={
@@ -47,7 +54,11 @@ def _checkpoint(
             "protocol_snapshot_hash": protocol_hash,
             "nested": {"values": [1, 2]},
         },
-        thread_json={"logical_id": f"thread-{particle_id}"},
+        thread_json=(
+            {"logical_id": f"thread-{particle_id}"}
+            if thread_json is None
+            else thread_json
+        ),
         protocol_snapshot_hash=protocol_hash,
     )
 
@@ -517,16 +528,18 @@ def test_stage_transition_commits_event_and_checkpoint_atomically_and_reopens(tm
     assert [item.event.event_type for item in events] == ["started", "completed"]
     assert events[-1].event.payload == {"a": 1, "z": 2}
     checkpoint = reopened.get_latest_stage_checkpoint_json("run-1", "p0", 0)
-    assert checkpoint == _checkpoint().model_dump(mode="json")
+    expected_checkpoint = _checkpoint().model_dump(mode="json")
+    expected_checkpoint["terminal_event_sequence"] = events[-1].sequence
+    assert checkpoint == expected_checkpoint
     checkpoint["context"]["nested"]["values"].append(3)
-    assert reopened.get_latest_stage_checkpoint_json("run-1", "p0", 0) == _checkpoint().model_dump(mode="json")
+    assert reopened.get_latest_stage_checkpoint_json("run-1", "p0", 0) == expected_checkpoint
 
     with sqlite3.connect(path) as connection:
         stored_json = connection.execute(
             "SELECT payload_json FROM thread_checkpoints"
         ).fetchone()[0]
     assert stored_json == json.dumps(
-        _checkpoint().model_dump(mode="json"),
+        expected_checkpoint,
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -617,3 +630,131 @@ def test_stage_transition_requires_terminal_event_and_known_run(tmp_path: Path) 
             ),
             _checkpoint(run_id="missing"),
         )
+
+
+@pytest.mark.parametrize("mismatch", ["stage", "attempt", "event_type", "protocol_hash", "sequence"])
+def test_stage_transition_rejects_mismatched_event_checkpoint_or_run(
+    tmp_path: Path, mismatch: str
+) -> None:
+    store = SQLiteRunStore(tmp_path / "runs.sqlite")
+    store.create_run("run-1", "a" * 64)
+    event = StageEvent(
+        run_id="run-1", particle_id="p0", iteration_id=0,
+        stage=AgentStage.EXECUTING, attempt=0, event_type="completed",
+    )
+    checkpoint_kwargs: dict[str, object] = {}
+    if mismatch == "stage":
+        checkpoint_kwargs.update(
+            completed_stage=AgentStage.EVALUATING,
+            terminal_event_type="timeout",
+            next_stage=None,
+        )
+    elif mismatch == "attempt":
+        checkpoint_kwargs.update(
+            completed_stage=AgentStage.HYPOTHESIZING,
+            completed_attempt=1,
+            terminal_event_type="interrupted",
+            next_stage=AgentStage.HYPOTHESIZING,
+            next_attempt=1,
+        )
+    elif mismatch == "event_type":
+        checkpoint_kwargs.update(terminal_event_type="invalid", next_stage=None)
+    elif mismatch == "protocol_hash":
+        checkpoint = _checkpoint()
+        payload = checkpoint.model_dump(mode="json")
+        payload["protocol_snapshot_hash"] = "b" * 64
+        payload["context"]["protocol_snapshot_hash"] = "b" * 64
+        checkpoint_kwargs = payload
+    else:
+        checkpoint_kwargs.update(terminal_event_sequence=7)
+    checkpoint = (
+        EpisodeCheckpoint.model_validate(checkpoint_kwargs)
+        if mismatch == "protocol_hash"
+        else _checkpoint(**checkpoint_kwargs)
+    )
+    with pytest.raises(ValueError):
+        store.commit_stage_transition(event, checkpoint)
+    assert store.list_stage_events("run-1", "p0", 0) == ()
+
+
+def test_stage_transition_identical_replay_is_noop_and_different_replay_conflicts(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteRunStore(tmp_path / "runs.sqlite")
+    store.create_run("run-1", "a" * 64)
+    event = StageEvent(
+        run_id="run-1", particle_id="p0", iteration_id=0,
+        stage=AgentStage.EXECUTING, attempt=0, event_type="completed",
+        payload={"value": 1},
+    )
+    checkpoint = _checkpoint()
+    store.commit_stage_transition(event, checkpoint)
+    store.commit_stage_transition(event, checkpoint)
+    assert len(store.list_stage_events("run-1", "p0", 0)) == 1
+    with sqlite3.connect(store._path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM thread_checkpoints").fetchone() == (1,)
+    with pytest.raises(ValueError, match="conflict"):
+        store.commit_stage_transition(
+            event.model_copy(update={"payload": {"value": 2}}), checkpoint
+        )
+    with pytest.raises(ValueError, match="conflict"):
+        store.commit_stage_transition(
+            event,
+            _checkpoint(thread_json={"logical_id": "different"}),
+        )
+
+
+def test_concurrent_identical_stage_transition_commits_one_row(tmp_path: Path) -> None:
+    store = SQLiteRunStore(tmp_path / "runs.sqlite")
+    store.create_run("run-1", "a" * 64)
+    event = StageEvent(
+        run_id="run-1", particle_id="p0", iteration_id=0,
+        stage=AgentStage.EXECUTING, attempt=0, event_type="completed",
+    )
+    barrier = threading.Barrier(2)
+    failures: list[BaseException] = []
+
+    def write() -> None:
+        try:
+            barrier.wait()
+            store.commit_stage_transition(event, _checkpoint())
+        except BaseException as error:
+            failures.append(error)
+
+    threads = [threading.Thread(target=write) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert failures == []
+    assert len(store.list_stage_events("run-1", "p0", 0)) == 1
+
+
+def test_concurrent_different_stage_transition_is_first_wins(tmp_path: Path) -> None:
+    store = SQLiteRunStore(tmp_path / "runs.sqlite")
+    store.create_run("run-1", "a" * 64)
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def write(value: int) -> None:
+        try:
+            barrier.wait()
+            store.commit_stage_transition(
+                StageEvent(
+                    run_id="run-1", particle_id="p0", iteration_id=0,
+                    stage=AgentStage.EXECUTING, attempt=0,
+                    event_type="completed", payload={"value": value},
+                ),
+                _checkpoint(),
+            )
+            outcomes.append("success")
+        except ValueError:
+            outcomes.append("conflict")
+
+    threads = [threading.Thread(target=write, args=(value,)) for value in (1, 2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(outcomes) == ["conflict", "success"]
+    assert len(store.list_stage_events("run-1", "p0", 0)) == 1

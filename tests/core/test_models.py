@@ -722,6 +722,9 @@ def test_stored_stage_event_and_episode_checkpoint_validate_identity() -> None:
     checkpoint = core_models.EpisodeCheckpoint(
         run_id="run-1", particle_id="p0", iteration_id=2,
         completed_stage=AgentStage.EXECUTING,
+        completed_attempt=0,
+        terminal_event_type="completed",
+        terminal_event_sequence=None,
         next_stage=AgentStage.EVALUATING, next_attempt=0,
         context={"run_id": "run-1", "particle_id": "p0", "iteration_id": 2,
                  "protocol_snapshot_hash": "a" * 64},
@@ -749,7 +752,7 @@ def test_artifact_hash_must_be_lowercase_sha256(bad_hash: str) -> None:
 
 @pytest.mark.parametrize(
     "relative_path",
-    ["", ".", "../x", "a/../x", "a/./x", "a//x", "a/x/", "/absolute", r"a\x"],
+    ["", ".", "../x", "a/../x", "a/./x", "a//x", "a/x/", "/absolute", r"a\x", "a\x00b"],
 )
 def test_artifact_reference_requires_normalized_relative_posix_path(
     relative_path: str,
@@ -762,3 +765,104 @@ def test_artifact_reference_requires_normalized_relative_posix_path(
             media_type="application/octet-stream",
             committed=True,
         )
+
+
+@pytest.mark.parametrize(
+    ("completed_stage", "completed_attempt", "terminal_type", "next_stage", "next_attempt"),
+    [
+        (AgentStage.PENDING, 0, "completed", AgentStage.HYPOTHESIZING, 0),
+        (AgentStage.HYPOTHESIZING, 2, "completed", AgentStage.PROPOSING_ACTION, 0),
+        (AgentStage.PROPOSING_ACTION, 0, "failed", AgentStage.PROPOSING_ACTION, 1),
+        (AgentStage.REFLECTING, 1, "failed", AgentStage.REFLECTING, 2),
+        (AgentStage.EXECUTING, 0, "interrupted", AgentStage.EXECUTING, 0),
+        (AgentStage.EVALUATING, 0, "timeout", None, 0),
+        (AgentStage.COMPLETED, 0, "completed", None, 0),
+        (AgentStage.COMPLETED, 0, "cleanup_failed", None, 0),
+    ],
+)
+def test_episode_checkpoint_accepts_only_real_agent_loop_transitions(
+    completed_stage, completed_attempt, terminal_type, next_stage, next_attempt
+) -> None:
+    checkpoint = core_models.EpisodeCheckpoint(
+        run_id="run-1", particle_id="p0", iteration_id=0,
+        completed_stage=completed_stage, completed_attempt=completed_attempt,
+        terminal_event_type=terminal_type, terminal_event_sequence=None,
+        next_stage=next_stage, next_attempt=next_attempt,
+        context={"run_id": "run-1", "particle_id": "p0", "iteration_id": 0,
+                 "protocol_snapshot_hash": "a" * 64},
+        protocol_snapshot_hash="a" * 64,
+    )
+    assert checkpoint.completed_attempt == completed_attempt
+
+
+@pytest.mark.parametrize(
+    ("completed_stage", "completed_attempt", "terminal_type", "next_stage", "next_attempt"),
+    [
+        (AgentStage.PENDING, 0, "completed", AgentStage.EXECUTING, 0),
+        (AgentStage.HYPOTHESIZING, 0, "completed", AgentStage.HYPOTHESIZING, 1),
+        (AgentStage.PROPOSING_ACTION, 0, "failed", AgentStage.PROPOSING_ACTION, 2),
+        (AgentStage.REFLECTING, 2, "failed", AgentStage.REFLECTING, 3),
+        (AgentStage.EXECUTING, 0, "interrupted", AgentStage.EXECUTING, 1),
+        (AgentStage.EVALUATING, 0, "timeout", AgentStage.REFLECTING, 0),
+        (AgentStage.COMPLETED, 0, "completed", AgentStage.COMPLETED, 0),
+        (AgentStage.EXECUTING, 99, "invalid", None, 0),
+        (AgentStage.EXECUTING, 0, "unknown", None, 0),
+    ],
+)
+def test_episode_checkpoint_rejects_impossible_transitions(
+    completed_stage, completed_attempt, terminal_type, next_stage, next_attempt
+) -> None:
+    with pytest.raises(ValidationError):
+        core_models.EpisodeCheckpoint(
+            run_id="run-1", particle_id="p0", iteration_id=0,
+            completed_stage=completed_stage, completed_attempt=completed_attempt,
+            terminal_event_type=terminal_type, terminal_event_sequence=None,
+            next_stage=next_stage, next_attempt=next_attempt,
+            context={"run_id": "run-1", "particle_id": "p0", "iteration_id": 0,
+                     "protocol_snapshot_hash": "a" * 64},
+            protocol_snapshot_hash="a" * 64,
+        )
+
+
+def test_snapshot_rejects_personal_or_global_best_from_future_iteration() -> None:
+    best = PersonalBest(
+        evaluated_position={}, candidate_reference="c", hypothesis_reference="h",
+        evaluation_reference="e", candidate_hash="a" * 64,
+        evaluation=_success_evaluation(), fitness=1.0, iteration_id=2,
+    )
+    particle = ParticleState(
+        particle_id="p0", position={}, velocity={}, pbest=best, rng_state={}
+    )
+    with pytest.raises(ValidationError, match="future"):
+        IterationSnapshot(
+            run_id="run-1", iteration_id=1, particles=(particle,), gbest=best,
+            config_snapshot_hash="b" * 64, rng_state={},
+            sbest_particle_ids={"p0": "p0"}, resource_budget={},
+            update_traces={"p0": core_models.UpdateTrace(
+                particle_id="p0", sbest_particle_id="p0", cognitive_seed=1,
+                social_seed=2, cognitive_rng_state_before={},
+                cognitive_rng_state_after={}, social_rng_state_before={},
+                social_rng_state_after={}, resampled=False,
+                projected_dimensions=(),
+            )},
+            run_status=core_models.RunStatus.RUNNING,
+        )
+
+
+def test_recovery_model_fields_are_exact() -> None:
+    assert tuple(core_models.EpisodeCheckpoint.model_fields) == (
+        "state_format_version",
+        "run_id",
+        "particle_id",
+        "iteration_id",
+        "completed_stage",
+        "completed_attempt",
+        "terminal_event_type",
+        "terminal_event_sequence",
+        "next_stage",
+        "next_attempt",
+        "context",
+        "thread_json",
+        "protocol_snapshot_hash",
+    )
+    assert tuple(core_models.StoredStageEvent.model_fields) == ("sequence", "event")
