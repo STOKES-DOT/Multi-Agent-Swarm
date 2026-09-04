@@ -1085,3 +1085,63 @@ def test_scandir_exception_and_cancellation_release_all_fds(
 
     assert raised.value is primary
     assert opened == set()
+
+
+@pytest.mark.parametrize("target", ["anchor", "namespace"])
+@pytest.mark.parametrize("mutation", ["grow", "shrink", "mtime"])
+def test_stat_to_open_metadata_change_fails_before_first_read(
+    tmp_path: Path, monkeypatch, target: str, mutation: str
+) -> None:
+    root = tmp_path / "wiki"
+    root.mkdir()
+    agents = root / "AGENTS.md"
+    index = root / "index.md"
+    agents.write_bytes(b"rules")
+    index.write_bytes(b"#\n")
+    page = root / "sources/a.md"
+    page.parent.mkdir()
+    page.write_bytes(b"# A\nx")
+    victim = agents if target == "anchor" else page
+    victim_inode = victim.stat().st_ino
+    total_before = agents.stat().st_size + index.stat().st_size + page.stat().st_size
+    limits = replace(WikiIndexLimits(), max_total_bytes=total_before)
+    opened = _tracked_fds(monkeypatch)
+    tracked_open = os.open
+    original_read = os.read
+    mutated = False
+    bytes_read = 0
+
+    def mutating_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal mutated
+        if path == victim.name and not mutated:
+            if mutation == "grow":
+                with victim.open("ab") as stream:
+                    stream.write(b"x" * 200_000)
+            elif mutation == "shrink":
+                with victim.open("r+b") as stream:
+                    stream.truncate(1)
+            else:
+                current = victim.stat()
+                os.utime(
+                    victim,
+                    ns=(current.st_atime_ns, current.st_mtime_ns + 1_000_000_000),
+                )
+            mutated = True
+        if dir_fd is None:
+            return tracked_open(path, flags, mode)
+        return tracked_open(path, flags, mode, dir_fd=dir_fd)
+
+    def counting_read(fd: int, size: int) -> bytes:
+        nonlocal bytes_read
+        value = original_read(fd, size)
+        if os.fstat(fd).st_ino == victim_inode:
+            bytes_read += len(value)
+        return value
+
+    monkeypatch.setattr(os, "open", mutating_open)
+    monkeypatch.setattr(os, "read", counting_read)
+    with pytest.raises(ValueError, match="changed"):
+        LocalWikiRetriever(root, limits=limits)
+
+    assert bytes_read == 0
+    assert opened == set()

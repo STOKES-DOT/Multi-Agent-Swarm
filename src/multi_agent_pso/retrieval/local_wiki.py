@@ -430,6 +430,13 @@ def _read_utf8_at(
     fd = _open_regular_at(parent_fd, name, expected=before_path)
     with _owned_fd(fd):
         before = os.fstat(fd)
+        budget_snapshot = expected if expected is not None else before_path
+        if (
+            _inode(budget_snapshot) != _inode(before)
+            or stat.S_IFMT(budget_snapshot.st_mode) != stat.S_IFMT(before.st_mode)
+            or _file_metadata(budget_snapshot) != _file_metadata(before)
+        ):
+            raise ValueError("wiki file changed between budget check and open")
         if before.st_size > max_bytes:
             raise ValueError(f"{label} exceeds max_file_bytes")
         data = bytearray()
