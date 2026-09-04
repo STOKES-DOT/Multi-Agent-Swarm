@@ -333,11 +333,23 @@ async def _discard(reader: asyncio.StreamReader) -> None:
         pass
 
 
+async def _capture_then_discard(
+    reader: asyncio.StreamReader,
+    destination: bytearray,
+    limit: int,
+) -> None:
+    try:
+        await _pump(reader, destination, limit)
+    except _OutputLimitExceeded:
+        await _discard(reader)
+
+
 async def _shutdown(
     process: asyncio.subprocess.Process,
     work_tasks: tuple[asyncio.Task[object], ...],
     wait_task: asyncio.Task[int],
     grace_seconds: float,
+    drain_tasks: tuple[asyncio.Task[None], ...] | None = None,
 ) -> None:
     cleanup_errors: list[Exception] = []
     if process.stdin is not None:
@@ -350,10 +362,14 @@ async def _shutdown(
             task.cancel()
     await asyncio.gather(*work_tasks, return_exceptions=True)
 
-    drains = tuple(
-        asyncio.create_task(_discard(stream))
-        for stream in (process.stdout, process.stderr)
-        if stream is not None
+    drains = (
+        tuple(
+            asyncio.create_task(_discard(stream))
+            for stream in (process.stdout, process.stderr)
+            if stream is not None
+        )
+        if drain_tasks is None
+        else drain_tasks
     )
     if process.returncode is None:
         try:
@@ -389,9 +405,16 @@ async def _cleanup_resilient(
     grace_seconds: float,
     *,
     primary: BaseException | None = None,
+    drain_tasks: tuple[asyncio.Task[None], ...] | None = None,
 ) -> None:
     cleanup = asyncio.create_task(
-        _shutdown(process, work_tasks, wait_task, grace_seconds)
+        _shutdown(
+            process,
+            work_tasks,
+            wait_task,
+            grace_seconds,
+            drain_tasks,
+        )
     )
     interrupted: asyncio.CancelledError | None = None
     cleanup_error: BaseException | None = None
@@ -543,6 +566,26 @@ class JsonCommandProvider:
                         )
             outcome = spawn_task.result()
             if isinstance(outcome, asyncio.subprocess.Process):
+                assert outcome.stdout is not None
+                assert outcome.stderr is not None
+                stdout_buffer = bytearray()
+                stderr_buffer = bytearray()
+                drain_tasks = (
+                    asyncio.create_task(
+                        _capture_then_discard(
+                            outcome.stdout,
+                            stdout_buffer,
+                            self._limits.max_stdout_bytes,
+                        )
+                    ),
+                    asyncio.create_task(
+                        _capture_then_discard(
+                            outcome.stderr,
+                            stderr_buffer,
+                            self._limits.max_stderr_bytes,
+                        )
+                    ),
+                )
                 wait_task = asyncio.create_task(outcome.wait())
                 await _cleanup_resilient(
                     outcome,
@@ -550,10 +593,15 @@ class JsonCommandProvider:
                     wait_task,
                     self._limits.terminate_grace_seconds,
                     primary=timeout_cancellation,
+                    drain_tasks=drain_tasks,
                 )
                 exit_code = outcome.returncode
+                stdout = bytes(stdout_buffer)
+                stderr = bytes(stderr_buffer)
             else:
                 exit_code = None
+                stdout = b""
+                stderr = b""
                 if timeout_cancellation is not None:
                     _add_secondary(
                         timeout_cancellation,
@@ -566,8 +614,8 @@ class JsonCommandProvider:
                 raise timeout_cancellation
             return self._result(
                 stdin=stdin,
-                stdout=b"",
-                stderr=b"",
+                stdout=stdout,
+                stderr=stderr,
                 exit_code=exit_code,
                 status=JsonCommandStatus.TIMEOUT,
                 payload=None,

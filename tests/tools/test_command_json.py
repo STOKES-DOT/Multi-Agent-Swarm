@@ -292,6 +292,75 @@ async def test_spawn_timeout_waits_for_late_handle_then_reaps_child(
     assert not _pid_exists(children[0].pid)
 
 
+async def test_spawn_timeout_captures_late_completed_process_streams(
+    tmp_path: Path, monkeypatch
+) -> None:
+    original_spawn = asyncio.create_subprocess_exec
+    children = []
+
+    async def delayed_spawn(*args, **kwargs):
+        process = await original_spawn(*args, **kwargs)
+        children.append(process)
+        await asyncio.sleep(0.1)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+    provider = JsonCommandProvider(
+        (
+            sys.executable,
+            "-c",
+            "import sys;sys.stdout.write('{}');sys.stderr.write('err')",
+        )
+    )
+    result = await provider.execute_json(
+        {}, cwd=tmp_path.resolve(), timeout_seconds=0.01
+    )
+
+    assert result.status is JsonCommandStatus.TIMEOUT
+    assert result.exit_code == 0
+    assert result.stdout == b"{}"
+    assert result.stderr == b"err"
+    assert result.stdout_text == "{}"
+    assert result.stderr_text == "err"
+    assert children[0].returncode == 0
+    assert not _pid_exists(children[0].pid)
+
+
+async def test_spawn_timeout_late_capture_obeys_output_limits(
+    tmp_path: Path, monkeypatch
+) -> None:
+    original_spawn = asyncio.create_subprocess_exec
+    children = []
+
+    async def delayed_spawn(*args, **kwargs):
+        process = await original_spawn(*args, **kwargs)
+        children.append(process)
+        await asyncio.sleep(0.1)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+    limits = replace(
+        JsonCommandLimits(), max_stdout_bytes=32, max_stderr_bytes=16
+    )
+    provider = JsonCommandProvider(
+        (
+            sys.executable,
+            "-c",
+            "import os;os.write(1,b'x'*1000000);os.write(2,b'err')",
+        ),
+        limits=limits,
+    )
+    result = await provider.execute_json(
+        {}, cwd=tmp_path.resolve(), timeout_seconds=0.01
+    )
+
+    assert result.status is JsonCommandStatus.TIMEOUT
+    assert result.stdout == b"x" * limits.max_stdout_bytes
+    assert len(result.stderr) <= limits.max_stderr_bytes
+    assert children[0].returncode is not None
+    assert not _pid_exists(children[0].pid)
+
+
 async def test_process_wait_uses_deadline_remaining_after_spawn(
     tmp_path: Path, monkeypatch
 ) -> None:
