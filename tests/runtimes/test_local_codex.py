@@ -157,6 +157,31 @@ async def test_rotation_bootstraps_checkpoint_and_rolls_back_mapping_on_failure(
         await runtime.run_stage(old, StageRequest(AgentStage.HYPOTHESIZING, "old"))
 
 
+@pytest.mark.parametrize(
+    "primary", [RuntimeError("bootstrap failed"), asyncio.CancelledError("cancelled")]
+)
+async def test_rotation_bootstrap_failure_releases_identity_reservation(
+    tmp_path, primary
+) -> None:
+    client = FakeCodexClient()
+    client.provider_ids.extend(["provider-0", "provider-1", "provider-1"])
+    runtime = LocalCodexRuntime(model="gpt-5", client=client)
+    old = await runtime.start_thread("p0", tmp_path.resolve())
+    client.default_result = primary
+
+    with pytest.raises(type(primary)) as raised:
+        await runtime.rotate_thread(old, {"state": 1})
+
+    assert raised.value is primary
+    assert (await runtime._entry(old)).reference == old
+    assert runtime._identity_reservations == {}
+    client.default_result = CodexTurnResult(
+        '{"ok":true}', None, "turn-ok", "completed", 1
+    )
+    rotated = await runtime.rotate_thread(old, {"state": 1})
+    assert rotated.provider_id == "provider-1"
+
+
 async def test_rotation_rejects_unbounded_checkpoint_before_starting_thread(tmp_path) -> None:
     client = FakeCodexClient()
     runtime = LocalCodexRuntime(model="gpt-5", client=client)
@@ -243,16 +268,45 @@ async def test_rotate_rejects_provider_collision_and_keeps_old_mapping(tmp_path)
     left_dir.mkdir()
     right_dir.mkdir()
     client = FakeCodexClient()
+    client.provider_ids.extend(["provider-0", "provider-1", "provider-1"])
     runtime = LocalCodexRuntime(model="gpt-5", client=client)
     left = await runtime.start_thread("p0", left_dir.resolve())
     right = await runtime.start_thread("p1", right_dir.resolve())
-    client.provider_ids.append(right.provider_id)
     with pytest.raises(ValueError, match="collision"):
         await runtime.rotate_thread(left, {"state": 1})
+    assert client.run_calls == []
+    assert (await runtime._entry(left)).reference == left
+    assert (await runtime._entry(right)).reference == right
+    assert runtime._identity_reservations == {}
     response = await runtime.run_stage(
         left, StageRequest(AgentStage.HYPOTHESIZING, "old survives")
     )
     assert response.raw_text
+
+
+async def test_provider_loss_collision_rejected_before_bootstrap(tmp_path) -> None:
+    left_dir = tmp_path / "left"
+    right_dir = tmp_path / "right"
+    left_dir.mkdir()
+    right_dir.mkdir()
+    client = FakeCodexClient()
+    client.provider_ids.extend(["provider-0", "provider-1", "provider-1"])
+    runtime = LocalCodexRuntime(model="gpt-5", client=client)
+    left = await runtime.start_thread("p0", left_dir.resolve())
+    right = await runtime.start_thread("p1", right_dir.resolve())
+    await runtime.close_thread(left)
+    client.resume_error = ProviderThreadNotFoundError("thread not found")
+
+    with pytest.raises(ValueError, match="collision"):
+        await runtime.restore_thread(
+            "p0", left_dir.resolve(), {"thread_json": left.to_json()}
+        )
+
+    assert client.run_calls == []
+    assert (await runtime._entry(right)).reference == right
+    assert "p0" not in runtime._particle_threads
+    assert runtime._reservations == {}
+    assert runtime._identity_reservations == {}
 
 
 async def test_workspace_aliases_are_exclusive_and_canonical(tmp_path) -> None:
@@ -339,6 +393,37 @@ async def test_provider_loss_bootstrap_failure_leaves_no_mapping(tmp_path) -> No
     assert raised.value is primary
     assert runtime._entries == {}
     assert runtime._reservations == {}
+
+
+@pytest.mark.parametrize(
+    "primary", [RuntimeError("bootstrap failed"), asyncio.CancelledError("cancelled")]
+)
+async def test_provider_loss_bootstrap_failure_releases_all_reservations(
+    tmp_path, primary
+) -> None:
+    client = FakeCodexClient()
+    client.provider_ids.extend(["provider-0", "provider-1", "provider-1"])
+    runtime = LocalCodexRuntime(model="gpt-5", client=client)
+    old = await runtime.start_thread("p0", tmp_path.resolve())
+    await runtime.close_thread(old)
+    client.resume_error = ProviderThreadNotFoundError("thread not found")
+    client.default_result = primary
+
+    with pytest.raises(type(primary)) as raised:
+        await runtime.restore_thread(
+            "p0", tmp_path.resolve(), {"thread_json": old.to_json()}
+        )
+
+    assert raised.value is primary
+    assert runtime._reservations == {}
+    assert runtime._identity_reservations == {}
+    client.default_result = CodexTurnResult(
+        '{"ok":true}', None, "turn-ok", "completed", 1
+    )
+    restored = await runtime.restore_thread(
+        "p0", tmp_path.resolve(), {"thread_json": old.to_json()}
+    )
+    assert restored.provider_id == "provider-1"
 
 
 async def test_provider_loss_rejects_reused_provider_identity(tmp_path) -> None:
@@ -434,6 +519,41 @@ async def test_close_during_start_rolls_back_reservation(tmp_path) -> None:
     with pytest.raises(RuntimeError, match="closing|closed"):
         await starting
     await closing
+    assert runtime._entries == {}
+    assert client.close_calls == 1
+
+
+@pytest.mark.parametrize("operation", ["rotate", "restore"])
+async def test_close_during_bootstrap_releases_identity_reservation(
+    tmp_path, operation
+) -> None:
+    client = FakeCodexClient()
+    client.delay = 0.03
+    runtime = LocalCodexRuntime(model="gpt-5", client=client, own_client=True)
+    old = await runtime.start_thread("p0", tmp_path.resolve())
+    if operation == "restore":
+        await runtime.close_thread(old)
+        client.resume_error = ProviderThreadNotFoundError("thread not found")
+        bootstrapping = asyncio.create_task(
+            runtime.restore_thread(
+                "p0", tmp_path.resolve(), {"thread_json": old.to_json()}
+            )
+        )
+    else:
+        bootstrapping = asyncio.create_task(
+            runtime.rotate_thread(old, {"thread_json": old.to_json()})
+        )
+    while not client.run_calls:
+        await asyncio.sleep(0)
+    assert runtime._identity_reservations
+
+    closing = asyncio.create_task(runtime.close())
+    with pytest.raises(RuntimeError, match="closing|closed"):
+        await bootstrapping
+    await closing
+
+    assert runtime._identity_reservations == {}
+    assert runtime._provider_reservations == {}
     assert runtime._entries == {}
     assert client.close_calls == 1
 

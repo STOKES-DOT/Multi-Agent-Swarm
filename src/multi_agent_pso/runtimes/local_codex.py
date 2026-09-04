@@ -220,6 +220,12 @@ class _Reservation:
     done: asyncio.Event
 
 
+@dataclass
+class _IdentityReservation:
+    reference: ThreadRef
+    done: asyncio.Event
+
+
 class LocalCodexRuntime:
     """Isolated, bounded local Codex threads with explicit ownership.
 
@@ -255,6 +261,8 @@ class LocalCodexRuntime:
         self._workspace_threads: dict[Path, str] = {}
         self._reservations: dict[str, _Reservation] = {}
         self._reserved_workspaces: set[Path] = set()
+        self._identity_reservations: dict[str, _IdentityReservation] = {}
+        self._provider_reservations: dict[str, _IdentityReservation] = {}
         self._state_lock = asyncio.Lock()
         self._closing = False
         self._closed = False
@@ -318,14 +326,25 @@ class LocalCodexRuntime:
                     raise ValueError(
                         "provider-loss recovery must create a distinct thread"
                     )
-                self._response(
-                    await provider.run(
-                        bootstrap,
-                        cwd=cwd,
-                        output_schema=None,
-                        sandbox=self._sandbox,
+                identity_reservation = await self._reserve_identity(restored)
+                try:
+                    self._response(
+                        await provider.run(
+                            bootstrap,
+                            cwd=cwd,
+                            output_schema=None,
+                            sandbox=self._sandbox,
+                        )
                     )
-                )
+                    await self._commit_reservation(
+                        reservation,
+                        restored,
+                        provider,
+                        identity_reservation=identity_reservation,
+                    )
+                except BaseException:
+                    await self._rollback_identity_reservation(identity_reservation)
+                    raise
             else:
                 restored = self._reference(
                     provider, particle, reference.generation, cwd
@@ -334,7 +353,7 @@ class LocalCodexRuntime:
                     raise ValueError(
                         "resumed SDK thread identity does not match checkpoint"
                     )
-            await self._commit_reservation(reservation, restored, provider)
+                await self._commit_reservation(reservation, restored, provider)
             return restored
         except BaseException:
             await self._rollback_reservation(reservation)
@@ -370,19 +389,31 @@ class LocalCodexRuntime:
             rotated = self._reference(
                 provider, thread.particle_id, thread.generation + 1, thread.workspace
             )
-            if rotated.provider_id == thread.provider_id:
-                raise ValueError("rotation must create a distinct provider thread")
-            result = await provider.run(
-                bootstrap,
-                cwd=thread.workspace,
-                output_schema=None,
-                sandbox=self._sandbox,
+            identity_reservation = await self._reserve_identity(
+                rotated, replacing=entry
             )
-            self._response(result)
-            async with self._state_lock:
-                self._require_available()
-                self._assert_current_locked(entry, thread)
-                self._insert_locked(rotated, provider, replacing=entry)
+            try:
+                result = await provider.run(
+                    bootstrap,
+                    cwd=thread.workspace,
+                    output_schema=None,
+                    sandbox=self._sandbox,
+                )
+                self._response(result)
+                async with self._state_lock:
+                    self._require_available()
+                    self._assert_current_locked(entry, thread)
+                    self._assert_identity_reservation_locked(identity_reservation)
+                    self._insert_locked(
+                        rotated,
+                        provider,
+                        replacing=entry,
+                        identity_reservation=identity_reservation,
+                    )
+                    self._release_identity_reservation_locked(identity_reservation)
+            except BaseException:
+                await self._rollback_identity_reservation(identity_reservation)
+                raise
             return rotated
 
     async def close_thread(self, thread: ThreadRef) -> None:
@@ -409,6 +440,9 @@ class LocalCodexRuntime:
             async with self._state_lock:
                 reservation_events = tuple(
                     reservation.done for reservation in self._reservations.values()
+                ) + tuple(
+                    reservation.done
+                    for reservation in self._identity_reservations.values()
                 )
             if reservation_events:
                 await asyncio.gather(*(event.wait() for event in reservation_events))
@@ -425,6 +459,8 @@ class LocalCodexRuntime:
                 self._workspace_threads.clear()
                 self._reservations.clear()
                 self._reserved_workspaces.clear()
+                self._identity_reservations.clear()
+                self._provider_reservations.clear()
                 self._closed = True
                 self._closing = False
         except BaseException:
@@ -495,29 +531,106 @@ class LocalCodexRuntime:
         reservation: _Reservation,
         reference: ThreadRef,
         provider: CodexThreadPort,
+        *,
+        identity_reservation: _IdentityReservation | None = None,
     ) -> None:
         async with self._state_lock:
             if self._reservations.get(reservation.particle_id) is not reservation:
                 raise ValueError("Codex thread reservation is stale")
+            if identity_reservation is not None:
+                self._assert_identity_reservation_locked(identity_reservation)
+                if identity_reservation.reference != reference:
+                    raise ValueError("Codex identity reservations do not match")
             if self._closing or self._closed:
                 self._reservations.pop(reservation.particle_id)
                 self._reserved_workspaces.discard(reservation.workspace)
+                if identity_reservation is not None:
+                    self._release_identity_reservation_locked(identity_reservation)
                 reservation.done.set()
                 raise RuntimeError("LocalCodexRuntime is closing or closed")
-            self._insert_locked(reference, provider)
+            self._insert_locked(
+                reference,
+                provider,
+                identity_reservation=identity_reservation,
+            )
+            if identity_reservation is not None:
+                self._release_identity_reservation_locked(identity_reservation)
             self._reservations.pop(reservation.particle_id)
             self._reserved_workspaces.discard(reservation.workspace)
             reservation.done.set()
 
-    def _insert_locked(
+    async def _reserve_identity(
         self,
         reference: ThreadRef,
-        provider: CodexThreadPort,
         *,
         replacing: _ThreadEntry | None = None,
+    ) -> _IdentityReservation:
+        async with self._state_lock:
+            self._require_available()
+            if replacing is not None:
+                self._assert_current_locked(replacing, replacing.reference)
+                if (
+                    reference.logical_id == replacing.reference.logical_id
+                    or reference.provider_id == replacing.reference.provider_id
+                ):
+                    raise ValueError(
+                        "rotation must create distinct logical and provider threads"
+                    )
+            self._assert_identity_available_locked(reference, replacing=replacing)
+            reservation = _IdentityReservation(reference, asyncio.Event())
+            self._identity_reservations[reference.logical_id] = reservation
+            assert reference.provider_id is not None
+            self._provider_reservations[reference.provider_id] = reservation
+            return reservation
+
+    async def _rollback_identity_reservation(
+        self, reservation: _IdentityReservation
     ) -> None:
+        async with self._state_lock:
+            self._release_identity_reservation_locked(reservation)
+
+    def _assert_identity_reservation_locked(
+        self, reservation: _IdentityReservation
+    ) -> None:
+        reference = reservation.reference
+        if self._identity_reservations.get(reference.logical_id) is not reservation:
+            raise ValueError("Codex logical thread reservation is stale")
+        if (
+            reference.provider_id is None
+            or self._provider_reservations.get(reference.provider_id) is not reservation
+        ):
+            raise ValueError("Codex provider thread reservation is stale")
+
+    def _release_identity_reservation_locked(
+        self, reservation: _IdentityReservation
+    ) -> None:
+        reference = reservation.reference
+        if self._identity_reservations.get(reference.logical_id) is reservation:
+            self._identity_reservations.pop(reference.logical_id)
+        if (
+            reference.provider_id is not None
+            and self._provider_reservations.get(reference.provider_id) is reservation
+        ):
+            self._provider_reservations.pop(reference.provider_id)
+        reservation.done.set()
+
+    def _assert_identity_available_locked(
+        self,
+        reference: ThreadRef,
+        *,
+        replacing: _ThreadEntry | None = None,
+        identity_reservation: _IdentityReservation | None = None,
+    ) -> None:
+        if reference.provider_id is None:
+            raise ValueError("Codex provider thread identity is missing")
         logical_entry = self._entries.get(reference.logical_id)
         if logical_entry is not None and logical_entry is not replacing:
+            raise ValueError("Codex logical thread collision")
+        reserved_logical = self._identity_reservations.get(reference.logical_id)
+        if (
+            reserved_logical is not None
+            and reserved_logical is not identity_reservation
+        ):
             raise ValueError("Codex logical thread collision")
         if any(
             entry is not replacing
@@ -525,6 +638,26 @@ class LocalCodexRuntime:
             for entry in self._entries.values()
         ):
             raise ValueError("Codex provider thread collision")
+        reserved_provider = self._provider_reservations.get(reference.provider_id)
+        if (
+            reserved_provider is not None
+            and reserved_provider is not identity_reservation
+        ):
+            raise ValueError("Codex provider thread collision")
+
+    def _insert_locked(
+        self,
+        reference: ThreadRef,
+        provider: CodexThreadPort,
+        *,
+        replacing: _ThreadEntry | None = None,
+        identity_reservation: _IdentityReservation | None = None,
+    ) -> None:
+        self._assert_identity_available_locked(
+            reference,
+            replacing=replacing,
+            identity_reservation=identity_reservation,
+        )
         if reference.particle_id in self._particle_threads:
             current_logical = self._particle_threads[reference.particle_id]
             if replacing is None or current_logical != replacing.reference.logical_id:
