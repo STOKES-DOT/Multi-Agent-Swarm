@@ -8,9 +8,19 @@ conda run -n multi-agent-pso python -m pip install -e '.[dev]'
 conda run -n multi-agent-pso pytest -q
 ```
 
-> 状态：技术构想草案  
-> 日期：2026-09-02  
-> 当前范围：讨论基于 PSO 的多 Agent 自主分子研究框架，不代表最终实现方案。
+> 状态：Stage A 已实现
+> 当前范围：可复现的通用 PSO core、持久化、checkpoint recovery 与 deterministic continuous benchmarks。分子设计、Codex、RDKit、MoleculeEditor、TDDFT 与 MOMAP 属于后续 Stage B 愿景，不会由 Stage A 执行。
+
+## Stage A benchmarks
+
+Stage A 使用真实 `SynchronousSwarmRunner`、SQLite run state 与 immutable artifact store；默认测试不运行任何 `live` 外部任务。
+
+```bash
+conda run -n multi-agent-pso multi-agent-pso benchmark sphere --runs-dir /private/tmp/multi-agent-pso-runs
+conda run -n multi-agent-pso multi-agent-pso benchmark rastrigin --runs-dir /private/tmp/multi-agent-pso-runs --seed 42
+```
+
+每个 run 目录包含 `runs.sqlite` 与 `artifacts/summary.json`。相同 benchmark 参数与 seed 在独立目录生成相同的 snapshot state；summary 仅使用相对输出引用，便于跨目录比较。
 
 ## 1. 目标
 
