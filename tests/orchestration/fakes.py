@@ -31,15 +31,41 @@ from multi_agent_pso.protocols import (
 
 
 class FakeRunStore:
-    def __init__(self, cached: ToolResult | None = None, audit_failure: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        cached: ToolResult | None = None,
+        audit_failure: BaseException | None = None,
+        *,
+        audit_failure_stage: AgentStage | None = None,
+        audit_failure_event_type: str | None = "interrupted",
+        audit_failure_nth: int = 1,
+        audit_failure_persistent: bool = False,
+    ) -> None:
         self.events: list[StageEvent] = []
+        self.append_attempts: list[StageEvent] = []
         self.cached = cached
         self.recorded: dict[str, ToolResult] = {}
         self.audit_failure = audit_failure
+        self.audit_failure_stage = audit_failure_stage
+        self.audit_failure_event_type = audit_failure_event_type
+        self.audit_failure_nth = audit_failure_nth
+        self.audit_failure_persistent = audit_failure_persistent
+        self._matching_append_attempts = 0
 
     def append_stage_event(self, event: StageEvent) -> None:
-        if self.audit_failure is not None and event.event_type == "interrupted":
-            raise self.audit_failure
+        self.append_attempts.append(event)
+        matches_stage = self.audit_failure_stage is None or event.stage is self.audit_failure_stage
+        matches_type = (
+            self.audit_failure_event_type is None
+            or event.event_type == self.audit_failure_event_type
+        )
+        if self.audit_failure is not None and matches_stage and matches_type:
+            self._matching_append_attempts += 1
+            should_fail = self.audit_failure_persistent or (
+                self._matching_append_attempts == self.audit_failure_nth
+            )
+            if should_fail:
+                raise self.audit_failure
         self.events.append(event)
 
     def create_run(self, run_id: str, snapshot_hash: str) -> None:
@@ -115,6 +141,7 @@ class FakeRuntime:
         self.payload = payload
         self.stages: list[AgentStage] = []
         self.closed_threads: list[str] = []
+        self.close_attempts: list[str] = []
         self.close_failure = close_failure
         self.start_exception = start_exception
         self.stage_exceptions = dict(stage_exceptions or {})
@@ -147,6 +174,7 @@ class FakeRuntime:
 
     async def close_thread(self, thread: ThreadRef) -> None:
         assert self.resources.agent_active
+        self.close_attempts.append(thread.logical_id)
         self.closed_threads.append(thread.logical_id)
         if self.close_failure is not None:
             raise self.close_failure
@@ -236,6 +264,10 @@ def make_fake_dependencies(
     candidate_failure: bool = False,
     stage_exceptions: Mapping[AgentStage, BaseException] | None = None,
     audit_failure: BaseException | None = None,
+    audit_failure_stage: AgentStage | None = None,
+    audit_failure_event_type: str | None = "interrupted",
+    audit_failure_nth: int = 1,
+    audit_failure_persistent: bool = False,
     start_exception: BaseException | None = None,
     mutate_context: bool = False,
 ) -> dict[str, object]:
@@ -252,7 +284,14 @@ def make_fake_dependencies(
         "evaluator": FakeEvaluator(resources, evaluator_status, evaluator_exception),
         "tool_provider": FakeTool(tool_status, tool_exception),
         "resource_manager": resources,
-        "run_store": FakeRunStore(cached, audit_failure),
+        "run_store": FakeRunStore(
+            cached,
+            audit_failure,
+            audit_failure_stage=audit_failure_stage,
+            audit_failure_event_type=audit_failure_event_type,
+            audit_failure_nth=audit_failure_nth,
+            audit_failure_persistent=audit_failure_persistent,
+        ),
         "target_position": {"x": 1},
         "workspace": workspace,
         "protocol_snapshot_hash": hashlib.sha256(b"protocol").hexdigest(),

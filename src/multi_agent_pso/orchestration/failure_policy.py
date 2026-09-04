@@ -4,6 +4,15 @@ from multi_agent_pso.core import EpisodeStatus, EvaluationStatus
 from multi_agent_pso.protocols import ToolStatus
 
 
+class AuditPersistenceError(RuntimeError):
+    """A stage audit event could not be durably appended."""
+
+    def __init__(self, *, stage: str, attempt: int, event_type: str) -> None:
+        super().__init__(
+            f"failed to persist {stage} audit event {event_type!r} for attempt {attempt}"
+        )
+
+
 def episode_status_for_tool(status: ToolStatus) -> EpisodeStatus:
     return {
         ToolStatus.SUCCESS: EpisodeStatus.COMPLETED,

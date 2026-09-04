@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from multi_agent_pso.core import AgentStage, EpisodeStatus, EvaluationStatus
-from multi_agent_pso.orchestration import AgentLoop
+from multi_agent_pso.orchestration import AgentLoop, AuditPersistenceError
 from multi_agent_pso.protocols import ToolStatus
 
 from .fakes import make_fake_dependencies
@@ -236,3 +236,151 @@ async def test_mutating_adapter_context_does_not_change_episode_target(tmp_path)
     dependencies = make_fake_dependencies(tmp_path, mutate_context=True)
     episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
     assert episode.model_dump(mode="json")["target_position"] == {"x": 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["started", "completed"])
+async def test_completion_audit_failure_closes_once_without_reentering_terminal_mapping(
+    tmp_path, event_type
+):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        audit_failure=RuntimeError(f"{event_type} audit"),
+        audit_failure_stage=AgentStage.COMPLETED,
+        audit_failure_event_type=event_type,
+    )
+
+    with pytest.raises(AuditPersistenceError):
+        await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+    attempts = dependencies["run_store"].append_attempts
+    completed_terminals = [
+        event
+        for event in attempts
+        if event.stage is AgentStage.COMPLETED and event.event_type != "started"
+    ]
+    assert len(completed_terminals) <= 1
+    assert all(event.event_type != "failed" for event in completed_terminals)
+
+
+@pytest.mark.asyncio
+async def test_pending_completion_audit_failure_still_closes_transferred_thread_once(tmp_path):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        audit_failure=RuntimeError("pending completion audit"),
+        audit_failure_stage=AgentStage.PENDING,
+        audit_failure_event_type="completed",
+    )
+
+    with pytest.raises(AuditPersistenceError):
+        await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+    attempts = dependencies["run_store"].append_attempts
+    assert [(event.stage, event.event_type) for event in attempts] == [
+        (AgentStage.PENDING, "started"),
+        (AgentStage.PENDING, "completed"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("where", "stage"),
+    [
+        ("runtime", AgentStage.HYPOTHESIZING),
+        ("tool", AgentStage.EXECUTING),
+        ("evaluator", AgentStage.EVALUATING),
+    ],
+)
+async def test_business_primary_survives_persistent_terminal_audit_failure(
+    tmp_path, where, stage
+):
+    primary = RuntimeError(f"{where} primary")
+    failure_options = {
+        "runtime": {"stage_exceptions": {AgentStage.HYPOTHESIZING: primary}},
+        "tool": {"tool_exception": primary},
+        "evaluator": {"evaluator_exception": primary},
+    }[where]
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        **failure_options,
+        audit_failure=RuntimeError("terminal audit"),
+        audit_failure_stage=stage,
+        audit_failure_event_type="failed",
+        audit_failure_persistent=True,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert raised.value is primary
+    assert any("audit" in note for note in raised.value.__notes__)
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+    attempts = dependencies["run_store"].append_attempts
+    assert sum(
+        event.stage is stage and event.event_type != "started"
+        for event in attempts
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancellation_identity_survives_audit_and_close_failures(tmp_path):
+    primary = asyncio.CancelledError("cancel primary")
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        stage_exceptions={AgentStage.HYPOTHESIZING: primary},
+        audit_failure=RuntimeError("cancel audit"),
+        close_failure=RuntimeError("cancel close"),
+    )
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert raised.value is primary
+    assert any("audit" in note for note in raised.value.__notes__)
+    assert any("close" in note for note in raised.value.__notes__)
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+
+
+@pytest.mark.asyncio
+async def test_timeout_primary_survives_terminal_audit_failure(tmp_path):
+    primary = TimeoutError("timeout primary")
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        stage_exceptions={AgentStage.HYPOTHESIZING: primary},
+        audit_failure=RuntimeError("timeout audit"),
+        audit_failure_stage=AgentStage.HYPOTHESIZING,
+        audit_failure_event_type="timeout",
+    )
+
+    with pytest.raises(TimeoutError) as raised:
+        await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert raised.value is primary
+    assert any("audit" in note for note in raised.value.__notes__)
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+
+
+@pytest.mark.asyncio
+async def test_close_primary_survives_cleanup_terminal_audit_failure(tmp_path):
+    primary = RuntimeError("close primary")
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        close_failure=primary,
+        audit_failure=RuntimeError("cleanup audit"),
+        audit_failure_stage=AgentStage.COMPLETED,
+        audit_failure_event_type="cleanup_failed",
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert raised.value is primary
+    assert any("audit" in note for note in raised.value.__notes__)
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+    attempts = dependencies["run_store"].append_attempts
+    assert sum(
+        event.stage is AgentStage.COMPLETED and event.event_type == "cleanup_failed"
+        for event in attempts
+    ) == 1
