@@ -150,7 +150,7 @@ def _bounded_json_copy(value: object, *, boundary: str) -> JsonValue:
                 budget.add_bytes(1)
                 copied[key] = copy(nested, depth + 1)
             return copied
-        if isinstance(item, (list, tuple)):
+        if type(item) in (list, tuple):
             if len(item) > V1_JSON_MAX_COLLECTION_ITEMS:
                 budget.fail("single collection limit exceeded")
             budget.add_bytes(2)
@@ -160,6 +160,8 @@ def _bounded_json_copy(value: object, *, boundary: str) -> JsonValue:
                     budget.add_bytes(1)
                 copied_list.append(copy(nested, depth + 1))
             return copied_list
+        if isinstance(item, (list, tuple)):
+            budget.fail("list and tuple subclasses are not accepted")
         budget.fail("value is not JSON-compatible")
         raise AssertionError("unreachable")
 
@@ -861,7 +863,7 @@ class AgentLoop:
     def _audit_payload(self, payload: object) -> Mapping[str, JsonValue]:
         try:
             copied = _bounded_json_copy(payload, boundary="audit")
-        except _JsonBoundaryError as error:
+        except Exception as error:
             summary: dict[str, JsonValue] = {
                 "truncated": True,
                 "reason": _safe_utf8_text(error, 256),
@@ -869,7 +871,7 @@ class AgentLoop:
             }
             try:
                 copied = _bounded_json_copy(summary, boundary="audit summary")
-            except _JsonBoundaryError:
+            except Exception:
                 copied = {
                     "truncated": True,
                     "reason": "audit JSON boundary rejected",

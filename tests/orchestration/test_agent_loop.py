@@ -1162,3 +1162,46 @@ async def test_invalid_identifier_is_rejected_before_external_calls(tmp_path, id
     assert dependencies["runtime"].stages == []
     assert dependencies["runtime"].close_attempts == []
     assert dependencies["run_store"].append_attempts == []
+
+
+@pytest.mark.parametrize("container_type", [list, tuple])
+def test_hostile_sequence_subclass_is_rejected_without_calling_protocol(
+    tmp_path, container_type
+):
+    class EvilSequence(container_type):
+        def __len__(self):
+            raise RuntimeError("hostile len")
+
+        def __iter__(self):
+            raise RuntimeError("hostile iterator")
+
+    payload = EvilSequence([1])
+    dependencies = make_fake_dependencies(tmp_path)
+    loop = AgentLoop(**dependencies)
+
+    loop._started("run-1", "p0", 0, AgentStage.PENDING, 0, {"value": payload})
+
+    event = dependencies["run_store"].events[-1]
+    assert event.payload["truncated"] is True
+    assert_audit_events_within_v1_budget(dependencies)
+    dependencies["target_position"] = payload
+    with pytest.raises(ValueError, match="JSON boundary"):
+        AgentLoop(**dependencies)
+
+
+def test_audit_payload_catches_unexpected_validator_exception(tmp_path, monkeypatch):
+    dependencies = make_fake_dependencies(tmp_path)
+    loop = AgentLoop(**dependencies)
+    original = agent_loop_module._bounded_json_copy
+
+    def fail_audit(value, *, boundary):
+        if boundary == "audit":
+            raise RuntimeError("unexpected validator failure")
+        return original(value, boundary=boundary)
+
+    monkeypatch.setattr(agent_loop_module, "_bounded_json_copy", fail_audit)
+    loop._started("run-1", "p0", 0, AgentStage.PENDING, 0, {"value": 1})
+
+    event = dependencies["run_store"].events[-1]
+    assert event.payload["truncated"] is True
+    assert_audit_events_within_v1_budget(dependencies)
