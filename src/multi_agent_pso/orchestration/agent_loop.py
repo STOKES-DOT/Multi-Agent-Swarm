@@ -47,6 +47,14 @@ class _ThreadOwner:
     close_attempted: bool = False
 
 
+@dataclass(slots=True)
+class _RecordedStageFailure(Exception):
+    primary: Exception
+    status: EpisodeStatus
+    evaluation_status: EvaluationStatus
+    audit_error: AuditPersistenceError | None = None
+
+
 class AgentLoop:
     """Drive one particle through a bounded, dependency-injected episode."""
 
@@ -180,13 +188,30 @@ class AgentLoop:
                 return await self._finish_episode(owner, run_id, particle_id, iteration_id, events, EpisodeStatus.INVALID, evaluation, evaluated, realized, adherence)
             current_stage = AgentStage.COMPLETED
             return await self._finish_episode(owner, run_id, particle_id, iteration_id, events, EpisodeStatus.COMPLETED, evaluation, evaluated, realized, adherence, complete_lifecycle=True)
+        except _RecordedStageFailure as error:
+            self._clear_stage_boundary(context)
+            if error.audit_error is not None:
+                self._add_secondary(error.primary, "stage failure audit failed", error.audit_error)
+                raise error.primary from error.audit_error
+            return await self._finish_episode(
+                owner,
+                run_id,
+                particle_id,
+                iteration_id,
+                events,
+                error.status,
+                Evaluation(status=error.evaluation_status, feasible=False),
+                evaluated,
+                realized,
+                adherence,
+            )
         except AuditPersistenceError:
             raise
         except asyncio.CancelledError as error:
             if owner.close_attempted:
                 raise
             try:
-                self._terminal_event(run_id, particle_id, iteration_id, current_stage, "interrupted", events)
+                self._terminal_event(run_id, particle_id, iteration_id, current_stage, "interrupted", events, payload=self._failure_payload(error, context))
             except AuditPersistenceError as audit_error:
                 self._add_secondary(error, "interruption audit failed", audit_error)
             except asyncio.CancelledError as audit_error:
@@ -275,23 +300,54 @@ class AgentLoop:
     ) -> Mapping[str, JsonValue] | None:
         for attempt in range(3):
             stage_context = self._copy_json(context)
+            context[_ACTIVE_STAGE_CONTEXT] = stage_context
+            try:
+                request = self._adapter.build_stage_request(
+                    stage, self._copy_json(stage_context)
+                )
+            except asyncio.CancelledError as error:
+                self._record_cancelled_build(
+                    stage, attempt, stage_context, error
+                )
+                raise
+            except TimeoutError as error:
+                self._raise_recorded_build_failure(
+                    stage,
+                    attempt,
+                    stage_context,
+                    events,
+                    error,
+                    EpisodeStatus.TIMEOUT,
+                    EvaluationStatus.TIMEOUT,
+                    "timeout",
+                )
+            except Exception as error:
+                self._raise_recorded_build_failure(
+                    stage,
+                    attempt,
+                    stage_context,
+                    events,
+                    error,
+                    EpisodeStatus.FAILED,
+                    EvaluationStatus.FAILED,
+                    "failed",
+                )
+            except (SystemExit, KeyboardInterrupt) as error:
+                self._record_cancelled_build(stage, attempt, stage_context, error)
+                raise
+            request_payload: Mapping[str, JsonValue]
+            if isinstance(request, StageRequest):
+                request_payload = request.to_json()
+            else:
+                request_payload = {"type": type(request).__name__[:128]}
             self._started(
                 str(context["run_id"]),
                 str(context["particle_id"]),
                 int(context["iteration_id"]),
                 stage,
                 attempt,
-                {"attempt": attempt, "context": stage_context},
+                {"attempt": attempt, "context": stage_context, "request": request_payload},
             )
-            context[_ACTIVE_STAGE_CONTEXT] = stage_context
-            request = self._adapter.build_stage_request(
-                stage, self._copy_json(stage_context)
-            )
-            request_payload: Mapping[str, JsonValue]
-            if isinstance(request, StageRequest):
-                request_payload = request.to_json()
-            else:
-                request_payload = {"type": type(request).__name__[:128]}
             context[_ACTIVE_STAGE_REQUEST] = request_payload
             if not isinstance(request, StageRequest):
                 raise TypeError("task adapter must return a StageRequest")
@@ -319,6 +375,84 @@ class AgentLoop:
             self._clear_stage_boundary(context)
             return parsed
         raise AssertionError("unreachable")
+
+    def _record_cancelled_build(
+        self,
+        stage: AgentStage,
+        attempt: int,
+        stage_context: JsonValue,
+        error: BaseException,
+    ) -> None:
+        diagnostic = self._request_error(error)
+        try:
+            self._started(
+                str(stage_context["run_id"]),  # type: ignore[index]
+                str(stage_context["particle_id"]),  # type: ignore[index]
+                int(stage_context["iteration_id"]),  # type: ignore[index]
+                stage,
+                attempt,
+                {
+                    "attempt": attempt,
+                    "context": stage_context,
+                    "request_error": diagnostic,
+                },
+            )
+        except AuditPersistenceError as audit_error:
+            self._add_secondary(error, "request build audit failed", audit_error)
+            raise error from audit_error
+
+    def _raise_recorded_build_failure(
+        self,
+        stage: AgentStage,
+        attempt: int,
+        stage_context: JsonValue,
+        events: list[StageEvent],
+        error: Exception,
+        status: EpisodeStatus,
+        evaluation_status: EvaluationStatus,
+        terminal_type: str,
+    ) -> None:
+        diagnostic = self._request_error(error)
+        started_payload: dict[str, JsonValue] = {
+            "attempt": attempt,
+            "context": stage_context,
+            "request_error": diagnostic,
+        }
+        terminal_payload: dict[str, JsonValue] = {
+            **diagnostic,
+            "context": stage_context,
+            "request_error": diagnostic,
+        }
+        failure = _RecordedStageFailure(error, status, evaluation_status)
+        try:
+            self._started(
+                str(stage_context["run_id"]),  # type: ignore[index]
+                str(stage_context["particle_id"]),  # type: ignore[index]
+                int(stage_context["iteration_id"]),  # type: ignore[index]
+                stage,
+                attempt,
+                started_payload,
+            )
+            self._terminal_event(
+                str(stage_context["run_id"]),  # type: ignore[index]
+                str(stage_context["particle_id"]),  # type: ignore[index]
+                int(stage_context["iteration_id"]),  # type: ignore[index]
+                stage,
+                terminal_type,
+                events,
+                attempt,
+                terminal_payload,
+            )
+        except AuditPersistenceError as audit_error:
+            failure.audit_error = audit_error
+        raise failure from error
+
+    @staticmethod
+    def _request_error(error: BaseException) -> dict[str, JsonValue]:
+        return {
+            "type": type(error).__name__[:128],
+            "message": str(error)[:512],
+        }
 
     async def _execute_tool(self, run_id: str, particle_id: str, iteration_id: int, proposal: Mapping[str, JsonValue]) -> tuple[ToolResult, ToolRequest, bool]:
         key = self._identity("tool", run_id, particle_id, iteration_id, "EXECUTING")

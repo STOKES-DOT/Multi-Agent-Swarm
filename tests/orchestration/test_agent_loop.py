@@ -471,6 +471,7 @@ async def test_agent_stage_rejects_invalid_request_before_runtime(tmp_path, inva
         if event.stage is AgentStage.HYPOTHESIZING
     ]
     assert [event.event_type for event in stage_attempts] == ["started", "failed"]
+    assert "request" in stage_attempts[0].payload
     if invalid_kind == "wrong_type":
         assert dict(stage_attempts[-1].payload["request"]) == {"type": "dict"}
     else:
@@ -505,7 +506,9 @@ async def test_adapter_build_failure_keeps_started_terminal_pair_without_runtime
     assert [event.event_type for event in attempts] == ["started", terminal_type]
     assert attempts[0].payload["attempt"] == 0
     assert attempts[0].payload["context"]["particle_id"] == "p0"
+    assert attempts[0].payload["request_error"]["type"] == type(primary).__name__
     assert attempts[-1].payload["context"]["particle_id"] == "p0"
+    assert attempts[-1].payload["request_error"]["type"] == type(primary).__name__
     assert len(attempts[-1].payload["message"]) <= 512
 
 
@@ -535,3 +538,47 @@ async def test_runtime_failure_terminal_carries_active_stage_request(
         and event.event_type == terminal_type
     )
     assert terminal.payload["request"]["stage"] == "HYPOTHESIZING"
+
+
+@pytest.mark.asyncio
+async def test_runtime_cancellation_audits_identical_active_request_boundary(tmp_path):
+    primary = asyncio.CancelledError("runtime cancellation")
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        stage_exceptions={AgentStage.HYPOTHESIZING: primary},
+    )
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert raised.value is primary
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+    attempts = [
+        event
+        for event in dependencies["run_store"].append_attempts
+        if event.stage is AgentStage.HYPOTHESIZING and event.attempt == 0
+    ]
+    assert [event.event_type for event in attempts] == ["started", "interrupted"]
+    assert attempts[0].payload["request"]["stage"] == "HYPOTHESIZING"
+    assert attempts[-1].payload["request"] == attempts[0].payload["request"]
+    assert attempts[-1].payload["context"] == attempts[0].payload["context"]
+
+
+@pytest.mark.asyncio
+async def test_build_cancellation_records_request_error_before_interruption(tmp_path):
+    primary = asyncio.CancelledError("build cancellation")
+    dependencies = make_fake_dependencies(tmp_path, build_exception=primary)
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert raised.value is primary
+    assert dependencies["runtime"].stages == []
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+    attempts = [
+        event
+        for event in dependencies["run_store"].append_attempts
+        if event.stage is AgentStage.HYPOTHESIZING and event.attempt == 0
+    ]
+    assert [event.event_type for event in attempts] == ["started", "interrupted"]
+    assert attempts[0].payload["request_error"]["type"] == "CancelledError"
