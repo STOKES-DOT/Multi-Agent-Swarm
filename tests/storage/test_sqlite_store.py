@@ -191,6 +191,67 @@ def test_concurrent_bootstrap_of_same_path_is_repeatable(tmp_path: Path) -> None
         assert SQLiteRunStore(path).get_iteration_snapshot_json("missing", 0) is None
 
 
+def test_high_concurrency_bootstrap_reaches_wal_without_lock_failures(tmp_path: Path) -> None:
+    for iteration in range(20):
+        path = tmp_path / f"high-contention-{iteration}.sqlite"
+        barrier = threading.Barrier(8)
+        failures: list[BaseException] = []
+
+        def bootstrap() -> None:
+            try:
+                barrier.wait()
+                SQLiteRunStore(path)
+            except BaseException as error:
+                failures.append(error)
+
+        threads = [threading.Thread(target=bootstrap) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert failures == []
+        assert path.stat().st_mode & 0o777 == 0o600
+        with sqlite3.connect(path) as connection:
+            assert connection.execute("SELECT schema_version FROM schema_metadata").fetchone() == (1,)
+            assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+
+
+def test_wal_mode_retries_locked_switch_and_rechecks_current_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Cursor:
+        def __init__(self, value: str) -> None:
+            self._value = value
+
+        def fetchone(self) -> tuple[str]:
+            return (self._value,)
+
+    class Connection:
+        def __init__(self) -> None:
+            self.mode = "delete"
+            self.switch_attempts = 0
+
+        def execute(self, statement: str) -> Cursor:
+            if statement == "PRAGMA journal_mode":
+                return Cursor(self.mode)
+            assert statement == "PRAGMA journal_mode=WAL"
+            self.switch_attempts += 1
+            if self.switch_attempts == 1:
+                self.mode = "wal"  # another constructor completed the switch
+                raise sqlite3.OperationalError("database is locked")
+            self.mode = "wal"
+            return Cursor("wal")
+
+    store = SQLiteRunStore(tmp_path / "runs.sqlite")
+    connection = Connection()
+    monkeypatch.setattr(sqlite_store_module.time, "sleep", lambda _seconds: None)
+
+    store._ensure_wal_mode(connection)  # type: ignore[arg-type]
+
+    assert connection.switch_attempts == 1
+
+
 def test_bootstrap_retries_after_ddl_failure_leaves_empty_sqlite_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

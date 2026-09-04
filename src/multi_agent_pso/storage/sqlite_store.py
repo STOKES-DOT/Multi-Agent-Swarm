@@ -7,6 +7,7 @@ import math
 import os
 import sqlite3
 import stat
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Self
@@ -148,6 +149,7 @@ def _expected_schema_fingerprint() -> dict[str, str]:
 
 
 _EXPECTED_SCHEMA_FINGERPRINT = _expected_schema_fingerprint()
+_WAL_LOCK_TIMEOUT_SECONDS = 5.0
 
 
 class SQLiteRunStore:
@@ -170,7 +172,7 @@ class SQLiteRunStore:
                 self._validate_schema(connection)
             connection.commit()
             self._secure_database_files()
-            connection.execute("PRAGMA journal_mode=WAL")
+            self._ensure_wal_mode(connection)
             self._secure_database_files()
         except BaseException:
             connection.rollback()
@@ -183,7 +185,23 @@ class SQLiteRunStore:
         connection = sqlite3.connect(self._path)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=5000")
         return connection
+
+    def _ensure_wal_mode(self, connection: sqlite3.Connection) -> None:
+        deadline = time.monotonic() + _WAL_LOCK_TIMEOUT_SECONDS
+        delay = 0.01
+        while True:
+            mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+            if str(mode).lower() == "wal":
+                return
+            try:
+                connection.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError as error:
+                if "locked" not in str(error).lower() or time.monotonic() >= deadline:
+                    raise
+                time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+                delay = min(delay * 2, 0.1)
 
     @staticmethod
     def _table_names(connection: sqlite3.Connection) -> set[str]:
