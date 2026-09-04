@@ -20,7 +20,7 @@ conda run -n multi-agent-pso multi-agent-pso benchmark sphere --runs-dir /privat
 conda run -n multi-agent-pso multi-agent-pso benchmark rastrigin --runs-dir /private/tmp/multi-agent-pso-runs --seed 42
 ```
 
-每个 run 目录包含 `runs.sqlite` 与 `artifacts/summary.json`。相同 benchmark 参数与 seed 在独立目录生成相同的 snapshot state；summary 仅使用相对输出引用，便于跨目录比较。
+每个 run 目录包含 `runs.sqlite` 与 `artifacts/summary.json`。summary 记录 protocol/config descriptor、`initial_gbest`、`final_gbest` 和相对输出引用。相同 descriptor 在独立目录生成相同的 snapshot state；改变 seed、dimension、边界、拓扑或更新参数会改变 run/config identity。
 
 ## 1. 目标
 

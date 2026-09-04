@@ -16,3 +16,8 @@ def test_benchmark_cli_runs_sphere_and_writes_summary(tmp_path, capsys) -> None:
 def test_stage_a_unimplemented_commands_fail_nonzero(capsys) -> None:
     assert main(["run"]) != 0
     assert "not implemented in Stage A" in capsys.readouterr().err
+
+
+def test_cli_without_command_prints_usage_and_fails(capsys) -> None:
+    assert main([]) == 2
+    assert "usage:" in capsys.readouterr().err

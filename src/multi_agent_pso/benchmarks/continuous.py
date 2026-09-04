@@ -15,12 +15,13 @@ from typing import Any, AsyncIterator
 import numpy as np
 from pydantic import JsonValue
 
-from multi_agent_pso.core import AgentStage, Evaluation, EvaluationStatus
+from multi_agent_pso.core import AgentStage, ArtifactRef, Evaluation, EvaluationStatus, IterationSnapshot
 from multi_agent_pso.core.position_space import ContinuousBoxPositionSpace
 from multi_agent_pso.core.topology import RingTopology
 from multi_agent_pso.core.update_rule import ConstrictedUpdateRule
 from multi_agent_pso.orchestration import AgentLoop, SynchronousSwarmRunner
 from multi_agent_pso.protocols import (
+    ArtifactIntegrityError,
     CandidateRef, EvaluationContext, StageRequest, StageResponse, ThreadRef,
     TokenUsage, ToolContext, ToolRequest, ToolResult, ToolStatus,
 )
@@ -36,19 +37,36 @@ def _vector(value: object) -> np.ndarray:
 
 def sphere_fitness(value: object) -> float:
     vector = _vector(value)
-    return float(-np.sum(vector * vector))
+    with np.errstate(over="ignore", invalid="ignore"):
+        result = float(-np.sum(vector * vector))
+    if not math.isfinite(result):
+        raise ValueError("benchmark fitness must be finite")
+    return result
 
 
 def rastrigin_fitness(value: object) -> float:
     vector = _vector(value)
-    return float(-(10.0 * vector.size + np.sum(vector * vector - 10.0 * np.cos(2.0 * np.pi * vector))))
+    with np.errstate(over="ignore", invalid="ignore"):
+        result = float(-(10.0 * vector.size + np.sum(vector * vector - 10.0 * np.cos(2.0 * np.pi * vector))))
+    if not math.isfinite(result):
+        raise ValueError("benchmark fitness must be finite")
+    return result
 
 
 @dataclass(frozen=True)
 class BenchmarkResult:
     run_id: str
-    summary: Mapping[str, JsonValue]
-    final_snapshot: Mapping[str, JsonValue]
+    _summary_json: str
+    final_snapshot: IterationSnapshot
+
+    @property
+    def summary(self) -> dict[str, JsonValue]:
+        value = json.loads(self._summary_json)
+        assert isinstance(value, dict)
+        return value
+
+
+STAGE_A_BENCHMARK_PROTOCOL_VERSION = 1
 
 
 class _Resources:
@@ -130,15 +148,24 @@ class _Evaluator:
         return Evaluation(status=EvaluationStatus.SUCCESS, feasible=True, fitness=self._fitness(candidate.metadata["position"]))
 
 
-def _run_id(name: str, seed: int, particles: int, iterations: int, dimension: int) -> str:
-    return "stagea-" + hashlib.sha256(json.dumps([name, seed, particles, iterations, dimension]).encode()).hexdigest()[:24]
+def _descriptor(name: str, seed: int, particles: int, iterations: int, dimension: int) -> dict[str, JsonValue]:
+    return {"protocol_version": STAGE_A_BENCHMARK_PROTOCOL_VERSION, "benchmark": name, "seed": seed, "particles": particles, "iterations": iterations, "dimension": dimension, "bounds": [-5.12, 5.12], "topology": {"type": "ring", "radius": 1}, "update": {"c1": 2.05, "c2": 2.05, "chi": 0.72984, "velocity_clamp": 0.20}, "failure_threshold": 2}
+
+
+def _canonical(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _run_id(descriptor: Mapping[str, JsonValue]) -> str:
+    return "stagea-" + hashlib.sha256(_canonical(["stage-a-run", descriptor]).encode()).hexdigest()[:24]
 
 
 def run_continuous_benchmark(name: str, seed: int, runs_dir: Path, *, particles: int = 5, iterations: int = 2, dimension: int = 3) -> BenchmarkResult:
-    if name not in {"sphere", "rastrigin"} or type(seed) is not int or seed < 0 or not isinstance(runs_dir, Path) or particles < 1 or particles > 5 or iterations < 1 or dimension < 1:
+    if not isinstance(name, str) or name not in {"sphere", "rastrigin"} or type(seed) is not int or seed < 0 or not isinstance(runs_dir, Path) or type(particles) is not int or not 1 <= particles <= 5 or type(iterations) is not int or iterations < 1 or type(dimension) is not int or dimension < 1:
         raise ValueError("invalid Stage A benchmark arguments")
     fitness = sphere_fitness if name == "sphere" else rastrigin_fitness
-    run_id = _run_id(name, seed, particles, iterations, dimension)
+    descriptor = _descriptor(name, seed, particles, iterations, dimension)
+    run_id = _run_id(descriptor)
     root = runs_dir / run_id
     root.mkdir(parents=True, exist_ok=True)
     store = SQLiteRunStore(root / "runs.sqlite")
@@ -149,18 +176,19 @@ def run_continuous_benchmark(name: str, seed: int, runs_dir: Path, *, particles:
     runtime = _Runtime()
     tool = _Tool()
     evaluator = _Evaluator(fitness)
-    config_hash = hashlib.sha256(json.dumps(["stage-a", name, dimension]).encode()).hexdigest()
+    config_hash = hashlib.sha256(_canonical(["stage-a-config", descriptor]).encode()).hexdigest()
     def factory(target: JsonValue) -> AgentLoop:
         return AgentLoop(runtime=runtime, task_adapter=adapter, evaluator=evaluator, tool_provider=tool, artifact_store=artifacts, resource_manager=resources, run_store=store, target_position=target, workspace=root.resolve(), protocol_snapshot_hash=config_hash)
     runner = SynchronousSwarmRunner(run_id=run_id, run_seed=seed, config_snapshot_hash=config_hash, space=space, adapter=adapter, topology=RingTopology(), update_rule=ConstrictedUpdateRule(), store=store, episode_factory=factory, particle_ids=tuple(f"p{i}" for i in range(particles)), resource_budget={"benchmark": name}, failure_threshold=2)
     result = asyncio.run(runner.run(iterations=iterations))
+    initial = result.snapshots[0].model_dump(mode="json")
     final = result.final_snapshot.model_dump(mode="json")
-    summary: dict[str, JsonValue] = {"run_id": run_id, "status": final["run_status"], "benchmark": name, "seed": seed, "particle_count": particles, "iteration_count": iterations, "dimension": dimension, "final_gbest": None if final["gbest"] is None else final["gbest"], "database": "runs.sqlite", "artifacts": "artifacts/summary.json"}
-    data = (json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    summary: dict[str, JsonValue] = {"run_id": run_id, "status": final["run_status"], "benchmark": name, "seed": seed, "particle_count": particles, "iteration_count": iterations, "dimension": dimension, "protocol_version": STAGE_A_BENCHMARK_PROTOCOL_VERSION, "config": descriptor, "initial_gbest": initial["gbest"], "final_gbest": final["gbest"], "database": "runs.sqlite", "artifacts": "artifacts/summary.json"}
+    summary_json = _canonical(summary)
+    data = (summary_json + "\n").encode()
     try:
         artifacts.publish_bytes("summary.json", data, "application/json")
     except FileExistsError:
-        existing = root / "artifacts" / "summary.json"
-        if existing.read_bytes() != data:
-            raise
-    return BenchmarkResult(run_id, summary, final)
+        reference = ArtifactRef(relative_path="summary.json", sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data), media_type="application/json", committed=True)
+        artifacts.verify(reference)
+    return BenchmarkResult(run_id, summary_json, result.final_snapshot)

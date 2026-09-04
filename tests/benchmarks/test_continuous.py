@@ -18,3 +18,5 @@ def test_benchmarks_reject_nonfinite_or_nonvector_inputs(fitness) -> None:
         fitness(np.array([np.nan], dtype=np.float64))
     with pytest.raises(ValueError):
         fitness(np.zeros((1, 1), dtype=np.float64))
+    with pytest.raises(ValueError):
+        fitness(np.array([1e308], dtype=np.float64))

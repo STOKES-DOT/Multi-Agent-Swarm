@@ -25,6 +25,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.version:
         print(__version__)
         return 0
+    if args.command is None:
+        parser.print_usage(sys.stderr)
+        return 2
     if args.command == "benchmark":
         try:
             from .benchmarks import run_continuous_benchmark
