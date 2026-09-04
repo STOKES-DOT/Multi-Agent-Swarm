@@ -39,6 +39,147 @@ from .failure_policy import (
 
 _ACTIVE_STAGE_CONTEXT = "_active_stage_context"
 _ACTIVE_STAGE_REQUEST = "_active_stage_request"
+V1_JSON_MAX_UTF8_BYTES = 256 * 1024
+V1_JSON_MAX_DEPTH = 32
+V1_JSON_MAX_NODES = 10_000
+V1_JSON_MAX_COLLECTION_ITEMS = 4_096
+_TEXT_CHUNK_CHARACTERS = 16_384
+
+
+class _JsonBoundaryError(ValueError):
+    """An in-band JSON value exceeded the v1 audit/transport budget."""
+
+
+@dataclass(slots=True)
+class _JsonBudget:
+    boundary: str
+    utf8_bytes: int = 0
+    nodes: int = 0
+
+    def add_bytes(self, count: int) -> None:
+        self.utf8_bytes += count
+        if self.utf8_bytes > V1_JSON_MAX_UTF8_BYTES:
+            self.fail("UTF-8 byte limit exceeded")
+
+    def add_node(self) -> None:
+        self.nodes += 1
+        if self.nodes > V1_JSON_MAX_NODES:
+            self.fail("node limit exceeded")
+
+    def fail(self, reason: str) -> None:
+        raise _JsonBoundaryError(f"{self.boundary} JSON boundary rejected: {reason}")
+
+
+def _bounded_json_copy(value: object, *, boundary: str) -> JsonValue:
+    budget = _JsonBudget(boundary)
+
+    def encoded_string_size(item: str) -> int:
+        if len(item) + 2 > V1_JSON_MAX_UTF8_BYTES - budget.utf8_bytes:
+            budget.fail("UTF-8 byte limit exceeded")
+        try:
+            return len(
+                json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            )
+        except (TypeError, ValueError, UnicodeError):
+            budget.fail("string is not valid UTF-8 JSON")
+        raise AssertionError("unreachable")
+
+    def copy(item: object, depth: int) -> JsonValue:
+        if depth > V1_JSON_MAX_DEPTH:
+            budget.fail("depth limit exceeded")
+        budget.add_node()
+        if item is None:
+            budget.add_bytes(4)
+            return None
+        if type(item) is bool:
+            budget.add_bytes(4 if item else 5)
+            return item
+        if type(item) is str:
+            budget.add_bytes(encoded_string_size(item))
+            return item
+        if type(item) is int:
+            remaining = V1_JSON_MAX_UTF8_BYTES - budget.utf8_bytes + 1
+            if abs(item).bit_length() > 4 * remaining:
+                budget.fail("UTF-8 byte limit exceeded")
+            try:
+                encoded = str(item)
+            except ValueError:
+                budget.fail("integer representation exceeds the limit")
+            budget.add_bytes(len(encoded))
+            return item
+        if type(item) is float:
+            if not math.isfinite(item):
+                budget.fail("non-finite number")
+            budget.add_bytes(len(json.dumps(item)))
+            return item
+        if isinstance(item, Mapping):
+            try:
+                if len(item) > V1_JSON_MAX_COLLECTION_ITEMS:
+                    budget.fail("single collection limit exceeded")
+            except TypeError:
+                budget.fail("mapping has no bounded length")
+            budget.add_bytes(2)
+            copied: dict[str, JsonValue] = {}
+            count = 0
+            for key, nested in item.items():
+                count += 1
+                if count > V1_JSON_MAX_COLLECTION_ITEMS:
+                    budget.fail("single collection limit exceeded")
+                if not isinstance(key, str):
+                    budget.fail("object keys must be strings")
+                budget.add_node()
+                if count > 1:
+                    budget.add_bytes(1)
+                budget.add_bytes(encoded_string_size(key))
+                budget.add_bytes(1)
+                copied[key] = copy(nested, depth + 1)
+            return copied
+        if isinstance(item, (list, tuple)):
+            if len(item) > V1_JSON_MAX_COLLECTION_ITEMS:
+                budget.fail("single collection limit exceeded")
+            budget.add_bytes(2)
+            copied_list: list[JsonValue] = []
+            for index, nested in enumerate(item):
+                if index:
+                    budget.add_bytes(1)
+                copied_list.append(copy(nested, depth + 1))
+            return copied_list
+        budget.fail("value is not JSON-compatible")
+        raise AssertionError("unreachable")
+
+    return copy(value, 0)
+
+
+def _validate_text_budget(value: str, *, boundary: str) -> None:
+    if not isinstance(value, str):
+        raise _JsonBoundaryError(f"{boundary} JSON boundary rejected: text required")
+    if len(value) > V1_JSON_MAX_UTF8_BYTES:
+        raise _JsonBoundaryError(
+            f"{boundary} JSON boundary rejected: UTF-8 byte limit exceeded"
+        )
+    total = 0
+    try:
+        for offset in range(0, len(value), _TEXT_CHUNK_CHARACTERS):
+            chunk = value[offset : offset + _TEXT_CHUNK_CHARACTERS]
+            total += len(chunk.encode("utf-8"))
+            if total > V1_JSON_MAX_UTF8_BYTES:
+                raise _JsonBoundaryError(
+                    f"{boundary} JSON boundary rejected: UTF-8 byte limit exceeded"
+                )
+    except UnicodeError as error:
+        raise _JsonBoundaryError(
+            f"{boundary} JSON boundary rejected: text is not valid UTF-8"
+        ) from error
+
+
+def _streaming_text_sha256(value: str) -> str:
+    digest = hashlib.sha256()
+    for offset in range(0, len(value), _TEXT_CHUNK_CHARACTERS):
+        chunk = value[offset : offset + _TEXT_CHUNK_CHARACTERS]
+        digest.update(chunk.encode("utf-8", "replace"))
+    return digest.hexdigest()
 
 
 @dataclass(slots=True)
@@ -58,7 +199,12 @@ class _RecordedStageFailure(Exception):
 
 
 class AgentLoop:
-    """Drive one particle through a bounded, dependency-injected episode."""
+    """Drive one particle through a bounded, dependency-injected episode.
+
+    The v1 limits apply to in-band JSON transport and audit records. Scientific
+    artifact bytes remain out of band and are represented here only by
+    ``ArtifactRef`` metadata.
+    """
 
     def __init__(
         self,
@@ -124,7 +270,18 @@ class AgentLoop:
             self._started(run_id, particle_id, iteration_id, AgentStage.PENDING, 0, {"workspace": str(self._workspace)})
             owner.thread = await self._start_thread(particle_id)
             thread = owner.thread
-            self._persist_event(StageEvent(run_id=run_id, particle_id=particle_id, iteration_id=iteration_id, stage=AgentStage.PENDING, attempt=0, event_type="completed", payload={"thread": thread.to_json()}))
+            thread_json = self._copy_json(thread.to_json())
+            self._persist_event(
+                StageEvent(
+                    run_id=run_id,
+                    particle_id=particle_id,
+                    iteration_id=iteration_id,
+                    stage=AgentStage.PENDING,
+                    attempt=0,
+                    event_type="completed",
+                    payload=self._audit_payload({"thread": thread_json}),
+                )
+            )
             proposal: Mapping[str, JsonValue] = {}
             for stage in (AgentStage.HYPOTHESIZING, AgentStage.PROPOSING_ACTION):
                 current_stage = stage
@@ -143,11 +300,13 @@ class AgentLoop:
             current_stage = AgentStage.EXECUTING
             self._started(run_id, particle_id, iteration_id, current_stage, 0, {"proposal": proposal})
             tool_result, request, cached = await self._execute_tool(run_id, particle_id, iteration_id, proposal)
-            context["tool_request"] = request.to_json()
-            context["tool_result"] = tool_result.to_json()
+            request_json = self._copy_json(request.to_json())
+            tool_result_json = self._copy_json(tool_result.to_json())
+            context["tool_request"] = request_json
+            context["tool_result"] = tool_result_json
             tool_status = episode_status_for_tool(tool_result.status)
             if tool_status is not EpisodeStatus.COMPLETED:
-                self._terminal_event(run_id, particle_id, iteration_id, current_stage, tool_status.value.lower(), events, payload={"tool_request": request.to_json(), "tool_result": tool_result.to_json(), "cached": cached})
+                self._terminal_event(run_id, particle_id, iteration_id, current_stage, tool_status.value.lower(), events, payload={"tool_request": request_json, "tool_result": tool_result_json, "cached": cached})
                 return await self._finish_episode(owner,
                     run_id, particle_id, iteration_id, events, tool_status,
                     self._evaluation_for_tool(tool_result.status), evaluated, realized, adherence,
@@ -155,7 +314,8 @@ class AgentLoop:
             tool_context = ToolContext(run_id, particle_id, iteration_id, current_stage, 0, self._workspace)
             try:
                 candidate = self._adapter.candidate_from_tool_result(tool_result, tool_context)
-                context["candidate"] = candidate.to_json()
+                candidate_json = self._copy_json(candidate.to_json())
+                context["candidate"] = candidate_json
                 realized = self._adapter.realized_position(candidate)
                 evaluated = self._adapter.evaluated_position(self._copy_json(self._target), self._copy_json(realized))
                 adherence = self._adapter.position_adherence(self._copy_json(self._target), self._copy_json(realized))
@@ -163,27 +323,28 @@ class AgentLoop:
                 evaluated = self._copy_json(evaluated)
                 adherence = self._copy_json(adherence)
             except ValueError as error:
-                self._terminal_event(run_id, particle_id, iteration_id, current_stage, "invalid", events, payload={"tool_request": request.to_json(), "tool_result": tool_result.to_json(), "cached": cached, "type": type(error).__name__, "message": str(error)[:512]})
+                self._terminal_event(run_id, particle_id, iteration_id, current_stage, "invalid", events, payload={"tool_request": request_json, "tool_result": tool_result_json, "cached": cached, "type": type(error).__name__, "message": str(error)[:512]})
                 return await self._finish_episode(owner, run_id, particle_id, iteration_id, events, EpisodeStatus.INVALID, self._invalid_evaluation(), evaluated, realized, adherence)
             context["realized_position"] = realized
             context["evaluated_position"] = evaluated
             context["adherence"] = adherence
-            self._terminal_event(run_id, particle_id, iteration_id, current_stage, "completed", events, payload={"tool_request": request.to_json(), "tool_result": tool_result.to_json(), "cached": cached, "candidate": candidate.to_json(), "realized_position": realized, "evaluated_position": evaluated, "adherence": adherence})
+            self._terminal_event(run_id, particle_id, iteration_id, current_stage, "completed", events, payload={"tool_request": request_json, "tool_result": tool_result_json, "cached": cached, "candidate": candidate_json, "realized_position": realized, "evaluated_position": evaluated, "adherence": adherence})
 
             current_stage = AgentStage.EVALUATING
             evaluation_context = EvaluationContext(run_id, particle_id, iteration_id, self._workspace, self._protocol_hash)
-            self._started(run_id, particle_id, iteration_id, current_stage, 0, {"candidate": candidate.to_json(), "evaluation_context": evaluation_context.to_json()})
+            self._started(run_id, particle_id, iteration_id, current_stage, 0, {"candidate": candidate_json, "evaluation_context": evaluation_context.to_json()})
             async with self._resources.evaluation_slot():
                 evaluation = await self._evaluator.evaluate(
                     candidate,
                     evaluation_context,
                 )
-            context["evaluation"] = evaluation.model_dump(mode="json")
+            evaluation_json = self._copy_json(evaluation.model_dump(mode="json"))
+            context["evaluation"] = evaluation_json
             status = episode_status_for_evaluation(evaluation.status)
             if status is not EpisodeStatus.COMPLETED:
-                self._terminal_event(run_id, particle_id, iteration_id, current_stage, status.value.lower(), events, payload={"evaluation": evaluation.model_dump(mode="json")})
+                self._terminal_event(run_id, particle_id, iteration_id, current_stage, status.value.lower(), events, payload={"evaluation": evaluation_json})
                 return await self._finish_episode(owner, run_id, particle_id, iteration_id, events, status, evaluation, evaluated, realized, adherence)
-            self._terminal_event(run_id, particle_id, iteration_id, current_stage, "completed", events, payload={"evaluation": evaluation.model_dump(mode="json")})
+            self._terminal_event(run_id, particle_id, iteration_id, current_stage, "completed", events, payload={"evaluation": evaluation_json})
 
             current_stage = AgentStage.REFLECTING
             if await self._agent_stage(thread, current_stage, context, events) is None:
@@ -422,7 +583,27 @@ class AgentLoop:
         events: list[StageEvent],
     ) -> Mapping[str, JsonValue] | None:
         for attempt in range(3):
-            stage_context = self._copy_json(context)
+            try:
+                stage_context = self._copy_json(context)
+            except _JsonBoundaryError as error:
+                summarized_context = dict(self._audit_payload(context))
+                summarized_context.update(
+                    {
+                        "run_id": str(context["run_id"]),
+                        "particle_id": str(context["particle_id"]),
+                        "iteration_id": int(context["iteration_id"]),
+                    }
+                )
+                self._raise_recorded_build_failure(
+                    stage,
+                    attempt,
+                    summarized_context,
+                    events,
+                    error,
+                    EpisodeStatus.FAILED,
+                    EvaluationStatus.FAILED,
+                    "failed",
+                )
             context[_ACTIVE_STAGE_CONTEXT] = stage_context
             try:
                 request = self._adapter.build_stage_request(
@@ -460,7 +641,22 @@ class AgentLoop:
                 raise
             request_payload: Mapping[str, JsonValue]
             if isinstance(request, StageRequest):
-                request_payload = request.to_json()
+                try:
+                    copied_request = self._copy_json(request.to_json())
+                except _JsonBoundaryError as error:
+                    self._raise_recorded_build_failure(
+                        stage,
+                        attempt,
+                        stage_context,
+                        events,
+                        error,
+                        EpisodeStatus.FAILED,
+                        EvaluationStatus.FAILED,
+                        "failed",
+                    )
+                if not isinstance(copied_request, Mapping):
+                    raise AssertionError("StageRequest JSON must be an object")
+                request_payload = copied_request
             else:
                 request_payload = {"type": type(request).__name__[:128]}
             self._started(
@@ -479,9 +675,14 @@ class AgentLoop:
             async with self._resources.agent_slot():
                 response = await self._runtime.run_stage(thread, request)
             try:
+                _validate_text_budget(response.raw_text, boundary="agent response")
                 parsed = self._adapter.parse_stage_response(stage, response)
                 if not isinstance(parsed, Mapping):
                     raise ValueError("parsed response must be a mapping")
+                parsed = self._copy_json(parsed)
+                provider_metadata = self._copy_json(response.provider_metadata)
+                if not isinstance(provider_metadata, Mapping):
+                    raise ValueError("provider metadata must be a mapping")
             except Exception as error:
                 diagnostic = {
                     "attempt": attempt + 1,
@@ -489,9 +690,7 @@ class AgentLoop:
                     "message": str(error)[:512],
                     "request": request_payload,
                     "response_excerpt": response.raw_text[:1024],
-                    "response_sha256": hashlib.sha256(
-                        response.raw_text.encode()
-                    ).hexdigest(),
+                    "response_sha256": _streaming_text_sha256(response.raw_text),
                 }
                 context["correction"] = diagnostic
                 if attempt == 2:
@@ -501,9 +700,8 @@ class AgentLoop:
                 self._terminal_event(str(context["run_id"]), str(context["particle_id"]), int(context["iteration_id"]), stage, "failed", events, attempt, diagnostic)
                 self._clear_stage_boundary(context)
                 continue
-            parsed = self._copy_json(parsed)
             context.pop("correction", None)
-            self._terminal_event(str(context["run_id"]), str(context["particle_id"]), int(context["iteration_id"]), stage, "completed", events, attempt, {"request": request_payload, "output": parsed, "usage": response.usage.to_json(), "provider_metadata": dict(response.provider_metadata)})
+            self._terminal_event(str(context["run_id"]), str(context["particle_id"]), int(context["iteration_id"]), stage, "completed", events, attempt, {"request": request_payload, "output": parsed, "usage": response.usage.to_json(), "provider_metadata": provider_metadata})
             self._clear_stage_boundary(context)
             return parsed
         raise AssertionError("unreachable")
@@ -587,17 +785,25 @@ class AgentLoop:
         }
 
     async def _execute_tool(self, run_id: str, particle_id: str, iteration_id: int, proposal: Mapping[str, JsonValue]) -> tuple[ToolResult, ToolRequest, bool]:
+        bounded_proposal = self._copy_json(proposal)
+        if not isinstance(bounded_proposal, Mapping):
+            raise _JsonBoundaryError(
+                "tool proposal JSON boundary rejected: object required"
+            )
         key = self._identity("tool", run_id, particle_id, iteration_id, "EXECUTING")
         cached = self._store.get_committed_tool_result(key)
         if cached is not None:
+            self._copy_json(cached.to_json())
             return cached, ToolRequest(self._identity("request", run_id, particle_id, iteration_id, "cached"), "cache", "reuse", {}, key), True
-        provider = proposal.get("provider")
-        operation = proposal.get("operation")
-        payload = proposal.get("tool_payload")
+        provider = bounded_proposal.get("provider")
+        operation = bounded_proposal.get("operation")
+        payload = bounded_proposal.get("tool_payload")
         if not isinstance(provider, str) or not provider or not isinstance(operation, str) or not operation or not isinstance(payload, Mapping):
             return ToolResult(ToolStatus.REJECTED, error="invalid tool proposal"), ToolRequest(self._identity("request", run_id, particle_id, iteration_id, "invalid"), "task", "invalid", {}, key), False
         request = ToolRequest(self._identity("request", run_id, particle_id, iteration_id, provider, operation), provider, operation, payload, key)
+        self._copy_json(request.to_json())
         result = await self._tool.execute(request, ToolContext(run_id, particle_id, iteration_id, AgentStage.EXECUTING, 0, self._workspace))
+        self._copy_json(result.to_json())
         self._store.record_tool_result(key, result)
         return result, request, False
 
@@ -606,29 +812,40 @@ class AgentLoop:
 
     @staticmethod
     def _copy_json(value: JsonValue) -> JsonValue:
-        def copy(item: object) -> JsonValue:
-            if item is None or type(item) in (str, int, bool):
-                return item  # type: ignore[return-value]
-            if type(item) is float:
-                if not math.isfinite(item):
-                    raise ValueError("target_position must contain finite JSON")
-                return item
-            if isinstance(item, Mapping):
-                if not all(isinstance(key, str) for key in item):
-                    raise ValueError("target_position object keys must be strings")
-                return {key: copy(nested) for key, nested in item.items()}
-            if isinstance(item, (list, tuple)):
-                return [copy(nested) for nested in item]
-            raise ValueError("target_position must be JSON-compatible")
-        return copy(value)
+        return _bounded_json_copy(value, boundary="transport")
 
     def _started(self, run_id: str, particle_id: str, iteration_id: int, stage: AgentStage, attempt: int, payload: Mapping[str, JsonValue] | None = None) -> None:
-        self._persist_event(StageEvent(run_id=run_id, particle_id=particle_id, iteration_id=iteration_id, stage=stage, attempt=attempt, event_type="started", payload={} if payload is None else payload))
+        self._persist_event(StageEvent(run_id=run_id, particle_id=particle_id, iteration_id=iteration_id, stage=stage, attempt=attempt, event_type="started", payload=self._audit_payload({} if payload is None else payload)))
 
     def _terminal_event(self, run_id: str, particle_id: str, iteration_id: int, stage: AgentStage, event_type: str, events: list[StageEvent], attempt: int = 0, payload: Mapping[str, JsonValue] | None = None) -> None:
-        event = StageEvent(run_id=run_id, particle_id=particle_id, iteration_id=iteration_id, stage=stage, attempt=attempt, event_type=event_type, payload={} if payload is None else payload)
+        event = StageEvent(run_id=run_id, particle_id=particle_id, iteration_id=iteration_id, stage=stage, attempt=attempt, event_type=event_type, payload=self._audit_payload({} if payload is None else payload))
         self._persist_event(event)
         events.append(event)
+
+    def _audit_payload(self, payload: object) -> Mapping[str, JsonValue]:
+        try:
+            copied = _bounded_json_copy(payload, boundary="audit")
+        except _JsonBoundaryError as error:
+            summary: dict[str, JsonValue] = {
+                "truncated": True,
+                "reason": str(error)[:256],
+                "type": type(payload).__name__[:128],
+            }
+            if isinstance(payload, Mapping):
+                keys: list[str] = []
+                try:
+                    for key in payload:
+                        keys.append(str(key)[:128])
+                        if len(keys) == 32:
+                            break
+                except Exception:
+                    keys = []
+                if keys:
+                    summary["keys"] = keys
+            copied = _bounded_json_copy(summary, boundary="audit summary")
+        if not isinstance(copied, Mapping):
+            return {"value": copied}
+        return copied
 
     def _persist_event(self, event: StageEvent) -> None:
         try:

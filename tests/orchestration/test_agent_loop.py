@@ -1,14 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
 from multi_agent_pso.core import AgentStage, EpisodeStatus, EvaluationStatus
 from multi_agent_pso.orchestration import AgentLoop, AuditPersistenceError
+import multi_agent_pso.orchestration.agent_loop as agent_loop_module
 from multi_agent_pso.protocols import ToolStatus
 
 from .fakes import make_fake_dependencies
+
+
+JSON_BYTES = 256 * 1024
+
+
+def assert_audit_events_within_v1_budget(dependencies) -> None:
+    for event in dependencies["run_store"].append_attempts:
+        encoded = json.dumps(
+            event.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        assert len(encoded) <= JSON_BYTES
 
 
 @pytest.mark.asyncio
@@ -872,3 +887,182 @@ async def test_audit_base_exception_without_primary_propagates_original(
 
     assert raised.value is audit_error
     assert dependencies["runtime"].close_attempts == ["thread-p0"]
+
+
+def test_v1_json_boundary_constants_are_explicit() -> None:
+    assert agent_loop_module.V1_JSON_MAX_UTF8_BYTES == 256 * 1024
+    assert agent_loop_module.V1_JSON_MAX_DEPTH == 32
+    assert agent_loop_module.V1_JSON_MAX_NODES == 10_000
+    assert agent_loop_module.V1_JSON_MAX_COLLECTION_ITEMS == 4_096
+
+
+@pytest.mark.asyncio
+async def test_oversized_raw_response_skips_parser_and_finishes_invalid(tmp_path):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        raw_responses={
+            AgentStage.HYPOTHESIZING: "x" * (JSON_BYTES + 1),
+        },
+    )
+
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert episode.status is EpisodeStatus.INVALID
+    assert dependencies["runtime"].stages == [AgentStage.HYPOTHESIZING] * 3
+    assert dependencies["task_adapter"].parse_calls == 0
+    assert all(len(event.payload.get("response_excerpt", "")) <= 1024 for event in episode.events)
+    assert_audit_events_within_v1_budget(dependencies)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["parsed", "provider_metadata"])
+async def test_oversized_agent_json_boundary_uses_schema_correction(tmp_path, boundary):
+    huge = {"blob": "x" * JSON_BYTES}
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        parsed_output=huge if boundary == "parsed" else None,
+        provider_metadata=huge if boundary == "provider_metadata" else None,
+    )
+
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert episode.status is EpisodeStatus.INVALID
+    assert dependencies["runtime"].stages == [AgentStage.HYPOTHESIZING] * 3
+    assert dependencies["task_adapter"].parse_calls == 3
+    assert_audit_events_within_v1_budget(dependencies)
+
+
+@pytest.mark.parametrize("case", ["collection", "depth"])
+def test_json_boundary_rejects_large_collection_and_depth_without_recursion(
+    tmp_path, case
+):
+    if case == "collection":
+        target = [0] * 4_097
+    else:
+        target = "leaf"
+        for _ in range(33):
+            target = [target]
+    dependencies = make_fake_dependencies(tmp_path)
+    dependencies["target_position"] = target
+
+    with pytest.raises(ValueError, match="JSON boundary") as raised:
+        AgentLoop(**dependencies)
+
+    assert "RecursionError" not in type(raised.value).__name__
+    assert len(str(raised.value)) <= 256
+
+
+@pytest.mark.asyncio
+async def test_oversized_tool_result_is_bounded_failed_episode(tmp_path):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        tool_payload={"blob": "x" * JSON_BYTES},
+    )
+
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert episode.status is EpisodeStatus.FAILED
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+    executing = [
+        event.event_type
+        for event in dependencies["run_store"].events
+        if event.stage is AgentStage.EXECUTING and event.event_type != "started"
+    ]
+    assert executing == ["failed"]
+    assert_audit_events_within_v1_budget(dependencies)
+
+
+@pytest.mark.asyncio
+async def test_oversized_evaluation_is_bounded_failed_episode(tmp_path):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        evaluation_metrics={"blob": "x" * JSON_BYTES},
+    )
+
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert episode.status is EpisodeStatus.FAILED
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+    evaluating = [
+        event.event_type
+        for event in dependencies["run_store"].events
+        if event.stage is AgentStage.EVALUATING and event.event_type != "started"
+    ]
+    assert evaluating == ["failed"]
+    assert_audit_events_within_v1_budget(dependencies)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["candidate", "realized", "evaluated", "adherence"])
+async def test_oversized_candidate_position_boundary_is_bounded_invalid(
+    tmp_path, boundary
+):
+    huge = {"blob": "x" * JSON_BYTES}
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        candidate_metadata=huge if boundary == "candidate" else None,
+        realized_value=huge if boundary == "realized" else None,
+        evaluated_value=huge if boundary == "evaluated" else None,
+        adherence_value=huge if boundary == "adherence" else None,
+    )
+
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert episode.status is EpisodeStatus.INVALID
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+    executing = [
+        event.event_type
+        for event in dependencies["run_store"].events
+        if event.stage is AgentStage.EXECUTING and event.event_type != "started"
+    ]
+    assert executing == ["invalid"]
+    assert_audit_events_within_v1_budget(dependencies)
+
+
+def test_audit_payload_has_independent_last_resort_budget_guard(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path)
+    loop = AgentLoop(**dependencies)
+
+    loop._started(
+        "run-1",
+        "p0",
+        0,
+        AgentStage.PENDING,
+        0,
+        {"blob": "x" * JSON_BYTES},
+    )
+
+    payload = dependencies["run_store"].events[-1].payload
+    assert payload["truncated"] is True
+    assert "JSON boundary" in payload["reason"]
+    assert_audit_events_within_v1_budget(dependencies)
+
+
+@pytest.mark.asyncio
+async def test_reflection_context_total_budget_fails_with_bounded_pair(tmp_path):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        stage_outputs={
+            AgentStage.HYPOTHESIZING: {"hypothesis": "h" * (84 * 1024)},
+            AgentStage.PROPOSING_ACTION: {
+                "provider": "fake",
+                "operation": "execute",
+                "tool_payload": {"candidate": "x"},
+                "padding": "p" * (84 * 1024),
+            },
+        },
+    )
+    dependencies["target_position"] = {"blob": "t" * (90 * 1024)}
+
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert episode.status is EpisodeStatus.FAILED
+    assert AgentStage.REFLECTING not in dependencies["runtime"].stages
+    reflection = [
+        event.event_type
+        for event in dependencies["run_store"].events
+        if event.stage is AgentStage.REFLECTING
+    ]
+    assert reflection == ["started", "failed"]
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+    assert_audit_events_within_v1_budget(dependencies)
