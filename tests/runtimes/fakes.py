@@ -41,8 +41,16 @@ class FakeCodexClient:
         self.run_calls: list[tuple[object, ...]] = []
         self.threads: dict[str, FakeCodexThread] = {}
         self.next_id = 0
+        self.provider_ids: list[str] = []
         self.close_calls = 0
+        self.close_results: list[BaseException | None] = []
+        self.close_delay = 0.0
+        self.close_started = asyncio.Event()
         self.delay = 0.0
+        self.start_delay = 0.0
+        self.start_active = 0
+        self.max_start_active = 0
+        self.resume_error: BaseException | None = None
         self.active = 0
         self.max_active = 0
         self.active_by_thread: dict[str, int] = {}
@@ -52,16 +60,36 @@ class FakeCodexClient:
         )
 
     async def thread_start(self, *, model, cwd, sandbox):
-        self.started.append((model, cwd, sandbox))
-        provider_id = f"provider-{self.next_id}"
-        self.next_id += 1
-        thread = FakeCodexThread(provider_id, self)
-        self.threads[provider_id] = thread
-        return thread
+        self.start_active += 1
+        self.max_start_active = max(self.max_start_active, self.start_active)
+        try:
+            self.started.append((model, cwd, sandbox))
+            if self.start_delay:
+                await asyncio.sleep(self.start_delay)
+            provider_id = (
+                self.provider_ids.pop(0)
+                if self.provider_ids
+                else f"provider-{self.next_id}"
+            )
+            self.next_id += 1
+            thread = FakeCodexThread(provider_id, self)
+            self.threads[provider_id] = thread
+            return thread
+        finally:
+            self.start_active -= 1
 
     async def thread_resume(self, thread_id, *, model, cwd, sandbox):
         self.resumed.append((thread_id, model, cwd, sandbox))
+        if self.resume_error is not None:
+            raise self.resume_error
         return self.threads.setdefault(thread_id, FakeCodexThread(thread_id, self))
 
     async def close(self):
         self.close_calls += 1
+        self.close_started.set()
+        if self.close_delay:
+            await asyncio.sleep(self.close_delay)
+        if self.close_results:
+            result = self.close_results.pop(0)
+            if result is not None:
+                raise result

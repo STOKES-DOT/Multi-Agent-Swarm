@@ -41,6 +41,10 @@ class CodexTurnResult:
     duration_ms: int | float | None
 
 
+class ProviderThreadNotFoundError(RuntimeError):
+    """The provider no longer has a thread referenced by a checkpoint."""
+
+
 class CodexThreadPort(Protocol):
     id: str
 
@@ -159,13 +163,31 @@ class OpenAICodexClientAdapter:
         self, thread_id: str, *, model: str, cwd: Path, sandbox: str
     ):
         await self._ensure_open()
-        thread = await self._client.thread_resume(
-            thread_id,
-            model=model,
-            cwd=str(cwd),
-            sandbox=self._sandbox(sandbox),
-            approval_mode=self._sdk.ApprovalMode.deny_all,
-        )
+        try:
+            thread = await self._client.thread_resume(
+                thread_id,
+                model=model,
+                cwd=str(cwd),
+                sandbox=self._sandbox(sandbox),
+                approval_mode=self._sdk.ApprovalMode.deny_all,
+            )
+        except Exception as error:
+            message = str(error).lower()
+            not_found = "thread" in message and any(
+                phrase in message
+                for phrase in ("not found", "unknown", "does not exist")
+            )
+            expected_errors = tuple(
+                candidate
+                for candidate in (
+                    getattr(self._sdk, "CodexRpcError", None),
+                    getattr(self._sdk, "InvalidParamsError", None),
+                )
+                if isinstance(candidate, type)
+            )
+            if expected_errors and isinstance(error, expected_errors) and not_found:
+                raise ProviderThreadNotFoundError(str(error)) from error
+            raise
         return _SDKThreadAdapter(thread, self._sdk)
 
     def _sandbox(self, value: str):
@@ -178,10 +200,10 @@ class OpenAICodexClientAdapter:
         async with self._lock:
             if self._closed:
                 return
-            self._closed = True
             if self._open:
                 await self._client.__aexit__(None, None, None)
                 self._open = False
+            self._closed = True
 
 
 @dataclass
@@ -191,8 +213,20 @@ class _ThreadEntry:
     lock: asyncio.Lock
 
 
+@dataclass
+class _Reservation:
+    particle_id: str
+    workspace: Path
+    done: asyncio.Event
+
+
 class LocalCodexRuntime:
-    """Isolated, bounded local Codex threads with explicit ownership."""
+    """Isolated, bounded local Codex threads with explicit ownership.
+
+    An injected client is caller-owned by default.  Closing a caller-owned runtime
+    only forgets local mappings; remote provider-thread cleanup remains the
+    caller's responsibility.
+    """
 
     def __init__(
         self,
@@ -218,11 +252,16 @@ class LocalCodexRuntime:
         self._sdk_version = str(getattr(client, "sdk_version", "injected"))
         self._entries: dict[str, _ThreadEntry] = {}
         self._particle_threads: dict[str, str] = {}
+        self._workspace_threads: dict[Path, str] = {}
+        self._reservations: dict[str, _Reservation] = {}
+        self._reserved_workspaces: set[Path] = set()
         self._state_lock = asyncio.Lock()
+        self._closing = False
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
 
     async def __aenter__(self) -> "LocalCodexRuntime":
-        self._require_open()
+        self._require_available()
         return self
 
     async def __aexit__(self, exc_type, exc, traceback) -> bool:
@@ -232,46 +271,74 @@ class LocalCodexRuntime:
     async def start_thread(self, particle_id: str, workspace: Path) -> ThreadRef:
         particle = _require_text(particle_id, "particle_id")
         cwd = _workspace(workspace)
-        self._require_open()
-        async with self._state_lock:
-            self._require_open()
-            if particle in self._particle_threads:
-                raise ValueError("particle already has an active Codex thread")
+        reservation = await self._reserve(particle, cwd)
+        try:
             provider = await self._client.thread_start(
                 model=self._model, cwd=cwd, sandbox=self._sandbox
             )
             reference = self._reference(provider, particle, 0, cwd)
-            self._insert(reference, provider)
+            await self._commit_reservation(reservation, reference, provider)
             return reference
+        except BaseException:
+            await self._rollback_reservation(reservation)
+            raise
 
     async def restore_thread(
         self, particle_id: str, workspace: Path, checkpoint: Mapping[str, JsonValue]
     ) -> ThreadRef:
         particle = _require_text(particle_id, "particle_id")
         cwd = _workspace(workspace)
-        self._require_open()
-        reference = _checkpoint_reference(checkpoint)
+        self._require_available()
+        bootstrap = _canonical_checkpoint(checkpoint)
+        reference = _checkpoint_reference(json.loads(bootstrap))
         if reference.particle_id != particle or reference.workspace != cwd:
             raise ValueError("checkpoint thread identity does not match restore request")
         if reference.provider_id is None:
             raise ValueError("checkpoint thread has no provider_id")
-        async with self._state_lock:
-            self._require_open()
-            if particle in self._particle_threads:
-                raise ValueError("particle already has an active Codex thread")
-            provider = await self._client.thread_resume(
-                reference.provider_id,
-                model=self._model,
-                cwd=cwd,
-                sandbox=self._sandbox,
-            )
-            restored = self._reference(
-                provider, particle, reference.generation, cwd
-            )
-            if restored != reference:
-                raise ValueError("resumed SDK thread identity does not match checkpoint")
-            self._insert(restored, provider)
+        reservation = await self._reserve(particle, cwd)
+        try:
+            try:
+                provider = await self._client.thread_resume(
+                    reference.provider_id,
+                    model=self._model,
+                    cwd=cwd,
+                    sandbox=self._sandbox,
+                )
+            except ProviderThreadNotFoundError:
+                provider = await self._client.thread_start(
+                    model=self._model, cwd=cwd, sandbox=self._sandbox
+                )
+                restored = self._reference(
+                    provider, particle, reference.generation + 1, cwd
+                )
+                if (
+                    restored.provider_id == reference.provider_id
+                    or restored.logical_id == reference.logical_id
+                ):
+                    raise ValueError(
+                        "provider-loss recovery must create a distinct thread"
+                    )
+                self._response(
+                    await provider.run(
+                        bootstrap,
+                        cwd=cwd,
+                        output_schema=None,
+                        sandbox=self._sandbox,
+                    )
+                )
+            else:
+                restored = self._reference(
+                    provider, particle, reference.generation, cwd
+                )
+                if restored != reference:
+                    raise ValueError(
+                        "resumed SDK thread identity does not match checkpoint"
+                    )
+            await self._commit_reservation(reservation, restored, provider)
             return restored
+        except BaseException:
+            await self._rollback_reservation(reservation)
+            raise
 
     async def run_stage(
         self, thread: ThreadRef, request: StageRequest
@@ -280,7 +347,7 @@ class LocalCodexRuntime:
             raise TypeError("request must be a StageRequest")
         entry = await self._entry(thread)
         async with entry.lock:
-            self._require_open()
+            await self._revalidate_entry(entry, thread)
             schema = request.to_json()["response_schema"]
             result = await entry.provider_thread.run(
                 request.prompt,
@@ -296,7 +363,7 @@ class LocalCodexRuntime:
         entry = await self._entry(thread)
         bootstrap = _canonical_checkpoint(checkpoint)
         async with entry.lock:
-            self._require_open()
+            await self._revalidate_entry(entry, thread)
             provider = await self._client.thread_start(
                 model=self._model, cwd=thread.workspace, sandbox=self._sandbox
             )
@@ -313,44 +380,65 @@ class LocalCodexRuntime:
             )
             self._response(result)
             async with self._state_lock:
-                current = self._entries.get(thread.logical_id)
-                if current is not entry:
-                    raise ValueError("thread mapping changed during rotation")
-                self._entries.pop(thread.logical_id)
-                self._particle_threads[thread.particle_id] = rotated.logical_id
-                self._entries[rotated.logical_id] = _ThreadEntry(
-                    rotated, provider, asyncio.Lock()
-                )
+                self._require_available()
+                self._assert_current_locked(entry, thread)
+                self._insert_locked(rotated, provider, replacing=entry)
             return rotated
 
     async def close_thread(self, thread: ThreadRef) -> None:
         entry = await self._entry(thread)
         async with entry.lock:
             async with self._state_lock:
-                if self._entries.get(thread.logical_id) is not entry:
-                    raise ValueError("unknown Codex thread")
-                self._entries.pop(thread.logical_id)
-                self._particle_threads.pop(thread.particle_id, None)
+                self._require_available()
+                self._assert_current_locked(entry, thread)
+                self._remove_locked(entry)
 
     async def close(self) -> None:
         async with self._state_lock:
             if self._closed:
                 return
-            self._closed = True
-            entries = tuple(self._entries.values())
-            self._entries.clear()
-            self._particle_threads.clear()
-        for entry in entries:
-            async with entry.lock:
-                pass
-        if self._own_client:
-            await self._client.close()
+            task = self._close_task
+            if task is None or task.done():
+                self._closing = True
+                task = asyncio.create_task(self._close_impl())
+                self._close_task = task
+        await asyncio.shield(task)
+
+    async def _close_impl(self) -> None:
+        try:
+            async with self._state_lock:
+                reservation_events = tuple(
+                    reservation.done for reservation in self._reservations.values()
+                )
+            if reservation_events:
+                await asyncio.gather(*(event.wait() for event in reservation_events))
+            async with self._state_lock:
+                entries = tuple(self._entries.values())
+            for entry in entries:
+                async with entry.lock:
+                    pass
+            if self._own_client:
+                await self._client.close()
+            async with self._state_lock:
+                self._entries.clear()
+                self._particle_threads.clear()
+                self._workspace_threads.clear()
+                self._reservations.clear()
+                self._reserved_workspaces.clear()
+                self._closed = True
+                self._closing = False
+        except BaseException:
+            async with self._state_lock:
+                self._closing = False
+                self._close_task = None
+            raise
 
     async def _entry(self, thread: ThreadRef) -> _ThreadEntry:
         if not isinstance(thread, ThreadRef):
             raise TypeError("thread must be a ThreadRef")
-        self._require_open()
+        self._require_available()
         async with self._state_lock:
+            self._require_available()
             entry = self._entries.get(thread.logical_id)
             if entry is None:
                 raise ValueError("unknown Codex thread")
@@ -358,18 +446,108 @@ class LocalCodexRuntime:
                 raise ValueError("Codex thread identity mismatch")
             return entry
 
-    def _insert(self, reference: ThreadRef, provider: CodexThreadPort) -> None:
-        if reference.logical_id in self._entries:
+    async def _revalidate_entry(
+        self, entry: _ThreadEntry, reference: ThreadRef
+    ) -> None:
+        async with self._state_lock:
+            self._require_available()
+            self._assert_current_locked(entry, reference)
+
+    def _assert_current_locked(
+        self, entry: _ThreadEntry, reference: ThreadRef
+    ) -> None:
+        if self._entries.get(reference.logical_id) is not entry:
+            raise ValueError("stale or unknown Codex thread")
+        if entry.reference != reference:
+            raise ValueError("Codex thread identity mismatch")
+
+    async def _reserve(self, particle_id: str, workspace: Path) -> _Reservation:
+        async with self._state_lock:
+            self._require_available()
+            if (
+                particle_id in self._particle_threads
+                or particle_id in self._reservations
+            ):
+                raise ValueError(
+                    "particle already has an active or reserved Codex thread"
+                )
+            if (
+                workspace in self._workspace_threads
+                or workspace in self._reserved_workspaces
+            ):
+                raise ValueError(
+                    "workspace already has an active or reserved Codex thread"
+                )
+            reservation = _Reservation(particle_id, workspace, asyncio.Event())
+            self._reservations[particle_id] = reservation
+            self._reserved_workspaces.add(workspace)
+            return reservation
+
+    async def _rollback_reservation(self, reservation: _Reservation) -> None:
+        async with self._state_lock:
+            if self._reservations.get(reservation.particle_id) is reservation:
+                self._reservations.pop(reservation.particle_id)
+                self._reserved_workspaces.discard(reservation.workspace)
+            reservation.done.set()
+
+    async def _commit_reservation(
+        self,
+        reservation: _Reservation,
+        reference: ThreadRef,
+        provider: CodexThreadPort,
+    ) -> None:
+        async with self._state_lock:
+            if self._reservations.get(reservation.particle_id) is not reservation:
+                raise ValueError("Codex thread reservation is stale")
+            if self._closing or self._closed:
+                self._reservations.pop(reservation.particle_id)
+                self._reserved_workspaces.discard(reservation.workspace)
+                reservation.done.set()
+                raise RuntimeError("LocalCodexRuntime is closing or closed")
+            self._insert_locked(reference, provider)
+            self._reservations.pop(reservation.particle_id)
+            self._reserved_workspaces.discard(reservation.workspace)
+            reservation.done.set()
+
+    def _insert_locked(
+        self,
+        reference: ThreadRef,
+        provider: CodexThreadPort,
+        *,
+        replacing: _ThreadEntry | None = None,
+    ) -> None:
+        logical_entry = self._entries.get(reference.logical_id)
+        if logical_entry is not None and logical_entry is not replacing:
             raise ValueError("Codex logical thread collision")
         if any(
-            entry.reference.provider_id == reference.provider_id
+            entry is not replacing
+            and entry.reference.provider_id == reference.provider_id
             for entry in self._entries.values()
         ):
             raise ValueError("Codex provider thread collision")
+        if reference.particle_id in self._particle_threads:
+            current_logical = self._particle_threads[reference.particle_id]
+            if replacing is None or current_logical != replacing.reference.logical_id:
+                raise ValueError("particle already has an active Codex thread")
+        if reference.workspace in self._workspace_threads:
+            current_logical = self._workspace_threads[reference.workspace]
+            if replacing is None or current_logical != replacing.reference.logical_id:
+                raise ValueError("workspace already has an active Codex thread")
+        if replacing is not None:
+            self._remove_locked(replacing)
         self._entries[reference.logical_id] = _ThreadEntry(
             reference, provider, asyncio.Lock()
         )
         self._particle_threads[reference.particle_id] = reference.logical_id
+        self._workspace_threads[reference.workspace] = reference.logical_id
+
+    def _remove_locked(self, entry: _ThreadEntry) -> None:
+        reference = entry.reference
+        self._entries.pop(reference.logical_id, None)
+        if self._particle_threads.get(reference.particle_id) == reference.logical_id:
+            self._particle_threads.pop(reference.particle_id)
+        if self._workspace_threads.get(reference.workspace) == reference.logical_id:
+            self._workspace_threads.pop(reference.workspace)
 
     @staticmethod
     def _reference(
@@ -425,9 +603,11 @@ class LocalCodexRuntime:
             metadata["duration_ms"] = result.duration_ms
         return StageResponse(raw, usage, metadata)
 
-    def _require_open(self) -> None:
+    def _require_available(self) -> None:
         if self._closed:
             raise RuntimeError("LocalCodexRuntime is closed")
+        if self._closing:
+            raise RuntimeError("LocalCodexRuntime is closing")
 
 
 def _require_text(value: object, name: str) -> str:
@@ -439,9 +619,13 @@ def _require_text(value: object, name: str) -> str:
 def _workspace(value: object) -> Path:
     if not isinstance(value, Path) or not value.is_absolute():
         raise ValueError("workspace must be an absolute Path")
-    if not value.is_dir():
+    try:
+        resolved = value.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError("workspace must be an existing directory") from error
+    if not resolved.is_dir():
         raise ValueError("workspace must be an existing directory")
-    return value
+    return resolved
 
 
 def _token(value: object) -> int:
@@ -523,4 +707,5 @@ __all__ = [
     "LocalCodexRuntime",
     "LOCAL_CODEX_RUNTIME_VERSION",
     "OpenAICodexClientAdapter",
+    "ProviderThreadNotFoundError",
 ]

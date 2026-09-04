@@ -1731,7 +1731,17 @@ class AgentLoop:
         expected = self._hydrate_checkpoint_thread(
             checkpoint.thread_json, particle_id
         )
-        if thread != expected:
+        if thread == expected:
+            return
+        provider_replacement = (
+            thread.particle_id == expected.particle_id
+            and thread.workspace == expected.workspace
+            and thread.generation == expected.generation + 1
+            and thread.logical_id != expected.logical_id
+            and thread.provider_id is not None
+            and thread.provider_id != expected.provider_id
+        )
+        if not provider_replacement:
             raise IncompatibleCheckpointError(
                 "runtime restored a mismatched thread reference"
             )

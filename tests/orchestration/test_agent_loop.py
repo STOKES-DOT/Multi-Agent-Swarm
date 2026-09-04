@@ -1813,6 +1813,60 @@ async def test_resume_closes_mismatched_restored_thread_once_without_audit(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_resume_accepts_provider_loss_generation_plus_one_thread(tmp_path):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        interrupt_after_transition=(AgentStage.PROPOSING_ACTION, "completed"),
+    )
+    loop = AgentLoop(**dependencies)
+    with pytest.raises(KeyboardInterrupt):
+        await loop.run_particle("run-1", "p0", 0)
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json(
+            "run-1", "p0", 0
+        )
+    )
+    old = checkpoint.thread_json
+    assert old is not None
+    dependencies["runtime"].restore_thread_override = ThreadRef(
+        "replacement-logical",
+        "p0",
+        old["generation"] + 1,
+        dependencies["workspace"],
+        "replacement-provider",
+    )
+
+    episode = await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert episode.status is EpisodeStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_provider_loss_generation_jump(tmp_path):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        interrupt_after_transition=(AgentStage.PROPOSING_ACTION, "completed"),
+    )
+    loop = AgentLoop(**dependencies)
+    with pytest.raises(KeyboardInterrupt):
+        await loop.run_particle("run-1", "p0", 0)
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json(
+            "run-1", "p0", 0
+        )
+    )
+    dependencies["runtime"].restore_thread_override = ThreadRef(
+        "replacement-logical",
+        "p0",
+        checkpoint.thread_json["generation"] + 2,
+        dependencies["workspace"],
+        "replacement-provider",
+    )
+    with pytest.raises(IncompatibleCheckpointError, match="mismatched"):
+        await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("completed_stage", "context_key", "replacement"),
     [
