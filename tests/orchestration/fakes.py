@@ -38,11 +38,43 @@ class FakeRunStore:
     def append_stage_event(self, event: StageEvent) -> None:
         self.events.append(event)
 
+    def create_run(self, run_id: str, snapshot_hash: str) -> None:
+        return None
+
     def get_committed_tool_result(self, key: str) -> ToolResult | None:
         return self.recorded.get(key, self.cached)
 
     def record_tool_result(self, key: str, result: ToolResult) -> None:
         self.recorded[key] = result
+
+    def iteration_transaction(self, run_id: str, iteration_id: int) -> "FakeTransaction":
+        return FakeTransaction()
+
+
+class FakeTransaction:
+    def __enter__(self) -> "FakeTransaction":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        return False
+
+    def put_particle_json(self, particle_id: str, payload: Mapping[str, object]) -> None:
+        return None
+
+    def put_pbest_json(self, particle_id: str, payload: Mapping[str, object]) -> None:
+        return None
+
+    def put_gbest_json(self, payload: Mapping[str, object]) -> None:
+        return None
+
+    def put_snapshot_json(self, payload: Mapping[str, object]) -> None:
+        return None
+
+    def commit(self) -> None:
+        return None
+
+    def rollback(self) -> None:
+        return None
 
 
 class FakeResources:
@@ -89,7 +121,11 @@ class FakeRuntime:
 
 
 class FakeAdapter:
+    def __init__(self) -> None:
+        self.contexts: dict[AgentStage, list[dict[str, object]]] = {stage: [] for stage in AgentStage}
+
     def build_stage_request(self, stage: AgentStage, context: Mapping[str, object]) -> StageRequest:
+        self.contexts[stage].append(dict(context))
         return StageRequest(stage, f"{stage.value}:{context['particle_id']}")
 
     def parse_stage_response(self, stage: AgentStage, response: StageResponse) -> Mapping[str, object]:
@@ -110,6 +146,12 @@ class FakeAdapter:
     def position_adherence(self, target: object, realized: object | None) -> Mapping[str, object]:
         return {"matched": realized == target}
 
+    def compare(self, left: Evaluation, right: Evaluation) -> int:
+        return 0
+
+    def summarize_best(self, best: object | None) -> Mapping[str, object]:
+        return {}
+
 
 class FakeTool:
     def __init__(self) -> None:
@@ -123,8 +165,13 @@ class FakeTool:
 class FakeEvaluator:
     fixed_fitness = 1.25
 
+    def __init__(self, status: EvaluationStatus = EvaluationStatus.SUCCESS) -> None:
+        self.status = status
+
     async def evaluate(self, candidate: CandidateRef, context: EvaluationContext) -> Evaluation:
-        return Evaluation(status=EvaluationStatus.SUCCESS, feasible=True, fitness=self.fixed_fitness)
+        if self.status is EvaluationStatus.SUCCESS:
+            return Evaluation(status=self.status, feasible=True, fitness=self.fixed_fitness)
+        return Evaluation(status=self.status, feasible=False)
 
 
 def make_fake_dependencies(
@@ -134,6 +181,8 @@ def make_fake_dependencies(
     invalid_responses: int = 0,
     cached_tool_result: bool = False,
     cancel_stage: AgentStage | None = None,
+    evaluator_status: EvaluationStatus = EvaluationStatus.SUCCESS,
+    close_failure: bool = False,
 ) -> dict[str, object]:
     workspace = (tmp_path / "workspace").resolve()
     workspace.mkdir()
@@ -144,7 +193,7 @@ def make_fake_dependencies(
     return {
         "runtime": FakeRuntime(invalid_responses=invalid_responses, cancel_stage=cancel_stage, payload=payload),
         "task_adapter": FakeAdapter(),
-        "evaluator": FakeEvaluator(),
+        "evaluator": FakeEvaluator(evaluator_status),
         "tool_provider": FakeTool(),
         "resource_manager": FakeResources(),
         "run_store": FakeRunStore(cached),

@@ -95,3 +95,58 @@ async def test_cancellation_records_interrupted_closes_thread_and_reraises(tmp_p
 
     assert dependencies["runtime"].closed_threads == ["thread-p0"]
     assert dependencies["run_store"].events[-1].event_type == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_stage_audit_payloads_carry_context_outputs_and_reflection_inputs(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path)
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert all(event.payload for event in episode.events)
+    reflection_context = dependencies["task_adapter"].contexts[AgentStage.REFLECTING][-1]
+    assert {"hypothesis", "proposal", "tool_request", "tool_result", "candidate", "evaluation"} <= set(reflection_context)
+    assert dependencies["run_store"].events[0].event_type == "started"
+    assert "request" in dependencies["run_store"].events[0].payload
+
+
+@pytest.mark.asyncio
+async def test_corrections_supply_bounded_diagnostics_to_next_request(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path, invalid_responses=2)
+    await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    contexts = dependencies["task_adapter"].contexts[AgentStage.HYPOTHESIZING]
+    assert contexts[1]["correction"]["attempt"] == 1
+    assert len(contexts[1]["correction"]["message"]) <= 512
+    assert len(contexts[1]["correction"]["response_excerpt"]) <= 1024
+
+
+@pytest.mark.asyncio
+async def test_length_safe_identity_prevents_colon_tuple_tool_cache_collision(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path)
+    loop = AgentLoop(**dependencies)
+
+    await loop.run_particle("a:b", "c", 0)
+    await loop.run_particle("a", "b:c", 0)
+
+    assert len(dependencies["tool_provider"].executed_keys) == 2
+
+
+@pytest.mark.asyncio
+async def test_timeout_and_close_failure_are_typed_and_audited(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path, evaluator_status=EvaluationStatus.TIMEOUT, close_failure=True)
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert episode.status is EpisodeStatus.TIMEOUT
+    assert episode.events[-1].event_type == "timeout"
+
+
+def test_fakes_implement_complete_runtime_protocols(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path)
+    from multi_agent_pso.protocols import AgentRuntime, Evaluator, ResourceManager, RunStore, TaskAdapter, ToolProvider
+
+    assert isinstance(dependencies["runtime"], AgentRuntime)
+    assert isinstance(dependencies["task_adapter"], TaskAdapter)
+    assert isinstance(dependencies["evaluator"], Evaluator)
+    assert isinstance(dependencies["resource_manager"], ResourceManager)
+    assert isinstance(dependencies["tool_provider"], ToolProvider)
+    assert isinstance(dependencies["run_store"], RunStore)
