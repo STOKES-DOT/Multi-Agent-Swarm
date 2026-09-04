@@ -20,3 +20,23 @@ Further donor substitution may increase the red absorption wavelength.
 - Author interpretation: authorclaim attributes the shift to conjugation.
 - Cross‐paper synthesis: crossclaim remains preliminary across sources.
 - Open hypothesis: openclaim should be tested prospectively.
+
+## Period direct
+
+- Evidence layer: direct evidence.
+perioddirecttoken
+
+## Period author
+
+- Evidence layer: author interpretation.
+periodauthortoken
+
+## Period synthesis
+
+- Evidence layer: cross-paper synthesis.
+periodsynthesistoken
+
+## Period hypothesis
+
+- Evidence layer: open hypothesis.
+periodhypothesistoken

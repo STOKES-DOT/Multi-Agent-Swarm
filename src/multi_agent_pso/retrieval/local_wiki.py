@@ -556,7 +556,13 @@ def _canonical_evidence_label(value: str) -> str | None:
     normalized = _DASH_RE.sub("-", normalized)
     normalized = re.sub(r"\s*-\s*", "-", normalized)
     normalized = re.sub(r"\s+", " ", normalized)
-    return normalized if normalized in _EVIDENCE_LAYERS else None
+    if normalized in _EVIDENCE_LAYERS:
+        return normalized
+    if normalized[-1:] in {".", "。"}:
+        without_terminator = normalized[:-1]
+        if without_terminator in _EVIDENCE_LAYERS:
+            return without_terminator
+    return None
 
 
 def _normalized_words(value: str) -> str:

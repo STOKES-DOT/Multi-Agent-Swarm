@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import multi_agent_pso.retrieval.local_wiki as local_wiki_module
 from multi_agent_pso.protocols import WikiHit, WikiRetriever
 from multi_agent_pso.retrieval import LocalWikiRetriever, WikiQuery
 
@@ -448,6 +449,93 @@ def test_evidence_boundary_bullets_are_independent_typed_fragments() -> None:
         "openclaim": ("open hypothesis", 22, 22),
     }
     assert len({hit.content for hit in by_token.values()}) == 4
+
+
+def test_fixture_period_terminated_evidence_markers_are_typed() -> None:
+    hits = LocalWikiRetriever(FIXTURE_WIKI).search(
+        WikiQuery(
+            "perioddirecttoken periodauthortoken "
+            "periodsynthesistoken periodhypothesistoken",
+            10,
+        )
+    )
+    by_token = {
+        token: next(hit for hit in hits if token in hit.content)
+        for token in (
+            "perioddirecttoken",
+            "periodauthortoken",
+            "periodsynthesistoken",
+            "periodhypothesistoken",
+        )
+    }
+
+    assert {token: hit.evidence_layer for token, hit in by_token.items()} == {
+        "perioddirecttoken": "direct evidence",
+        "periodauthortoken": "author interpretation",
+        "periodsynthesistoken": "cross-paper synthesis",
+        "periodhypothesistoken": "open hypothesis",
+    }
+
+
+@pytest.mark.parametrize(
+    "layer",
+    [
+        "direct evidence",
+        "author interpretation",
+        "cross-paper synthesis",
+        "open hypothesis",
+    ],
+)
+@pytest.mark.parametrize("terminator", [".", "。"])
+def test_single_supported_evidence_terminator_is_accepted(
+    tmp_path: Path, layer: str, terminator: str
+) -> None:
+    assert local_wiki_module._canonical_evidence_label(layer + terminator) == layer
+    root = _wiki(
+        tmp_path,
+        {
+            "sources/label.md": (
+                "# Label check\n"
+                f"- Evidence layer: {layer}{terminator}\n"
+                "terminatedlabeltoken\n"
+            )
+        },
+    )
+
+    hit = LocalWikiRetriever(root).search(WikiQuery("terminatedlabeltoken", 1))[0]
+
+    assert hit.evidence_layer == layer
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "direct evidence because the source says so",
+        "direct evidence..",
+        "direct evidence。。",
+        "direct evidence!",
+        "direct evidence. extra prose",
+    ],
+)
+def test_evidence_terminator_does_not_allow_extra_syntax(
+    tmp_path: Path, declaration: str
+) -> None:
+    root = _wiki(
+        tmp_path,
+        {
+            "sources/label.md": (
+                "# Label check\n"
+                f"- Evidence layer: {declaration}\n"
+                "invalidterminatedlabeltoken\n"
+            )
+        },
+    )
+
+    hit = LocalWikiRetriever(root).search(
+        WikiQuery("invalidterminatedlabeltoken", 1)
+    )[0]
+
+    assert hit.evidence_layer == "open hypothesis"
 
 
 def test_backtick_fence_excludes_fake_metadata_headings_and_evidence(
