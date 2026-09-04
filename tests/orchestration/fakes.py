@@ -16,8 +16,10 @@ from typing import AsyncIterator
 from pydantic import JsonValue
 
 from multi_agent_pso.core import (
+    AgentEpisode,
     AgentStage,
     ArtifactRef,
+    ContinuousBoxPositionSpace,
     EpisodeCheckpoint,
     EpisodeStatus,
     Evaluation,
@@ -25,6 +27,8 @@ from multi_agent_pso.core import (
     StageEvent,
     StoredStageEvent,
 )
+from multi_agent_pso.core.topology import RingTopology
+from multi_agent_pso.core.update_rule import ConstrictedUpdateRule
 from multi_agent_pso.protocols import (
     AgentRuntime,
     CandidateRef,
@@ -148,6 +152,7 @@ class FakeRunStore:
         self._next_event_sequence = 1
         self._lock = threading.RLock()
         self._episode_claims: dict[tuple[str, str, int], threading.Lock] = {}
+        self.fail_iteration_commits: set[int] = set()
         self.audit_failure = audit_failure
         self.audit_failure_stage = audit_failure_stage
         self.audit_failure_event_type = audit_failure_event_type
@@ -155,6 +160,9 @@ class FakeRunStore:
         self.audit_failure_persistent = audit_failure_persistent
         self._matching_append_attempts = 0
         self.interrupt_after_transition = interrupt_after_transition
+        self.transition_interrupt_exception: BaseException = KeyboardInterrupt(
+            "interrupted after committed transition"
+        )
         self._transition_interrupted = False
 
     @contextmanager
@@ -313,7 +321,7 @@ class FakeRunStore:
                 and self.interrupt_after_transition == (event.stage, event.event_type)
             ):
                 self._transition_interrupted = True
-                raise KeyboardInterrupt("interrupted after committed transition")
+                raise self.transition_interrupt_exception
 
     def get_latest_stage_checkpoint_json(
         self, run_id: str, particle_id: str, iteration_id: int
@@ -576,6 +584,9 @@ class FakeTransaction:
         if self.snapshot is None:
             self.closed = True
             raise ValueError("iteration transaction requires a snapshot before commit")
+        if self.iteration_id in self.store.fail_iteration_commits:
+            self.closed = True
+            raise RuntimeError("injected iteration commit failure")
         raw_state = {
             "snapshot": self.snapshot,
             "particles": self.particles,
@@ -829,6 +840,18 @@ class FakeTool:
             raise self.exception
         return ToolResult(self.status, self.payload, self.artifacts, error="fake tool failure" if self.status is not ToolStatus.SUCCESS else None)
 
+    def executions_for(
+        self, run_id: str, particle_id: str, iteration_id: int, stage: str
+    ) -> int:
+        encoded = json.dumps(
+            ["tool", run_id, particle_id, iteration_id, stage],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        key = hashlib.sha256(encoded).hexdigest()
+        return self.executed_keys.count(key)
+
 
 class FakeArtifactStore:
     def __init__(self) -> None:
@@ -948,3 +971,149 @@ def make_fake_dependencies(
         "workspace": workspace,
         "protocol_snapshot_hash": hashlib.sha256(b"protocol").hexdigest(),
     }
+
+
+class FakeSwarmEpisodeLoop:
+    def __init__(
+        self,
+        target: object,
+        delays: Mapping[str, float],
+        calls: list[tuple[str, int]],
+        succeed: bool,
+    ) -> None:
+        self.target = copy.deepcopy(target)
+        self.delays = delays
+        self.calls = calls
+        self.succeed = succeed
+
+    async def run_particle(
+        self,
+        run_id: str,
+        particle_id: str,
+        iteration_id: int,
+        *,
+        resume: EpisodeCheckpoint | None = None,
+    ) -> AgentEpisode:
+        await asyncio.sleep(self.delays.get(particle_id, 0.0))
+        self.calls.append((particle_id, iteration_id))
+        position = copy.deepcopy(self.target)
+        fitness = -sum(float(value) ** 2 for value in position)
+        evaluation = (
+            Evaluation(
+                status=EvaluationStatus.SUCCESS,
+                feasible=True,
+                fitness=fitness,
+                metrics={"fitness": fitness},
+            )
+            if self.succeed
+            else Evaluation(status=EvaluationStatus.FAILED, feasible=False)
+        )
+        references = (
+            {
+                "candidate_reference": f"candidate-{particle_id}-{iteration_id}",
+                "candidate_hash": hashlib.sha256(
+                    f"{particle_id}:{iteration_id}".encode("utf-8")
+                ).hexdigest(),
+                "hypothesis_reference": f"hypothesis-{particle_id}-{iteration_id}",
+                "evaluation_reference": f"evaluation-{particle_id}-{iteration_id}",
+            }
+            if self.succeed
+            else {}
+        )
+        return AgentEpisode(
+            episode_id=f"episode-{particle_id}-{iteration_id}",
+            run_id=run_id,
+            particle_id=particle_id,
+            iteration_id=iteration_id,
+            target_position=position,
+            realized_position=position,
+            evaluated_position=position,
+            evaluation=evaluation,
+            status=(EpisodeStatus.COMPLETED if self.succeed else EpisodeStatus.FAILED),
+            **references,
+        )
+
+
+def make_fake_runner(
+    tmp_path: Path,
+    *,
+    delays: Mapping[str, float],
+    seed: int,
+    succeed: bool = True,
+):
+    from multi_agent_pso.orchestration.runner import SynchronousSwarmRunner
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    store = FakeRunStore()
+    calls: list[tuple[str, int]] = []
+    space = ContinuousBoxPositionSpace([-1.0], [1.0])
+    adapter = FakeAdapter()
+    runner = SynchronousSwarmRunner(
+        run_id="run-1",
+        run_seed=seed,
+        config_snapshot_hash=hashlib.sha256(b"runner-config").hexdigest(),
+        space=space,
+        adapter=adapter,
+        topology=RingTopology(1),
+        update_rule=ConstrictedUpdateRule(),
+        store=store,
+        episode_factory=lambda target: FakeSwarmEpisodeLoop(
+            target, delays, calls, succeed
+        ),
+        particle_ids=("p0", "p1"),
+        resource_budget={"evaluations": 2},
+        failure_threshold=2,
+    )
+    runner.episode_calls = calls
+    return runner
+
+
+def make_interruptible_runner(
+    tmp_path: Path, *, interrupt_after: AgentStage | None
+):
+    from multi_agent_pso.orchestration import AgentLoop
+    from multi_agent_pso.orchestration.runner import SynchronousSwarmRunner
+
+    options = (
+        {}
+        if interrupt_after is None
+        else {"interrupt_after_transition": (interrupt_after, "completed")}
+    )
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        realized_value=[0.25],
+        evaluated_value=[0.25],
+        adherence_value={"matched": True},
+        **options,
+    )
+    dependencies["run_store"].transition_interrupt_exception = asyncio.CancelledError(
+        "interrupted after committed transition"
+    )
+    target_independent = dict(dependencies)
+    target_independent.pop("target_position")
+
+    def episode_factory(target: JsonValue) -> AgentLoop:
+        return AgentLoop(**target_independent, target_position=target)
+
+    runner = SynchronousSwarmRunner(
+        run_id="run-1",
+        run_seed=5,
+        config_snapshot_hash=dependencies["protocol_snapshot_hash"],
+        space=ContinuousBoxPositionSpace([-1.0], [1.0]),
+        adapter=dependencies["task_adapter"],
+        topology=RingTopology(),
+        update_rule=ConstrictedUpdateRule(),
+        store=dependencies["run_store"],
+        episode_factory=episode_factory,
+        particle_ids=("p0",),
+        resource_budget={"evaluations": 1},
+        failure_threshold=2,
+    )
+    runner.external_call_counts = lambda: (
+        len(dependencies["runtime"].started_threads),
+        len(dependencies["runtime"].restored_threads),
+        len(dependencies["runtime"].close_attempts),
+        len(dependencies["tool_provider"].executed_keys),
+        dependencies["evaluator"].calls,
+    )
+    return runner, dependencies["tool_provider"]

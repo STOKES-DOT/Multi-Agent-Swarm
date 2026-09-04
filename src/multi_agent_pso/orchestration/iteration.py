@@ -218,7 +218,6 @@ def advance_snapshot(
             position = space.sample_position(resample_rng)
             velocity = space.zero_velocity()
             resample_after = _rng_state(resample_rng)
-            failures = 0
         elif generation_success:
             pbest = updated_bests[particle_id]
             sbest_id = sbest_ids[particle_id]
