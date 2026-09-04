@@ -231,6 +231,7 @@ class _ThreadOwner:
     close_attempted: bool = False
     finalization_started: bool = False
     finalization_terminal: bool = False
+    last_safe_checkpoint_context: dict[str, JsonValue] | None = None
 
 
 @dataclass(slots=True)
@@ -333,6 +334,7 @@ class AgentLoop:
                 payload={"thread": thread_json},
                 context=context,
                 thread=thread,
+                owner=owner,
                 next_stage=AgentStage.HYPOTHESIZING,
                 next_attempt=0,
                 include_in_episode=False,
@@ -340,7 +342,7 @@ class AgentLoop:
             proposal: Mapping[str, JsonValue] = {}
             for stage in (AgentStage.HYPOTHESIZING, AgentStage.PROPOSING_ACTION):
                 current_stage = stage
-                parsed = await self._agent_stage(thread, stage, context, events)
+                parsed = await self._agent_stage(owner, thread, stage, context, events)
                 if parsed is None:
                     return await self._finish_episode(owner,
                         run_id, particle_id, iteration_id, events, EpisodeStatus.INVALID,
@@ -365,7 +367,9 @@ class AgentLoop:
                     run_id, particle_id, iteration_id, current_stage,
                     tool_status.value.lower(), events, attempt=0,
                     payload={"tool_request": request_json, "tool_result": tool_result_json, "cached": cached},
-                    context=context, thread=thread, next_stage=None, next_attempt=0,
+                    context=context, thread=thread, owner=owner,
+                    next_stage=None, next_attempt=0,
+                    episode_status=tool_status,
                 )
                 return await self._finish_episode(owner,
                     run_id, particle_id, iteration_id, events, tool_status,
@@ -388,7 +392,9 @@ class AgentLoop:
                     run_id, particle_id, iteration_id, current_stage, "invalid", events,
                     attempt=0,
                     payload={"tool_request": request_json, "tool_result": tool_result_json, "cached": cached, **self._request_error(error)},
-                    context=context, thread=thread, next_stage=None, next_attempt=0,
+                    context=context, thread=thread, owner=owner,
+                    next_stage=None, next_attempt=0,
+                    episode_status=EpisodeStatus.INVALID,
                 )
                 return await self._finish_episode(owner, run_id, particle_id, iteration_id, events, EpisodeStatus.INVALID, self._invalid_evaluation(), evaluated, realized, adherence, context)
             context["realized_position"] = realized
@@ -398,7 +404,7 @@ class AgentLoop:
                 run_id, particle_id, iteration_id, current_stage, "completed", events,
                 attempt=0,
                 payload={"tool_request": request_json, "tool_result": tool_result_json, "cached": cached, "candidate": candidate_json, "realized_position": realized, "evaluated_position": evaluated, "adherence": adherence},
-                context=context, thread=thread,
+                context=context, thread=thread, owner=owner,
                 next_stage=AgentStage.EVALUATING, next_attempt=0,
             )
 
@@ -418,17 +424,19 @@ class AgentLoop:
                     run_id, particle_id, iteration_id, current_stage,
                     status.value.lower(), events, attempt=0,
                     payload={"evaluation": evaluation_json}, context=context,
-                    thread=thread, next_stage=None, next_attempt=0,
+                    thread=thread, owner=owner, next_stage=None, next_attempt=0,
+                    episode_status=status,
                 )
                 return await self._finish_episode(owner, run_id, particle_id, iteration_id, events, status, evaluation, evaluated, realized, adherence, context)
             self._terminal_event(
                 run_id, particle_id, iteration_id, current_stage, "completed", events,
                 attempt=0, payload={"evaluation": evaluation_json}, context=context,
-                thread=thread, next_stage=AgentStage.REFLECTING, next_attempt=0,
+                thread=thread, owner=owner,
+                next_stage=AgentStage.REFLECTING, next_attempt=0,
             )
 
             current_stage = AgentStage.REFLECTING
-            if await self._agent_stage(thread, current_stage, context, events) is None:
+            if await self._agent_stage(owner, thread, current_stage, context, events) is None:
                 return await self._finish_episode(owner, run_id, particle_id, iteration_id, events, EpisodeStatus.INVALID, evaluation, evaluated, realized, adherence, context)
             current_stage = AgentStage.COMPLETED
             return await self._finish_episode(
@@ -484,6 +492,7 @@ class AgentLoop:
                     payload=self._failure_payload(error, context),
                     context=checkpoint_context,
                     thread=owner.thread,
+                    owner=owner,
                     next_stage=current_stage,
                     next_attempt=attempt,
                 )
@@ -513,8 +522,10 @@ class AgentLoop:
                     payload=self._failure_payload(error, context),
                     context=checkpoint_context,
                     thread=owner.thread,
+                    owner=owner,
                     next_stage=None,
                     next_attempt=0,
+                    episode_status=EpisodeStatus.TIMEOUT,
                 )
             except BaseException as audit_error:
                 self._add_secondary(error, "timeout audit failed", audit_error)
@@ -549,8 +560,10 @@ class AgentLoop:
                     payload=self._failure_payload(error, context),
                     context=checkpoint_context,
                     thread=owner.thread,
+                    owner=owner,
                     next_stage=None,
                     next_attempt=0,
+                    episode_status=EpisodeStatus.FAILED,
                 )
             except BaseException as audit_error:
                 self._add_secondary(error, "failure audit failed", audit_error)
@@ -593,6 +606,11 @@ class AgentLoop:
         evaluation_reference: str | None = None,
     ) -> AgentEpisode:
         primary_status = status
+        final_context = (
+            owner.last_safe_checkpoint_context
+            if owner.last_safe_checkpoint_context is not None
+            else self._checkpoint_context(context)
+        )
         self._started(
             run_id,
             particle_id,
@@ -623,7 +641,8 @@ class AgentLoop:
                         "primary_status": primary_status.value,
                         **self._request_error(close_error),
                     },
-                    context,
+                    final_context,
+                    status,
                 )
             except BaseException as audit_error:
                 self._add_secondary(close_error, "interruption audit failed", audit_error)
@@ -651,7 +670,8 @@ class AgentLoop:
                 events,
                 terminal_type,
                 terminal_payload,
-                context,
+                final_context,
+                status,
             )
         except BaseException as audit_error:
             if close_error is not None:
@@ -684,6 +704,7 @@ class AgentLoop:
         event_type: str,
         payload: Mapping[str, JsonValue],
         context: Mapping[str, JsonValue],
+        episode_status: EpisodeStatus,
     ) -> None:
         next_stage = (
             AgentStage.COMPLETED if event_type == "interrupted" else None
@@ -699,8 +720,10 @@ class AgentLoop:
             payload=payload,
             context=context,
             thread=owner.thread,
+            owner=owner,
             next_stage=next_stage,
             next_attempt=0,
+            episode_status=episode_status,
         )
         owner.finalization_terminal = True
 
@@ -722,6 +745,7 @@ class AgentLoop:
 
     async def _agent_stage(
         self,
+        owner: _ThreadOwner,
         thread: ThreadRef,
         stage: AgentStage,
         context: dict[str, JsonValue],
@@ -750,6 +774,7 @@ class AgentLoop:
                     EvaluationStatus.FAILED,
                     "failed",
                     thread,
+                    owner,
                 )
             context[_ACTIVE_STAGE_CONTEXT] = stage_context
             context[_ACTIVE_STAGE_ATTEMPT] = attempt
@@ -773,6 +798,7 @@ class AgentLoop:
                     EvaluationStatus.TIMEOUT,
                     "timeout",
                     thread,
+                    owner,
                 )
             except Exception as error:
                 self._raise_recorded_build_failure(
@@ -785,6 +811,7 @@ class AgentLoop:
                     EvaluationStatus.FAILED,
                     "failed",
                     thread,
+                    owner,
                 )
             except (SystemExit, KeyboardInterrupt) as error:
                 self._record_cancelled_build(stage, attempt, stage_context, error)
@@ -804,6 +831,7 @@ class AgentLoop:
                         EvaluationStatus.FAILED,
                         "failed",
                         thread,
+                        owner,
                     )
                 if not isinstance(copied_request, Mapping):
                     raise AssertionError("StageRequest JSON must be an object")
@@ -834,6 +862,40 @@ class AgentLoop:
                 provider_metadata = self._copy_json(response.provider_metadata)
                 if not isinstance(provider_metadata, Mapping):
                     raise ValueError("provider metadata must be a mapping")
+                output_key = {
+                    AgentStage.HYPOTHESIZING: "hypothesis",
+                    AgentStage.PROPOSING_ACTION: "proposal",
+                    AgentStage.REFLECTING: "reflection",
+                }[stage]
+                next_stage = {
+                    AgentStage.HYPOTHESIZING: AgentStage.PROPOSING_ACTION,
+                    AgentStage.PROPOSING_ACTION: AgentStage.EXECUTING,
+                    AgentStage.REFLECTING: AgentStage.COMPLETED,
+                }[stage]
+                completed_context = self._checkpoint_context(context)
+                completed_context[output_key] = parsed
+                completed_payload: dict[str, JsonValue] = {
+                    "request": request_payload,
+                    "output": parsed,
+                    "usage": response.usage.to_json(),
+                    "provider_metadata": provider_metadata,
+                }
+                preview_event = self._stage_event(
+                    str(context["run_id"]),
+                    str(context["particle_id"]),
+                    int(context["iteration_id"]),
+                    stage,
+                    attempt,
+                    "completed",
+                    completed_payload,
+                )
+                self._checkpoint_for(
+                    preview_event,
+                    context=completed_context,
+                    thread=thread,
+                    next_stage=next_stage,
+                    next_attempt=0,
+                )
             except Exception as error:
                 diagnostic = {
                     "attempt": attempt + 1,
@@ -848,7 +910,9 @@ class AgentLoop:
                         str(context["run_id"]), str(context["particle_id"]),
                         int(context["iteration_id"]), stage, "invalid", events,
                         attempt=attempt, payload=diagnostic, context=context,
-                        thread=thread, next_stage=None, next_attempt=0,
+                        thread=thread, owner=owner,
+                        next_stage=None, next_attempt=0,
+                        episode_status=EpisodeStatus.INVALID,
                     )
                     self._clear_stage_boundary(context)
                     return None
@@ -856,31 +920,20 @@ class AgentLoop:
                     str(context["run_id"]), str(context["particle_id"]),
                     int(context["iteration_id"]), stage, "failed", events,
                     attempt=attempt, payload=diagnostic, context=context,
-                    thread=thread, next_stage=stage, next_attempt=attempt + 1,
+                    thread=thread, owner=owner,
+                    next_stage=stage, next_attempt=attempt + 1,
                 )
                 self._clear_stage_boundary(context)
                 continue
             context.pop("correction", None)
-            context[
-                {
-                    AgentStage.HYPOTHESIZING: "hypothesis",
-                    AgentStage.PROPOSING_ACTION: "proposal",
-                    AgentStage.REFLECTING: "reflection",
-                }[stage]
-            ] = parsed
+            context[output_key] = parsed
             self._terminal_event(
                 str(context["run_id"]), str(context["particle_id"]),
                 int(context["iteration_id"]), stage, "completed", events,
                 attempt=attempt,
-                payload={"request": request_payload, "output": parsed,
-                         "usage": response.usage.to_json(),
-                         "provider_metadata": provider_metadata},
-                context=context, thread=thread,
-                next_stage={
-                    AgentStage.HYPOTHESIZING: AgentStage.PROPOSING_ACTION,
-                    AgentStage.PROPOSING_ACTION: AgentStage.EXECUTING,
-                    AgentStage.REFLECTING: AgentStage.COMPLETED,
-                }[stage],
+                payload=completed_payload,
+                context=context, thread=thread, owner=owner,
+                next_stage=next_stage,
                 next_attempt=0,
             )
             self._clear_stage_boundary(context)
@@ -923,6 +976,7 @@ class AgentLoop:
         evaluation_status: EvaluationStatus,
         terminal_type: str,
         thread: ThreadRef,
+        owner: _ThreadOwner,
     ) -> None:
         diagnostic = self._request_error(error)
         started_payload: dict[str, JsonValue] = {
@@ -956,8 +1010,10 @@ class AgentLoop:
                 payload=terminal_payload,
                 context=stage_context,  # type: ignore[arg-type]
                 thread=thread,
+                owner=owner,
                 next_stage=None,
                 next_attempt=0,
+                episode_status=status,
             )
         except BaseException as audit_error:
             failure.audit_error = audit_error
@@ -1034,8 +1090,10 @@ class AgentLoop:
         payload: Mapping[str, JsonValue] | None,
         context: Mapping[str, JsonValue],
         thread: ThreadRef | None,
+        owner: _ThreadOwner,
         next_stage: AgentStage | None,
         next_attempt: int,
+        episode_status: EpisodeStatus | None = None,
         include_in_episode: bool = True,
     ) -> None:
         event = self._stage_event(
@@ -1053,11 +1111,17 @@ class AgentLoop:
             thread=thread,
             next_stage=next_stage,
             next_attempt=next_attempt,
+            episode_status=episode_status,
         )
         try:
             self._store.commit_stage_transition(event, checkpoint)
         except Exception as error:
             raise AuditPersistenceError(stage=stage.value, attempt=attempt, event_type=event_type) from error
+        checkpoint_json = checkpoint.model_dump(mode="json")
+        checkpoint_context = checkpoint_json["context"]
+        if not isinstance(checkpoint_context, dict):
+            raise AssertionError("checkpoint context must serialize as an object")
+        owner.last_safe_checkpoint_context = checkpoint_context
         if include_in_episode:
             events.append(event)
 
@@ -1091,8 +1155,18 @@ class AgentLoop:
         thread: ThreadRef | None,
         next_stage: AgentStage | None,
         next_attempt: int,
+        episode_status: EpisodeStatus | None = None,
     ) -> EpisodeCheckpoint:
-        return EpisodeCheckpoint(
+        checkpoint_context = self._checkpoint_context(context)
+        if episode_status is not None:
+            checkpoint_context["episode_status"] = episode_status.value
+        primary_status = event.payload.get("primary_status")
+        if isinstance(primary_status, str):
+            checkpoint_context["primary_status"] = primary_status
+        finalization = event.payload.get("finalization")
+        if isinstance(finalization, str):
+            checkpoint_context["finalization"] = finalization
+        checkpoint = EpisodeCheckpoint(
             run_id=event.run_id,
             particle_id=event.particle_id,
             iteration_id=event.iteration_id,
@@ -1102,10 +1176,55 @@ class AgentLoop:
             terminal_event_sequence=None,
             next_stage=next_stage,
             next_attempt=next_attempt,
-            context=self._checkpoint_context(context),
+            context=checkpoint_context,
             thread_json=None if thread is None else thread.to_json(),
             protocol_snapshot_hash=self._protocol_hash,
         )
+        try:
+            _bounded_json_copy(
+                checkpoint.model_dump(mode="json"), boundary="checkpoint"
+            )
+            return checkpoint
+        except _JsonBoundaryError:
+            if next_stage is not None:
+                raise
+        summary: dict[str, JsonValue] = {
+            "run_id": event.run_id,
+            "particle_id": event.particle_id,
+            "iteration_id": event.iteration_id,
+            "protocol_snapshot_hash": self._protocol_hash,
+            "checkpoint_truncated": True,
+            "terminal_stage": event.stage.value,
+            "terminal_attempt": event.attempt,
+            "terminal_event_type": event.event_type,
+        }
+        if episode_status is not None:
+            summary["episode_status"] = episode_status.value
+        if isinstance(primary_status, str):
+            summary["primary_status"] = primary_status
+        if isinstance(finalization, str):
+            summary["finalization"] = finalization
+        if thread is not None:
+            summary["thread_logical_id"] = thread.logical_id
+            summary["thread_generation"] = thread.generation
+        fallback = EpisodeCheckpoint(
+            run_id=event.run_id,
+            particle_id=event.particle_id,
+            iteration_id=event.iteration_id,
+            completed_stage=event.stage,
+            completed_attempt=event.attempt,
+            terminal_event_type=event.event_type,
+            terminal_event_sequence=None,
+            next_stage=None,
+            next_attempt=0,
+            context=summary,
+            thread_json=None,
+            protocol_snapshot_hash=self._protocol_hash,
+        )
+        _bounded_json_copy(
+            fallback.model_dump(mode="json"), boundary="checkpoint fallback"
+        )
+        return fallback
 
     def _audit_payload(self, payload: object) -> Mapping[str, JsonValue]:
         try:

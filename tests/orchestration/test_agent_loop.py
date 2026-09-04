@@ -22,6 +22,7 @@ import multi_agent_pso.orchestration.agent_loop as agent_loop_module
 from multi_agent_pso.protocols import (
     ArtifactIntegrityError,
     StageResponse,
+    ThreadRef,
     TokenUsage,
     ToolResult,
     ToolStatus,
@@ -53,6 +54,18 @@ def assert_audit_events_within_v1_budget(dependencies) -> None:
             separators=(",", ":"),
         ).encode("utf-8")
         assert len(encoded) <= JSON_BYTES
+
+
+def assert_checkpoints_within_v1_budget(dependencies) -> None:
+    for values in dependencies["run_store"].checkpoints.values():
+        for checkpoint in values:
+            encoded = json.dumps(
+                checkpoint,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            assert len(encoded) <= JSON_BYTES
 
 
 @pytest.mark.asyncio
@@ -395,6 +408,7 @@ async def test_success_checkpoints_capture_cumulative_context_thread_and_cursor(
     assert episode.evaluation_reference == AgentLoop._identity(
         "evaluation", "run-1", "p0", 0
     )
+    assert_checkpoints_within_v1_budget(dependencies)
 
 
 @pytest.mark.asyncio
@@ -492,15 +506,85 @@ async def test_terminal_stage_event_envelope_is_inside_json_budget(tmp_path):
         evaluation_metrics={"blob": "x" * (JSON_BYTES - 140)},
     )
 
-    await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
 
-    evaluating_terminal = next(
-        event
+    evaluating_terminals = [
+        event.event_type
         for event in dependencies["run_store"].events
-        if event.stage is AgentStage.EVALUATING and event.event_type == "completed"
+        if event.stage is AgentStage.EVALUATING and event.event_type != "started"
+    ]
+    assert episode.status is EpisodeStatus.FAILED
+    assert evaluating_terminals == ["failed"]
+    checkpoints = [
+        EpisodeCheckpoint.model_validate(value)
+        for value in dependencies["run_store"].checkpoints[("run-1", "p0", 0)]
+    ]
+    evaluating = next(
+        checkpoint
+        for checkpoint in checkpoints
+        if checkpoint.completed_stage is AgentStage.EVALUATING
     )
-    assert evaluating_terminal.payload["truncated"] is True
+    completed = checkpoints[-1]
+    assert evaluating.context["checkpoint_truncated"] is True
+    assert evaluating.context["episode_status"] == EpisodeStatus.FAILED.value
+    assert completed.context["episode_status"] == EpisodeStatus.FAILED.value
+    assert completed.context["primary_status"] == EpisodeStatus.FAILED.value
     assert_audit_events_within_v1_budget(dependencies)
+    assert_checkpoints_within_v1_budget(dependencies)
+
+
+@pytest.mark.asyncio
+async def test_tool_candidate_context_overflow_fails_before_executing_completed(tmp_path):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        tool_payload={"blob": "x" * (84 * 1024)},
+    )
+    dependencies["target_position"] = {"blob": "t" * (90 * 1024)}
+
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert episode.status is EpisodeStatus.FAILED
+    executing = [
+        event.event_type
+        for event in dependencies["run_store"].events
+        if event.stage is AgentStage.EXECUTING and event.event_type != "started"
+    ]
+    assert executing == ["failed"]
+    assert_checkpoints_within_v1_budget(dependencies)
+
+
+@pytest.mark.asyncio
+async def test_near_limit_thread_checkpoint_uses_terminal_identity_summary(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path)
+    resources = dependencies["resource_manager"]
+
+    async def near_limit_thread(particle_id, workspace):
+        assert resources.agent_active
+        return ThreadRef(
+            "thread-p0", particle_id, 0, workspace,
+            provider_id="x" * (JSON_BYTES - 400),
+        )
+
+    dependencies["runtime"].start_thread = near_limit_thread
+
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert episode.status is EpisodeStatus.FAILED
+    pending = [
+        event.event_type
+        for event in dependencies["run_store"].events
+        if event.stage is AgentStage.PENDING and event.event_type != "started"
+    ]
+    assert pending == ["failed"]
+    checkpoints = [
+        EpisodeCheckpoint.model_validate(value)
+        for value in dependencies["run_store"].checkpoints[("run-1", "p0", 0)]
+    ]
+    assert checkpoints[0].thread_json is None
+    assert checkpoints[0].context["checkpoint_truncated"] is True
+    assert checkpoints[0].context["episode_status"] == EpisodeStatus.FAILED.value
+    assert checkpoints[-1].context["primary_status"] == EpisodeStatus.FAILED.value
+    assert_checkpoints_within_v1_budget(dependencies)
 
 
 @pytest.mark.asyncio
@@ -1296,7 +1380,9 @@ def test_audit_payload_has_independent_last_resort_budget_guard(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_reflection_context_total_budget_fails_with_bounded_pair(tmp_path):
+async def test_agent_cumulative_context_overflow_uses_corrections_without_completed(
+    tmp_path,
+):
     dependencies = make_fake_dependencies(
         tmp_path,
         stage_outputs={
@@ -1313,16 +1399,51 @@ async def test_reflection_context_total_budget_fails_with_bounded_pair(tmp_path)
 
     episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
 
-    assert episode.status is EpisodeStatus.FAILED
-    assert AgentStage.REFLECTING not in dependencies["runtime"].stages
+    assert episode.status is EpisodeStatus.INVALID
+    assert AgentStage.EXECUTING not in dependencies["runtime"].stages
+    proposing = [
+        event.event_type
+        for event in dependencies["run_store"].events
+        if event.stage is AgentStage.PROPOSING_ACTION and event.event_type != "started"
+    ]
+    assert proposing == ["failed", "failed", "invalid"]
+    assert "completed" not in proposing
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+    assert_audit_events_within_v1_budget(dependencies)
+    assert_checkpoints_within_v1_budget(dependencies)
+
+
+@pytest.mark.asyncio
+async def test_reflection_output_overflow_keeps_reflection_and_final_checkpoints_small(
+    tmp_path,
+):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        stage_outputs={
+            AgentStage.HYPOTHESIZING: {"hypothesis": "h" * (84 * 1024)},
+            AgentStage.REFLECTING: {"reflection": "r" * (84 * 1024)},
+        },
+    )
+    dependencies["target_position"] = {"blob": "t" * (90 * 1024)}
+
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert episode.status is EpisodeStatus.INVALID
     reflection = [
         event.event_type
         for event in dependencies["run_store"].events
-        if event.stage is AgentStage.REFLECTING
+        if event.stage is AgentStage.REFLECTING and event.event_type != "started"
     ]
-    assert reflection == ["started", "failed"]
-    assert dependencies["runtime"].close_attempts == ["thread-p0"]
-    assert_audit_events_within_v1_budget(dependencies)
+    assert reflection == ["failed", "failed", "invalid"]
+    assert "completed" not in reflection
+    checkpoints = [
+        EpisodeCheckpoint.model_validate(value)
+        for value in dependencies["run_store"].checkpoints[("run-1", "p0", 0)]
+    ]
+    assert checkpoints[-1].completed_stage is AgentStage.COMPLETED
+    assert checkpoints[-1].context["episode_status"] == EpisodeStatus.INVALID.value
+    assert checkpoints[-1].context["primary_status"] == EpisodeStatus.INVALID.value
+    assert_checkpoints_within_v1_budget(dependencies)
 
 
 @pytest.mark.parametrize("case", ["surrogate_key", "len", "items", "iterator"])
