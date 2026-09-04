@@ -137,7 +137,8 @@ async def test_timeout_and_close_failure_are_typed_and_audited(tmp_path):
     episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
 
     assert episode.status is EpisodeStatus.TIMEOUT
-    assert episode.events[-1].event_type == "timeout"
+    assert any(event.event_type == "timeout" for event in episode.events)
+    assert episode.events[-1].event_type == "cleanup_failed"
 
 
 def test_fakes_implement_complete_runtime_protocols(tmp_path):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -46,17 +47,25 @@ class AgentLoop:
         workspace: Path,
         protocol_snapshot_hash: str,
     ) -> None:
+        if not isinstance(workspace, Path) or not workspace.is_absolute():
+            raise ValueError("workspace must be an absolute Path")
+        if not isinstance(protocol_snapshot_hash, str) or len(protocol_snapshot_hash) != 64 or any(character not in "0123456789abcdef" for character in protocol_snapshot_hash):
+            raise ValueError("protocol_snapshot_hash must be a lowercase SHA-256 digest")
         self._runtime = runtime
         self._adapter = task_adapter
         self._evaluator = evaluator
         self._tool = tool_provider
         self._resources = resource_manager
         self._store = run_store
-        self._target = target_position
+        self._target = self._copy_json(target_position)
         self._workspace = workspace
         self._protocol_hash = protocol_snapshot_hash
 
     async def run_particle(self, run_id: str, particle_id: str, iteration_id: int) -> AgentEpisode:
+        if not isinstance(run_id, str) or not run_id or not isinstance(particle_id, str) or not particle_id:
+            raise ValueError("run_id and particle_id must be nonempty strings")
+        if type(iteration_id) is not int or iteration_id < 0:
+            raise ValueError("iteration_id must be a nonnegative integer")
         events: list[StageEvent] = []
         thread: ThreadRef | None = None
         current_stage = AgentStage.HYPOTHESIZING
@@ -72,7 +81,7 @@ class AgentLoop:
                 current_stage = stage
                 parsed = await self._agent_stage(thread, stage, context, events)
                 if parsed is None:
-                    return self._terminal_episode(
+                    return await self._finish_episode(thread,
                         run_id, particle_id, iteration_id, events, EpisodeStatus.INVALID,
                         self._invalid_evaluation(), evaluated, realized, adherence,
                     )
@@ -90,7 +99,7 @@ class AgentLoop:
             tool_status = episode_status_for_tool(tool_result.status)
             if tool_status is not EpisodeStatus.COMPLETED:
                 self._terminal_event(run_id, particle_id, iteration_id, current_stage, tool_status.value.lower(), events)
-                return self._terminal_episode(
+                return await self._finish_episode(thread,
                     run_id, particle_id, iteration_id, events, tool_status,
                     self._evaluation_for_tool(tool_result.status), evaluated, realized, adherence,
                 )
@@ -117,25 +126,31 @@ class AgentLoop:
             status = episode_status_for_evaluation(evaluation.status)
             if status is not EpisodeStatus.COMPLETED:
                 self._terminal_event(run_id, particle_id, iteration_id, current_stage, status.value.lower(), events)
-                return self._terminal_episode(run_id, particle_id, iteration_id, events, status, evaluation, evaluated, realized, adherence)
+                return await self._finish_episode(thread, run_id, particle_id, iteration_id, events, status, evaluation, evaluated, realized, adherence)
             self._terminal_event(run_id, particle_id, iteration_id, current_stage, "completed", events, payload={"evaluation": evaluation.model_dump(mode="json")})
 
             current_stage = AgentStage.REFLECTING
             if await self._agent_stage(thread, current_stage, context, events) is None:
-                return self._terminal_episode(run_id, particle_id, iteration_id, events, EpisodeStatus.INVALID, evaluation, evaluated, realized, adherence)
+                return await self._finish_episode(thread, run_id, particle_id, iteration_id, events, EpisodeStatus.INVALID, evaluation, evaluated, realized, adherence)
             current_stage = AgentStage.COMPLETED
             self._started(run_id, particle_id, iteration_id, current_stage, 0, {"episode": "complete"})
             self._terminal_event(run_id, particle_id, iteration_id, current_stage, "completed", events, payload={"evaluation": evaluation.model_dump(mode="json")})
-            return self._terminal_episode(run_id, particle_id, iteration_id, events, EpisodeStatus.COMPLETED, evaluation, evaluated, realized, adherence)
+            return await self._finish_episode(thread, run_id, particle_id, iteration_id, events, EpisodeStatus.COMPLETED, evaluation, evaluated, realized, adherence)
         except asyncio.CancelledError as error:
             try:
                 self._terminal_event(run_id, particle_id, iteration_id, current_stage, "interrupted", events)
             except Exception as audit_error:
                 error.add_note(f"interruption audit failed: {type(audit_error).__name__}: {str(audit_error)[:512]}")
+            if thread is not None:
+                try:
+                    async with self._resources.agent_slot():
+                        await self._runtime.close_thread(thread)
+                except Exception as close_error:
+                    error.add_note(f"thread close failed: {type(close_error).__name__}: {str(close_error)[:512]}")
             raise
         except TimeoutError:
             self._terminal_event(run_id, particle_id, iteration_id, current_stage, "timeout", events)
-            return self._terminal_episode(
+            return await self._finish_episode(thread,
                 run_id,
                 particle_id,
                 iteration_id,
@@ -148,28 +163,22 @@ class AgentLoop:
             )
         except Exception:
             self._terminal_event(run_id, particle_id, iteration_id, current_stage, "failed", events)
-            return self._terminal_episode(run_id, particle_id, iteration_id, events, EpisodeStatus.FAILED, self._failed_evaluation(), evaluated, realized, adherence)
-        finally:
-            if thread is not None:
-                try:
-                    async with self._resources.agent_slot():
-                        await self._runtime.close_thread(thread)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as error:
-                    self._terminal_event(
-                        run_id,
-                        particle_id,
-                        iteration_id,
-                        current_stage,
-                        "cleanup_failed",
-                        events,
-                        payload={"type": type(error).__name__, "message": str(error)[:512]},
-                    )
+            return await self._finish_episode(thread, run_id, particle_id, iteration_id, events, EpisodeStatus.FAILED, self._failed_evaluation(), evaluated, realized, adherence)
 
     async def _start_thread(self, particle_id: str) -> ThreadRef:
         async with self._resources.agent_slot():
             return await self._runtime.start_thread(particle_id, self._workspace)
+
+    async def _finish_episode(self, thread: ThreadRef | None, run_id: str, particle_id: str, iteration_id: int, events: list[StageEvent], status: EpisodeStatus, evaluation: Evaluation | None, evaluated: JsonValue, realized: JsonValue | None, adherence: Mapping[str, JsonValue]) -> AgentEpisode:
+        if thread is not None:
+            try:
+                async with self._resources.agent_slot():
+                    await self._runtime.close_thread(thread)
+            except Exception as error:
+                self._terminal_event(run_id, particle_id, iteration_id, events[-1].stage if events else AgentStage.PENDING, "cleanup_failed", events, payload={"type": type(error).__name__, "message": str(error)[:512]})
+                if status is EpisodeStatus.COMPLETED:
+                    status = EpisodeStatus.FAILED
+        return self._terminal_episode(run_id, particle_id, iteration_id, events, status, evaluation, evaluated, realized, adherence)
 
     async def _agent_stage(
         self,
@@ -215,6 +224,24 @@ class AgentLoop:
 
     def _context(self, run_id: str, particle_id: str, iteration_id: int) -> Mapping[str, JsonValue]:
         return {"run_id": run_id, "particle_id": particle_id, "iteration_id": iteration_id, "target_position": self._target, "protocol_snapshot_hash": self._protocol_hash}
+
+    @staticmethod
+    def _copy_json(value: JsonValue) -> JsonValue:
+        def copy(item: object) -> JsonValue:
+            if item is None or type(item) in (str, int, bool):
+                return item  # type: ignore[return-value]
+            if type(item) is float:
+                if not math.isfinite(item):
+                    raise ValueError("target_position must contain finite JSON")
+                return item
+            if isinstance(item, Mapping):
+                if not all(isinstance(key, str) for key in item):
+                    raise ValueError("target_position object keys must be strings")
+                return {key: copy(nested) for key, nested in item.items()}
+            if isinstance(item, (list, tuple)):
+                return [copy(nested) for nested in item]
+            raise ValueError("target_position must be JSON-compatible")
+        return copy(value)
 
     def _started(self, run_id: str, particle_id: str, iteration_id: int, stage: AgentStage, attempt: int, payload: Mapping[str, JsonValue] | None = None) -> None:
         self._store.append_stage_event(StageEvent(run_id=run_id, particle_id=particle_id, iteration_id=iteration_id, stage=stage, attempt=attempt, event_type="started", payload={} if payload is None else payload))
