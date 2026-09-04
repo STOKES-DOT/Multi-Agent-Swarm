@@ -150,6 +150,7 @@ def _expected_schema_fingerprint() -> dict[str, str]:
 
 _EXPECTED_SCHEMA_FINGERPRINT = _expected_schema_fingerprint()
 _WAL_LOCK_TIMEOUT_SECONDS = 5.0
+_WAL_MAX_ATTEMPTS = 64
 
 
 class SQLiteRunStore:
@@ -191,17 +192,21 @@ class SQLiteRunStore:
     def _ensure_wal_mode(self, connection: sqlite3.Connection) -> None:
         deadline = time.monotonic() + _WAL_LOCK_TIMEOUT_SECONDS
         delay = 0.01
-        while True:
+        for attempt in range(_WAL_MAX_ATTEMPTS):
             mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
             if str(mode).lower() == "wal":
                 return
             try:
-                connection.execute("PRAGMA journal_mode=WAL")
+                switched_mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                if str(switched_mode).lower() == "wal":
+                    return
             except sqlite3.OperationalError as error:
-                if "locked" not in str(error).lower() or time.monotonic() >= deadline:
+                if "locked" not in str(error).lower():
                     raise
-                time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
-                delay = min(delay * 2, 0.1)
+            if attempt + 1 == _WAL_MAX_ATTEMPTS or time.monotonic() >= deadline:
+                raise sqlite3.OperationalError("timed out switching SQLite journal mode to WAL")
+            time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+            delay = min(delay * 2, 0.1)
 
     @staticmethod
     def _table_names(connection: sqlite3.Connection) -> set[str]:

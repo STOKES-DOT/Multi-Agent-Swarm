@@ -252,6 +252,40 @@ def test_wal_mode_retries_locked_switch_and_rechecks_current_mode(
     assert connection.switch_attempts == 1
 
 
+def test_wal_mode_fails_after_bounded_nontransition_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Cursor:
+        def fetchone(self) -> tuple[str]:
+            return ("delete",)
+
+    class Connection:
+        def __init__(self) -> None:
+            self.switch_attempts = 0
+
+        def execute(self, statement: str) -> Cursor:
+            if statement == "PRAGMA journal_mode":
+                return Cursor()
+            assert statement == "PRAGMA journal_mode=WAL"
+            self.switch_attempts += 1
+            if self.switch_attempts > 3:
+                raise AssertionError("unbounded WAL retry")
+            return Cursor()
+
+    store = SQLiteRunStore(tmp_path / "runs.sqlite")
+    connection = Connection()
+    sleeps: list[float] = []
+    monkeypatch.setattr(sqlite_store_module, "_WAL_MAX_ATTEMPTS", 3, raising=False)
+    monkeypatch.setattr(sqlite_store_module.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(sqlite_store_module.time, "sleep", sleeps.append)
+
+    with pytest.raises(sqlite3.OperationalError, match="WAL"):
+        store._ensure_wal_mode(connection)  # type: ignore[arg-type]
+
+    assert connection.switch_attempts == 3
+    assert sleeps == [0.01, 0.02]
+
+
 def test_bootstrap_retries_after_ddl_failure_leaves_empty_sqlite_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
