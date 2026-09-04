@@ -350,6 +350,9 @@ class UpdateTrace(_FrozenModel):
     social_rng_state_before: JsonValue
     social_rng_state_after: JsonValue
     resampled: bool = False
+    resample_seed: int | None = Field(default=None, ge=0, strict=True)
+    resample_rng_state_before: JsonValue | None = None
+    resample_rng_state_after: JsonValue | None = None
     projected_dimensions: tuple[int, ...] = ()
 
     @field_validator(
@@ -357,6 +360,8 @@ class UpdateTrace(_FrozenModel):
         "cognitive_rng_state_after",
         "social_rng_state_before",
         "social_rng_state_after",
+        "resample_rng_state_before",
+        "resample_rng_state_after",
         mode="before",
     )
     @classmethod
@@ -368,6 +373,8 @@ class UpdateTrace(_FrozenModel):
         "cognitive_rng_state_after",
         "social_rng_state_before",
         "social_rng_state_after",
+        "resample_rng_state_before",
+        "resample_rng_state_after",
     )
     @classmethod
     def validate_rng_states(cls, value: JsonValue) -> JsonValue:
@@ -378,9 +385,24 @@ class UpdateTrace(_FrozenModel):
         "cognitive_rng_state_after",
         "social_rng_state_before",
         "social_rng_state_after",
+        "resample_rng_state_before",
+        "resample_rng_state_after",
     )
     def serialize_rng_states(self, value: JsonValue) -> JsonValue:
         return _thaw_json(value)  # type: ignore[return-value]
+
+    @model_validator(mode="after")
+    def validate_resample_evidence(self) -> "UpdateTrace":
+        evidence = (
+            self.resample_seed,
+            self.resample_rng_state_before,
+            self.resample_rng_state_after,
+        )
+        if self.resampled != all(value is not None for value in evidence):
+            raise ValueError("resample evidence must be complete exactly when resampled")
+        if not self.resampled and any(value is not None for value in evidence):
+            raise ValueError("non-resampled traces must not contain resample evidence")
+        return self
 
     @field_validator("projected_dimensions")
     @classmethod

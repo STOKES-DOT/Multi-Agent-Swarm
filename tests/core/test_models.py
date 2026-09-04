@@ -654,6 +654,44 @@ def test_update_trace_and_snapshot_invariants_are_frozen() -> None:
         snapshot.resource_budget["agent_slots"] = 3
 
 
+def test_update_trace_requires_complete_resample_rng_evidence() -> None:
+    common = {
+        "particle_id": "p0",
+        "sbest_particle_id": None,
+        "cognitive_seed": 1,
+        "social_seed": 2,
+        "cognitive_rng_state_before": {},
+        "cognitive_rng_state_after": {},
+        "social_rng_state_before": {},
+        "social_rng_state_after": {},
+    }
+    trace = core_models.UpdateTrace(
+        **common,
+        resampled=True,
+        resample_seed=3,
+        resample_rng_state_before={"state": [1]},
+        resample_rng_state_after={"state": [2]},
+    )
+    dumped = trace.model_dump(mode="json")
+    assert dumped["resample_seed"] == 3
+    with pytest.raises((TypeError, AttributeError)):
+        trace.resample_rng_state_before["state"] = []  # type: ignore[index]
+    for updates in (
+        {"resample_seed": None},
+        {"resample_rng_state_before": None},
+        {"resample_rng_state_after": None},
+        {"resampled": False},
+    ):
+        with pytest.raises(ValidationError):
+            trace.model_copy(update=updates).model_validate(
+                trace.model_copy(update=updates).model_dump(mode="json")
+            )
+    non_resampled = core_models.UpdateTrace(**common)
+    assert non_resampled.resample_seed is None
+    with pytest.raises(ValidationError):
+        core_models.UpdateTrace(**common, resample_seed=3)
+
+
 @pytest.mark.parametrize(
     "mutation",
     ["version", "order", "duplicate", "map_keys", "trace_keys", "sbest", "gbest"],

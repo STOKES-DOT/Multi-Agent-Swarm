@@ -180,6 +180,10 @@ def test_model_bounds_are_checked(factory: object, expected: str) -> None:
         factory()  # type: ignore[operator]
 
 
+def test_retry_config_resamples_after_two_failures_by_default() -> None:
+    assert RetryConfig().consecutive_failures_before_resample == 2
+
+
 @pytest.mark.parametrize("value", [False, 1, 1.0])
 def test_wiki_read_only_requires_the_strict_boolean_true(value: object) -> None:
     with pytest.raises(ValidationError, match="read_only"):
