@@ -4,6 +4,10 @@ from multi_agent_pso.core import EpisodeStatus, EvaluationStatus
 from multi_agent_pso.protocols import ToolStatus
 
 
+class IncompatibleCheckpointError(RuntimeError):
+    """A persisted checkpoint cannot safely resume the requested episode."""
+
+
 class AuditPersistenceError(RuntimeError):
     """A stage audit event could not be durably appended."""
 

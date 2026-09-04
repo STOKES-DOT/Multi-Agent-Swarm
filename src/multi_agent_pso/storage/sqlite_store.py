@@ -435,10 +435,22 @@ class SQLiteRunStore:
                     event.attempt,
                 ),
             ).fetchall()
-            if existing_rows:
-                if len(existing_rows) != 1:
-                    raise ValueError("stage transition conflict: multiple terminal events")
-                existing_row = existing_rows[0]
+            interrupted_rows = [
+                row for row in existing_rows if row["event_type"] == "interrupted"
+            ]
+            resolution_rows = [
+                row for row in existing_rows if row["event_type"] != "interrupted"
+            ]
+            if len(interrupted_rows) > 1 or len(resolution_rows) > 1:
+                raise ValueError("stage transition conflict: multiple terminal events")
+            is_interrupted = event.event_type == "interrupted"
+            if is_interrupted and resolution_rows:
+                raise ValueError(
+                    "stage transition conflict: interrupted follows resolution"
+                )
+            matching_rows = interrupted_rows if is_interrupted else resolution_rows
+            if matching_rows:
+                existing_row = matching_rows[0]
                 existing_event = self._stage_event_from_row(existing_row)
                 if _canonical_json(existing_event.model_dump(mode="json")) != canonical_event:
                     raise ValueError("stage transition conflict: terminal event differs")
@@ -544,9 +556,10 @@ class SQLiteRunStore:
                 ):
                     raise ValueError("checkpoint terminal event does not match")
                 terminal_rows = connection.execute(
-                    """SELECT event_id FROM stage_events
+                    """SELECT event_id, event_type FROM stage_events
                     WHERE run_id = ? AND particle_id = ? AND iteration_id = ?
-                    AND stage = ? AND attempt = ? AND event_type <> 'started'""",
+                    AND stage = ? AND attempt = ? AND event_type <> 'started'
+                    ORDER BY event_id ASC""",
                     (
                         checkpoint.run_id,
                         checkpoint.particle_id,
@@ -555,11 +568,138 @@ class SQLiteRunStore:
                         checkpoint.completed_attempt,
                     ),
                 ).fetchall()
-                if (
-                    len(terminal_rows) != 1
-                    or terminal_rows[0]["event_id"] != sequence
+                interrupted_rows = [
+                    terminal
+                    for terminal in terminal_rows
+                    if terminal["event_type"] == "interrupted"
+                ]
+                resolution_rows = [
+                    terminal
+                    for terminal in terminal_rows
+                    if terminal["event_type"] != "interrupted"
+                ]
+                if len(interrupted_rows) > 1 or len(resolution_rows) > 1:
+                    raise ValueError(
+                        "checkpoint stage attempt has duplicate terminal events"
+                    )
+                if event.event_type == "interrupted":
+                    if (
+                        len(interrupted_rows) != 1
+                        or interrupted_rows[0]["event_id"] != sequence
+                        or resolution_rows
+                    ):
+                        raise ValueError(
+                            "interrupted checkpoint is not the unresolved cursor"
+                        )
+                elif (
+                    len(resolution_rows) != 1
+                    or resolution_rows[0]["event_id"] != sequence
+                    or (
+                        interrupted_rows
+                        and interrupted_rows[0]["event_id"] >= sequence
+                    )
                 ):
-                    raise ValueError("checkpoint stage attempt does not have one terminal event")
+                    raise ValueError(
+                        "resolution checkpoint has invalid terminal ordering"
+                    )
+                checkpoint_rows = connection.execute(
+                    """SELECT payload_json FROM thread_checkpoints
+                    WHERE run_id = ? AND particle_id = ? AND iteration_id = ?""",
+                    (
+                        checkpoint.run_id,
+                        checkpoint.particle_id,
+                        checkpoint.iteration_id,
+                    ),
+                ).fetchall()
+                checkpoint_sequences: list[int] = []
+                checkpoint_records: list[EpisodeCheckpoint] = []
+                for checkpoint_row in checkpoint_rows:
+                    candidate = EpisodeCheckpoint.model_validate(
+                        json.loads(checkpoint_row["payload_json"])
+                    )
+                    if (
+                        candidate.run_id,
+                        candidate.particle_id,
+                        candidate.iteration_id,
+                    ) != (
+                        checkpoint.run_id,
+                        checkpoint.particle_id,
+                        checkpoint.iteration_id,
+                    ):
+                        raise ValueError("stored checkpoint identity is incompatible")
+                    candidate_sequence = candidate.terminal_event_sequence
+                    if candidate_sequence is None:
+                        raise ValueError("stored checkpoint has no event sequence")
+                    checkpoint_sequences.append(candidate_sequence)
+                    checkpoint_records.append(candidate)
+                if any(
+                    checkpoint_sequences.count(terminal["event_id"]) != 1
+                    for terminal in terminal_rows
+                ):
+                    raise ValueError(
+                        "checkpoint stage attempt terminal is missing its checkpoint"
+                    )
+                all_terminal_rows = connection.execute(
+                    """SELECT event_id, run_id, particle_id, iteration_id, stage,
+                    attempt, event_type, payload_json FROM stage_events
+                    WHERE run_id = ? AND particle_id = ? AND iteration_id = ?
+                    AND event_type <> 'started' ORDER BY event_id ASC""",
+                    (
+                        checkpoint.run_id,
+                        checkpoint.particle_id,
+                        checkpoint.iteration_id,
+                    ),
+                ).fetchall()
+                terminal_by_sequence = {
+                    terminal["event_id"]: self._stage_event_from_row(terminal)
+                    for terminal in all_terminal_rows
+                }
+                if not terminal_by_sequence or sequence != max(terminal_by_sequence):
+                    raise ValueError(
+                        "latest checkpoint does not reference the latest terminal event"
+                    )
+                if set(checkpoint_sequences) != set(terminal_by_sequence) or any(
+                    checkpoint_sequences.count(sequence) != 1
+                    for sequence in terminal_by_sequence
+                ):
+                    raise ValueError(
+                        "episode terminal events and checkpoints are not paired"
+                    )
+                grouped: dict[tuple[str, int], dict[str, int]] = {}
+                for terminal in all_terminal_rows:
+                    key = (terminal["stage"], terminal["attempt"])
+                    classification = (
+                        "interrupted"
+                        if terminal["event_type"] == "interrupted"
+                        else "resolution"
+                    )
+                    values = grouped.setdefault(key, {})
+                    if classification in values:
+                        raise ValueError("episode has duplicate terminal events")
+                    if classification == "interrupted" and "resolution" in values:
+                        raise ValueError("interrupted terminal follows resolution")
+                    values[classification] = terminal["event_id"]
+                for candidate in checkpoint_records:
+                    candidate_sequence = candidate.terminal_event_sequence
+                    candidate_event = terminal_by_sequence[candidate_sequence]
+                    if (
+                        candidate.run_id,
+                        candidate.particle_id,
+                        candidate.iteration_id,
+                        candidate.completed_stage,
+                        candidate.completed_attempt,
+                        candidate.terminal_event_type,
+                    ) != (
+                        candidate_event.run_id,
+                        candidate_event.particle_id,
+                        candidate_event.iteration_id,
+                        candidate_event.stage,
+                        candidate_event.attempt,
+                        candidate_event.event_type,
+                    ):
+                        raise ValueError(
+                            "stored checkpoint does not match its terminal event"
+                        )
                 run_row = connection.execute(
                     "SELECT snapshot_hash FROM runs WHERE run_id = ?", (run,)
                 ).fetchone()

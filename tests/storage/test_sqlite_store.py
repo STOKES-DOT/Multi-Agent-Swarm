@@ -704,6 +704,119 @@ def test_stage_transition_identical_replay_is_noop_and_different_replay_conflict
         )
 
 
+def test_interrupted_transition_can_be_resolved_once_in_order(tmp_path: Path) -> None:
+    store = SQLiteRunStore(tmp_path / "runs.sqlite")
+    store.create_run("run-1", "a" * 64)
+    interrupted = StageEvent(
+        run_id="run-1", particle_id="p0", iteration_id=0,
+        stage=AgentStage.EXECUTING, attempt=0, event_type="interrupted",
+        payload={"reason": "cancelled"},
+    )
+    interrupted_checkpoint = _checkpoint(
+        terminal_event_type="interrupted",
+        next_stage=AgentStage.EXECUTING,
+    )
+    resolution = interrupted.model_copy(
+        update={"event_type": "completed", "payload": {"result": "ok"}}
+    )
+    store.commit_stage_transition(interrupted, interrupted_checkpoint)
+    store.commit_stage_transition(interrupted, interrupted_checkpoint)
+    store.commit_stage_transition(resolution, _checkpoint())
+    store.commit_stage_transition(resolution, _checkpoint())
+
+    events = store.list_stage_events("run-1", "p0", 0)
+    assert [stored.event.event_type for stored in events] == [
+        "interrupted",
+        "completed",
+    ]
+    latest = store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    assert latest["terminal_event_sequence"] == events[-1].sequence
+    assert latest["terminal_event_type"] == "completed"
+    with pytest.raises(ValueError, match="conflict"):
+        store.commit_stage_transition(interrupted, interrupted_checkpoint)
+
+
+def test_interrupted_transition_rejects_resolution_then_interrupt(tmp_path: Path) -> None:
+    store = SQLiteRunStore(tmp_path / "runs.sqlite")
+    store.create_run("run-1", "a" * 64)
+    resolution = StageEvent(
+        run_id="run-1", particle_id="p0", iteration_id=0,
+        stage=AgentStage.EXECUTING, attempt=0, event_type="completed",
+    )
+    store.commit_stage_transition(resolution, _checkpoint())
+    interrupted = resolution.model_copy(update={"event_type": "interrupted"})
+
+    with pytest.raises(ValueError, match="conflict"):
+        store.commit_stage_transition(
+            interrupted,
+            _checkpoint(
+                terminal_event_type="interrupted",
+                next_stage=AgentStage.EXECUTING,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "corruption", ["duplicate_interrupted", "missing_interrupt_checkpoint", "late_interrupt"]
+)
+def test_latest_checkpoint_validates_interrupted_resolution_history(
+    tmp_path: Path, corruption: str
+) -> None:
+    path = tmp_path / "runs.sqlite"
+    store = SQLiteRunStore(path)
+    store.create_run("run-1", "a" * 64)
+    interrupted = StageEvent(
+        run_id="run-1", particle_id="p0", iteration_id=0,
+        stage=AgentStage.EXECUTING, attempt=0, event_type="interrupted",
+    )
+    store.commit_stage_transition(
+        interrupted,
+        _checkpoint(
+            terminal_event_type="interrupted",
+            next_stage=AgentStage.EXECUTING,
+        ),
+    )
+    resolution = interrupted.model_copy(update={"event_type": "completed"})
+    store.commit_stage_transition(resolution, _checkpoint())
+    with sqlite3.connect(path) as connection:
+        interrupt_sequence = connection.execute(
+            "SELECT event_id FROM stage_events WHERE event_type = 'interrupted'"
+        ).fetchone()[0]
+        if corruption == "missing_interrupt_checkpoint":
+            connection.execute(
+                "DELETE FROM thread_checkpoints WHERE json_extract(payload_json, '$.terminal_event_sequence') = ?",
+                (interrupt_sequence,),
+            )
+        else:
+            cursor = connection.execute(
+                """INSERT INTO stage_events
+                (run_id, particle_id, iteration_id, stage, attempt, event_type, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                ("run-1", "p0", 0, "EXECUTING", 0, "interrupted", "{}"),
+            )
+            if corruption == "late_interrupt":
+                checkpoint = _checkpoint(
+                    terminal_event_type="interrupted",
+                    next_stage=AgentStage.EXECUTING,
+                ).model_dump(mode="json")
+                checkpoint["terminal_event_sequence"] = cursor.lastrowid
+                connection.execute(
+                    """INSERT INTO thread_checkpoints
+                    (run_id, particle_id, iteration_id, payload_json)
+                    VALUES (?, ?, ?, ?)""",
+                    (
+                        "run-1",
+                        "p0",
+                        0,
+                        json.dumps(checkpoint, sort_keys=True, separators=(",", ":")),
+                    ),
+                )
+        connection.commit()
+
+    with pytest.raises(RuntimeError, match="store corrupted"):
+        store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+
+
 def test_concurrent_identical_stage_transition_commits_one_row(tmp_path: Path) -> None:
     store = SQLiteRunStore(tmp_path / "runs.sqlite")
     store.create_run("run-1", "a" * 64)

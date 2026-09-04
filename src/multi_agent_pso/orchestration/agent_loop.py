@@ -14,11 +14,21 @@ from typing import Any
 
 from pydantic import JsonValue
 
-from multi_agent_pso.core import AgentEpisode, AgentStage, EpisodeCheckpoint, EpisodeStatus, Evaluation, EvaluationStatus, StageEvent
+from multi_agent_pso.core import (
+    AgentEpisode,
+    AgentStage,
+    ArtifactRef,
+    EpisodeCheckpoint,
+    EpisodeStatus,
+    Evaluation,
+    EvaluationStatus,
+    StageEvent,
+)
 from multi_agent_pso.protocols import (
     AgentRuntime,
     ArtifactIntegrityError,
     ArtifactStore,
+    CandidateRef,
     EvaluationContext,
     Evaluator,
     ResourceManager,
@@ -35,6 +45,7 @@ from multi_agent_pso.protocols import (
 
 from .failure_policy import (
     AuditPersistenceError,
+    IncompatibleCheckpointError,
     episode_status_for_evaluation,
     episode_status_for_tool,
 )
@@ -48,6 +59,14 @@ V1_JSON_MAX_NODES = 10_000
 V1_JSON_MAX_COLLECTION_ITEMS = 4_096
 V1_IDENTIFIER_MAX_UTF8_BYTES = 512
 _TEXT_CHUNK_CHARACTERS = 16_384
+_STAGE_ORDER = (
+    AgentStage.HYPOTHESIZING,
+    AgentStage.PROPOSING_ACTION,
+    AgentStage.EXECUTING,
+    AgentStage.EVALUATING,
+    AgentStage.REFLECTING,
+    AgentStage.COMPLETED,
+)
 
 
 class _JsonBoundaryError(ValueError):
@@ -281,20 +300,50 @@ class AgentLoop:
         self._workspace = workspace
         self._protocol_hash = protocol_snapshot_hash
 
-    async def run_particle(self, run_id: str, particle_id: str, iteration_id: int) -> AgentEpisode:
+    async def run_particle(
+        self,
+        run_id: str,
+        particle_id: str,
+        iteration_id: int,
+        *,
+        resume: EpisodeCheckpoint | None = None,
+    ) -> AgentEpisode:
         run_id = _validate_identifier(run_id, "run_id")
         particle_id = _validate_identifier(particle_id, "particle_id")
         if type(iteration_id) is not int or iteration_id < 0:
             raise ValueError("iteration_id must be a nonnegative integer")
-        owner = _ThreadOwner()
-        try:
-            stored_hash = self._store.get_run_snapshot_hash(run_id)
+        if resume is not None and not isinstance(resume, EpisodeCheckpoint):
+            raise IncompatibleCheckpointError("resume must be an EpisodeCheckpoint")
+        resume_context: dict[str, JsonValue] | None = None
+        resume_events: list[StageEvent] = []
+        stored_hash = self._store.get_run_snapshot_hash(run_id)
+        if resume is None:
             if stored_hash is None:
                 self._store.create_run(run_id, self._protocol_hash)
                 stored_hash = self._store.get_run_snapshot_hash(run_id)
             if stored_hash != self._protocol_hash:
-                raise ValueError("run snapshot hash is incompatible with AgentLoop protocol")
-            return await self._run_particle(owner, run_id, particle_id, iteration_id)
+                raise ValueError(
+                    "run snapshot hash is incompatible with AgentLoop protocol"
+                )
+        else:
+            resume, resume_context, resume_events = self._prepare_resume(
+                run_id, particle_id, iteration_id, resume, stored_hash
+            )
+            if resume.next_stage is None:
+                return self._rebuild_terminal_episode(
+                    run_id, particle_id, iteration_id, resume_context, resume_events
+                )
+        owner = _ThreadOwner()
+        try:
+            return await self._run_particle(
+                owner,
+                run_id,
+                particle_id,
+                iteration_id,
+                resume=resume,
+                resume_context=resume_context,
+                resume_events=resume_events,
+            )
         finally:
             if owner.thread is not None and not owner.close_attempted:
                 primary_error = sys.exception()
@@ -310,43 +359,111 @@ class AgentLoop:
         run_id: str,
         particle_id: str,
         iteration_id: int,
+        *,
+        resume: EpisodeCheckpoint | None,
+        resume_context: dict[str, JsonValue] | None,
+        resume_events: list[StageEvent],
     ) -> AgentEpisode:
-        events: list[StageEvent] = []
-        current_stage = AgentStage.PENDING
+        events = list(resume_events)
+        current_stage = (
+            AgentStage.PENDING if resume is None else resume.next_stage
+        )
+        if current_stage is None:
+            raise AssertionError("terminal checkpoints are rebuilt before execution")
         evaluation: Evaluation | None = None
         realized: JsonValue | None = None
         evaluated: JsonValue = self._target
         adherence: Mapping[str, JsonValue] = {}
-        context = dict(self._context(run_id, particle_id, iteration_id))
+        context = (
+            dict(self._context(run_id, particle_id, iteration_id))
+            if resume_context is None
+            else resume_context
+        )
+        proposal: Mapping[str, JsonValue] = {}
+        candidate: CandidateRef | None = None
+        candidate_json: JsonValue = {}
         try:
-            self._started(run_id, particle_id, iteration_id, AgentStage.PENDING, 0, {"workspace": str(self._workspace)})
-            owner.thread = await self._start_thread(particle_id)
-            thread = owner.thread
-            thread_json = self._copy_json(thread.to_json())
-            self._terminal_event(
-                run_id,
-                particle_id,
-                iteration_id,
-                AgentStage.PENDING,
-                "completed",
-                events,
-                attempt=0,
-                payload={"thread": thread_json},
-                context=context,
-                thread=thread,
-                owner=owner,
-                next_stage=AgentStage.HYPOTHESIZING,
-                next_attempt=0,
-                include_in_episode=False,
-            )
-            proposal: Mapping[str, JsonValue] = {}
-            for stage in (AgentStage.HYPOTHESIZING, AgentStage.PROPOSING_ACTION):
+            if resume is None:
+                self._started(
+                    run_id,
+                    particle_id,
+                    iteration_id,
+                    AgentStage.PENDING,
+                    0,
+                    {"workspace": str(self._workspace)},
+                )
+                owner.thread = await self._start_thread(particle_id)
+                thread = owner.thread
+                thread_json = self._copy_json(thread.to_json())
+                self._terminal_event(
+                    run_id,
+                    particle_id,
+                    iteration_id,
+                    AgentStage.PENDING,
+                    "completed",
+                    events,
+                    attempt=0,
+                    payload={"thread": thread_json},
+                    context=context,
+                    thread=thread,
+                    owner=owner,
+                    next_stage=AgentStage.HYPOTHESIZING,
+                    next_attempt=0,
+                    include_in_episode=False,
+                )
+                start_stage = AgentStage.HYPOTHESIZING
+                start_attempt = 0
+            else:
+                owner.thread = await self._restore_thread(particle_id, resume)
+                self._validate_restored_thread(owner.thread, particle_id, resume)
+                thread = owner.thread
+                owner.last_safe_checkpoint_context = dict(context)
+                start_stage = resume.next_stage
+                start_attempt = resume.next_attempt
+                if start_stage is None:
+                    raise AssertionError("resume cursor must be nonterminal")
+
+            start_index = _STAGE_ORDER.index(start_stage)
+            if start_index > _STAGE_ORDER.index(AgentStage.PROPOSING_ACTION):
+                proposal = self._require_mapping(context, "proposal")
+            if start_index > _STAGE_ORDER.index(AgentStage.EXECUTING):
+                candidate = self._candidate_from_context(context)
+                candidate_json = self._copy_json(candidate.to_json())
+                realized = self._require_json(context, "realized_position")
+                evaluated = self._require_json(context, "evaluated_position")
+                adherence = self._require_mapping(context, "adherence")
+            if start_index > _STAGE_ORDER.index(AgentStage.EVALUATING):
+                evaluation = self._evaluation_from_context(context)
+
+            for stage in (
+                AgentStage.HYPOTHESIZING,
+                AgentStage.PROPOSING_ACTION,
+            ):
+                stage_index = _STAGE_ORDER.index(stage)
+                if stage_index < start_index:
+                    continue
                 current_stage = stage
-                parsed = await self._agent_stage(owner, thread, stage, context, events)
+                parsed = await self._agent_stage(
+                    owner,
+                    thread,
+                    stage,
+                    context,
+                    events,
+                    start_attempt=start_attempt if stage is start_stage else 0,
+                )
                 if parsed is None:
-                    return await self._finish_episode(owner,
-                        run_id, particle_id, iteration_id, events, EpisodeStatus.INVALID,
-                        self._invalid_evaluation(), evaluated, realized, adherence, context,
+                    return await self._finish_episode(
+                        owner,
+                        run_id,
+                        particle_id,
+                        iteration_id,
+                        events,
+                        EpisodeStatus.INVALID,
+                        self._invalid_evaluation(),
+                        evaluated,
+                        realized,
+                        adherence,
+                        context,
                     )
                 if stage is AgentStage.PROPOSING_ACTION:
                     proposal = parsed
@@ -354,94 +471,269 @@ class AgentLoop:
                 else:
                     context["hypothesis"] = parsed
 
-            current_stage = AgentStage.EXECUTING
-            self._started(run_id, particle_id, iteration_id, current_stage, 0, {"proposal": proposal})
-            tool_result, request, cached = await self._execute_tool(run_id, particle_id, iteration_id, proposal)
-            request_json = self._copy_json(request.to_json())
-            tool_result_json = self._copy_json(tool_result.to_json())
-            context["tool_request"] = request_json
-            context["tool_result"] = tool_result_json
-            tool_status = episode_status_for_tool(tool_result.status)
-            if tool_status is not EpisodeStatus.COMPLETED:
-                self._terminal_event(
-                    run_id, particle_id, iteration_id, current_stage,
-                    tool_status.value.lower(), events, attempt=0,
-                    payload={"tool_request": request_json, "tool_result": tool_result_json, "cached": cached},
-                    context=context, thread=thread, owner=owner,
-                    next_stage=None, next_attempt=0,
-                    episode_status=tool_status,
+            if start_index <= _STAGE_ORDER.index(AgentStage.EXECUTING):
+                current_stage = AgentStage.EXECUTING
+                self._started(
+                    run_id,
+                    particle_id,
+                    iteration_id,
+                    current_stage,
+                    0,
+                    {"proposal": proposal},
                 )
-                return await self._finish_episode(owner,
-                    run_id, particle_id, iteration_id, events, tool_status,
-                    self._evaluation_for_tool(tool_result.status), evaluated, realized, adherence,
-                    context,
+                tool_result, request, cached = await self._execute_tool(
+                    run_id, particle_id, iteration_id, proposal
                 )
-            tool_context = ToolContext(run_id, particle_id, iteration_id, current_stage, 0, self._workspace)
-            try:
-                candidate = self._adapter.candidate_from_tool_result(tool_result, tool_context)
-                candidate_json = self._copy_json(candidate.to_json())
-                context["candidate"] = candidate_json
-                realized = self._adapter.realized_position(candidate)
-                evaluated = self._adapter.evaluated_position(self._copy_json(self._target), self._copy_json(realized))
-                adherence = self._adapter.position_adherence(self._copy_json(self._target), self._copy_json(realized))
-                realized = self._copy_json(realized)
-                evaluated = self._copy_json(evaluated)
-                adherence = self._copy_json(adherence)
-            except ValueError as error:
+                request_json = self._copy_json(request.to_json())
+                tool_result_json = self._copy_json(tool_result.to_json())
+                context["tool_request"] = request_json
+                context["tool_result"] = tool_result_json
+                tool_status = episode_status_for_tool(tool_result.status)
+                if tool_status is not EpisodeStatus.COMPLETED:
+                    self._terminal_event(
+                        run_id,
+                        particle_id,
+                        iteration_id,
+                        current_stage,
+                        tool_status.value.lower(),
+                        events,
+                        attempt=0,
+                        payload={
+                            "tool_request": request_json,
+                            "tool_result": tool_result_json,
+                            "cached": cached,
+                        },
+                        context=context,
+                        thread=thread,
+                        owner=owner,
+                        next_stage=None,
+                        next_attempt=0,
+                        episode_status=tool_status,
+                    )
+                    return await self._finish_episode(
+                        owner,
+                        run_id,
+                        particle_id,
+                        iteration_id,
+                        events,
+                        tool_status,
+                        self._evaluation_for_tool(tool_result.status),
+                        evaluated,
+                        realized,
+                        adherence,
+                        context,
+                    )
+                tool_context = ToolContext(
+                    run_id,
+                    particle_id,
+                    iteration_id,
+                    current_stage,
+                    0,
+                    self._workspace,
+                )
+                try:
+                    candidate = self._adapter.candidate_from_tool_result(
+                        tool_result, tool_context
+                    )
+                    candidate_json = self._copy_json(candidate.to_json())
+                    context["candidate"] = candidate_json
+                    realized = self._adapter.realized_position(candidate)
+                    evaluated = self._adapter.evaluated_position(
+                        self._copy_json(self._target), self._copy_json(realized)
+                    )
+                    adherence = self._adapter.position_adherence(
+                        self._copy_json(self._target), self._copy_json(realized)
+                    )
+                    realized = self._copy_json(realized)
+                    evaluated = self._copy_json(evaluated)
+                    adherence = self._copy_json(adherence)
+                except ValueError as error:
+                    self._terminal_event(
+                        run_id,
+                        particle_id,
+                        iteration_id,
+                        current_stage,
+                        "invalid",
+                        events,
+                        attempt=0,
+                        payload={
+                            "tool_request": request_json,
+                            "tool_result": tool_result_json,
+                            "cached": cached,
+                            **self._request_error(error),
+                        },
+                        context=context,
+                        thread=thread,
+                        owner=owner,
+                        next_stage=None,
+                        next_attempt=0,
+                        episode_status=EpisodeStatus.INVALID,
+                    )
+                    return await self._finish_episode(
+                        owner,
+                        run_id,
+                        particle_id,
+                        iteration_id,
+                        events,
+                        EpisodeStatus.INVALID,
+                        self._invalid_evaluation(),
+                        evaluated,
+                        realized,
+                        adherence,
+                        context,
+                    )
+                context["realized_position"] = realized
+                context["evaluated_position"] = evaluated
+                context["adherence"] = adherence
                 self._terminal_event(
-                    run_id, particle_id, iteration_id, current_stage, "invalid", events,
+                    run_id,
+                    particle_id,
+                    iteration_id,
+                    current_stage,
+                    "completed",
+                    events,
                     attempt=0,
-                    payload={"tool_request": request_json, "tool_result": tool_result_json, "cached": cached, **self._request_error(error)},
-                    context=context, thread=thread, owner=owner,
-                    next_stage=None, next_attempt=0,
-                    episode_status=EpisodeStatus.INVALID,
+                    payload={
+                        "tool_request": request_json,
+                        "tool_result": tool_result_json,
+                        "cached": cached,
+                        "candidate": candidate_json,
+                        "realized_position": realized,
+                        "evaluated_position": evaluated,
+                        "adherence": adherence,
+                    },
+                    context=context,
+                    thread=thread,
+                    owner=owner,
+                    next_stage=AgentStage.EVALUATING,
+                    next_attempt=0,
                 )
-                return await self._finish_episode(owner, run_id, particle_id, iteration_id, events, EpisodeStatus.INVALID, self._invalid_evaluation(), evaluated, realized, adherence, context)
-            context["realized_position"] = realized
-            context["evaluated_position"] = evaluated
-            context["adherence"] = adherence
-            self._terminal_event(
-                run_id, particle_id, iteration_id, current_stage, "completed", events,
-                attempt=0,
-                payload={"tool_request": request_json, "tool_result": tool_result_json, "cached": cached, "candidate": candidate_json, "realized_position": realized, "evaluated_position": evaluated, "adherence": adherence},
-                context=context, thread=thread, owner=owner,
-                next_stage=AgentStage.EVALUATING, next_attempt=0,
-            )
 
-            current_stage = AgentStage.EVALUATING
-            evaluation_context = EvaluationContext(run_id, particle_id, iteration_id, self._workspace, self._protocol_hash)
-            self._started(run_id, particle_id, iteration_id, current_stage, 0, {"candidate": candidate_json, "evaluation_context": evaluation_context.to_json()})
-            async with self._resources.evaluation_slot():
-                evaluation = await self._evaluator.evaluate(
-                    candidate,
-                    evaluation_context,
+            if candidate is None:
+                raise IncompatibleCheckpointError(
+                    "checkpoint is missing a valid candidate"
                 )
-            evaluation_json = self._copy_json(evaluation.model_dump(mode="json"))
-            context["evaluation"] = evaluation_json
-            status = episode_status_for_evaluation(evaluation.status)
-            if status is not EpisodeStatus.COMPLETED:
+
+            if start_index <= _STAGE_ORDER.index(AgentStage.EVALUATING):
+                current_stage = AgentStage.EVALUATING
+                evaluation_context = EvaluationContext(
+                    run_id,
+                    particle_id,
+                    iteration_id,
+                    self._workspace,
+                    self._protocol_hash,
+                )
+                self._started(
+                    run_id,
+                    particle_id,
+                    iteration_id,
+                    current_stage,
+                    0,
+                    {
+                        "candidate": candidate_json,
+                        "evaluation_context": evaluation_context.to_json(),
+                    },
+                )
+                async with self._resources.evaluation_slot():
+                    evaluation = await self._evaluator.evaluate(
+                        candidate, evaluation_context
+                    )
+                evaluation_json = self._copy_json(
+                    evaluation.model_dump(mode="json")
+                )
+                context["evaluation"] = evaluation_json
+                status = episode_status_for_evaluation(evaluation.status)
+                if status is not EpisodeStatus.COMPLETED:
+                    self._terminal_event(
+                        run_id,
+                        particle_id,
+                        iteration_id,
+                        current_stage,
+                        status.value.lower(),
+                        events,
+                        attempt=0,
+                        payload={"evaluation": evaluation_json},
+                        context=context,
+                        thread=thread,
+                        owner=owner,
+                        next_stage=None,
+                        next_attempt=0,
+                        episode_status=status,
+                    )
+                    return await self._finish_episode(
+                        owner,
+                        run_id,
+                        particle_id,
+                        iteration_id,
+                        events,
+                        status,
+                        evaluation,
+                        evaluated,
+                        realized,
+                        adherence,
+                        context,
+                    )
                 self._terminal_event(
-                    run_id, particle_id, iteration_id, current_stage,
-                    status.value.lower(), events, attempt=0,
-                    payload={"evaluation": evaluation_json}, context=context,
-                    thread=thread, owner=owner, next_stage=None, next_attempt=0,
-                    episode_status=status,
+                    run_id,
+                    particle_id,
+                    iteration_id,
+                    current_stage,
+                    "completed",
+                    events,
+                    attempt=0,
+                    payload={"evaluation": evaluation_json},
+                    context=context,
+                    thread=thread,
+                    owner=owner,
+                    next_stage=AgentStage.REFLECTING,
+                    next_attempt=0,
                 )
-                return await self._finish_episode(owner, run_id, particle_id, iteration_id, events, status, evaluation, evaluated, realized, adherence, context)
-            self._terminal_event(
-                run_id, particle_id, iteration_id, current_stage, "completed", events,
-                attempt=0, payload={"evaluation": evaluation_json}, context=context,
-                thread=thread, owner=owner,
-                next_stage=AgentStage.REFLECTING, next_attempt=0,
-            )
 
-            current_stage = AgentStage.REFLECTING
-            if await self._agent_stage(owner, thread, current_stage, context, events) is None:
-                return await self._finish_episode(owner, run_id, particle_id, iteration_id, events, EpisodeStatus.INVALID, evaluation, evaluated, realized, adherence, context)
+            if evaluation is None:
+                raise IncompatibleCheckpointError(
+                    "checkpoint is missing a valid evaluation"
+                )
+
+            if start_index <= _STAGE_ORDER.index(AgentStage.REFLECTING):
+                current_stage = AgentStage.REFLECTING
+                if (
+                    await self._agent_stage(
+                        owner,
+                        thread,
+                        current_stage,
+                        context,
+                        events,
+                        start_attempt=(
+                            start_attempt if start_stage is current_stage else 0
+                        ),
+                    )
+                    is None
+                ):
+                    return await self._finish_episode(
+                        owner,
+                        run_id,
+                        particle_id,
+                        iteration_id,
+                        events,
+                        EpisodeStatus.INVALID,
+                        evaluation,
+                        evaluated,
+                        realized,
+                        adherence,
+                        context,
+                    )
             current_stage = AgentStage.COMPLETED
             return await self._finish_episode(
-                owner, run_id, particle_id, iteration_id, events,
-                EpisodeStatus.COMPLETED, evaluation, evaluated, realized, adherence,
+                owner,
+                run_id,
+                particle_id,
+                iteration_id,
+                events,
+                EpisodeStatus.COMPLETED,
+                evaluation,
+                evaluated,
+                realized,
+                adherence,
                 context,
                 candidate_reference=candidate.reference,
                 candidate_hash=candidate.candidate_hash,
@@ -453,6 +745,8 @@ class AgentLoop:
                 ),
             )
         except ArtifactIntegrityError:
+            raise
+        except IncompatibleCheckpointError:
             raise
         except _RecordedStageFailure as error:
             self._clear_stage_boundary(context)
@@ -582,9 +876,442 @@ class AgentLoop:
                 context,
             )
 
+    def _prepare_resume(
+        self,
+        run_id: str,
+        particle_id: str,
+        iteration_id: int,
+        resume: EpisodeCheckpoint,
+        stored_hash: str | None,
+    ) -> tuple[EpisodeCheckpoint, dict[str, JsonValue], list[StageEvent]]:
+        if stored_hash != self._protocol_hash:
+            raise IncompatibleCheckpointError(
+                "checkpoint run snapshot hash is missing or incompatible"
+            )
+        if (
+            resume.run_id,
+            resume.particle_id,
+            resume.iteration_id,
+            resume.protocol_snapshot_hash,
+        ) != (run_id, particle_id, iteration_id, self._protocol_hash):
+            raise IncompatibleCheckpointError(
+                "checkpoint identity or protocol snapshot hash is incompatible"
+            )
+        if resume.terminal_event_sequence is None:
+            raise IncompatibleCheckpointError(
+                "checkpoint has no validated terminal event sequence"
+            )
+        try:
+            latest_json = self._store.get_latest_stage_checkpoint_json(
+                run_id, particle_id, iteration_id
+            )
+            if latest_json is None:
+                raise IncompatibleCheckpointError(
+                    "checkpoint is not present in the run store"
+                )
+            latest = EpisodeCheckpoint.model_validate(latest_json)
+            if self._canonical_json(latest.model_dump(mode="json")) != self._canonical_json(
+                resume.model_dump(mode="json")
+            ):
+                raise IncompatibleCheckpointError(
+                    "checkpoint is stale or does not match persisted state"
+                )
+            stored_events = self._store.list_stage_events(
+                run_id, particle_id, iteration_id
+            )
+            events = self._validated_resume_events(latest, stored_events)
+            context_value = self._copy_json(latest.context)
+            if not isinstance(context_value, dict):
+                raise IncompatibleCheckpointError(
+                    "checkpoint context must be a JSON object"
+                )
+            self._validate_resume_context(latest, context_value)
+        except ArtifactIntegrityError:
+            raise
+        except IncompatibleCheckpointError:
+            raise
+        except (TypeError, ValueError, RuntimeError, _JsonBoundaryError) as error:
+            raise IncompatibleCheckpointError(
+                "checkpoint persistence records are invalid"
+            ) from error
+        return latest, context_value, events
+
+    def _validated_resume_events(
+        self, checkpoint: EpisodeCheckpoint, stored_events: object
+    ) -> list[StageEvent]:
+        if not isinstance(stored_events, tuple):
+            raise IncompatibleCheckpointError(
+                "stored stage events must be returned as a tuple"
+            )
+        previous_sequence = 0
+        terminals: dict[tuple[AgentStage, int], dict[str, int]] = {}
+        selected: StageEvent | None = None
+        restored: list[StageEvent] = []
+        latest_terminal_sequence = 0
+        completed_stages: set[AgentStage] = set()
+        for stored in stored_events:
+            sequence = getattr(stored, "sequence", None)
+            event = getattr(stored, "event", None)
+            if type(sequence) is not int or sequence <= previous_sequence:
+                raise IncompatibleCheckpointError(
+                    "stored stage event sequence is not strictly ordered"
+                )
+            if not isinstance(event, StageEvent):
+                raise IncompatibleCheckpointError("stored stage event is invalid")
+            if (
+                event.run_id,
+                event.particle_id,
+                event.iteration_id,
+            ) != (
+                checkpoint.run_id,
+                checkpoint.particle_id,
+                checkpoint.iteration_id,
+            ):
+                raise IncompatibleCheckpointError(
+                    "stored stage event identity is incompatible"
+                )
+            previous_sequence = sequence
+            if event.event_type == "started":
+                continue
+            if event.event_type not in {
+                "completed",
+                "failed",
+                "invalid",
+                "timeout",
+                "interrupted",
+                "cleanup_failed",
+            }:
+                raise IncompatibleCheckpointError(
+                    "stored stage terminal event type is invalid"
+                )
+            key = (event.stage, event.attempt)
+            classification = (
+                "interrupted"
+                if event.event_type == "interrupted"
+                else "resolution"
+            )
+            classified = terminals.setdefault(key, {})
+            if classification in classified:
+                raise IncompatibleCheckpointError(
+                    "stored stage attempt has duplicate terminal events"
+                )
+            if classification == "interrupted" and "resolution" in classified:
+                raise IncompatibleCheckpointError(
+                    "stored interrupted event follows its resolution"
+                )
+            classified[classification] = sequence
+            latest_terminal_sequence = sequence
+            if event.event_type == "completed":
+                completed_stages.add(event.stage)
+            if sequence == checkpoint.terminal_event_sequence:
+                selected = event
+            if event.stage is not AgentStage.PENDING:
+                restored.append(event)
+        if selected is None or latest_terminal_sequence != checkpoint.terminal_event_sequence:
+            raise IncompatibleCheckpointError(
+                "checkpoint does not identify the latest terminal event"
+            )
+        if (
+            selected.run_id,
+            selected.particle_id,
+            selected.iteration_id,
+            selected.stage,
+            selected.attempt,
+            selected.event_type,
+        ) != (
+            checkpoint.run_id,
+            checkpoint.particle_id,
+            checkpoint.iteration_id,
+            checkpoint.completed_stage,
+            checkpoint.completed_attempt,
+            checkpoint.terminal_event_type,
+        ):
+            raise IncompatibleCheckpointError(
+                "checkpoint terminal event does not match its sequence"
+            )
+        if checkpoint.next_stage is not None:
+            cursor_index = _STAGE_ORDER.index(checkpoint.next_stage)
+            required_prefix = {
+                AgentStage.PENDING,
+                *_STAGE_ORDER[:cursor_index],
+            }
+            if not required_prefix.issubset(completed_stages):
+                raise IncompatibleCheckpointError(
+                    "checkpoint is missing a completed stage prefix"
+                )
+        return restored
+
+    def _validate_resume_context(
+        self, checkpoint: EpisodeCheckpoint, context: dict[str, JsonValue]
+    ) -> None:
+        required_identity = {
+            "run_id": checkpoint.run_id,
+            "particle_id": checkpoint.particle_id,
+            "iteration_id": checkpoint.iteration_id,
+            "protocol_snapshot_hash": self._protocol_hash,
+        }
+        if any(context.get(key) != value for key, value in required_identity.items()):
+            raise IncompatibleCheckpointError("checkpoint context identity is incompatible")
+        if self._canonical_json(self._require_json(context, "target_position")) != self._canonical_json(
+            self._target
+        ):
+            raise IncompatibleCheckpointError(
+                "checkpoint target position is incompatible"
+            )
+        if "tool_result" in context:
+            self._verify_tool_result_artifacts(
+                self._tool_result_from_context(context)
+            )
+        if checkpoint.next_stage is None:
+            self._terminal_fields_from_context(context)
+            return
+        if checkpoint.thread_json is None:
+            raise IncompatibleCheckpointError(
+                "resumable checkpoint is missing thread identity"
+            )
+        self._thread_identity(checkpoint.thread_json)
+        stage_index = _STAGE_ORDER.index(checkpoint.next_stage)
+        if checkpoint.next_attempt:
+            self._require_mapping(context, "correction")
+        if stage_index > _STAGE_ORDER.index(AgentStage.HYPOTHESIZING):
+            self._require_mapping(context, "hypothesis")
+        if stage_index > _STAGE_ORDER.index(AgentStage.PROPOSING_ACTION):
+            self._require_mapping(context, "proposal")
+        if stage_index > _STAGE_ORDER.index(AgentStage.EXECUTING):
+            result = self._tool_result_from_context(context)
+            if result.status is not ToolStatus.SUCCESS:
+                raise IncompatibleCheckpointError(
+                    "completed tool boundary does not contain a successful result"
+                )
+            self._candidate_from_context(context)
+            self._require_json(context, "realized_position")
+            self._require_json(context, "evaluated_position")
+            self._require_mapping(context, "adherence")
+        if stage_index > _STAGE_ORDER.index(AgentStage.EVALUATING):
+            evaluation = self._evaluation_from_context(context)
+            if evaluation.status is not EvaluationStatus.SUCCESS:
+                raise IncompatibleCheckpointError(
+                    "completed evaluation boundary is not successful"
+                )
+
+    def _rebuild_terminal_episode(
+        self,
+        run_id: str,
+        particle_id: str,
+        iteration_id: int,
+        context: Mapping[str, JsonValue],
+        events: list[StageEvent],
+    ) -> AgentEpisode:
+        (
+            status,
+            evaluation,
+            target,
+            realized,
+            evaluated,
+            adherence,
+            references,
+        ) = self._terminal_fields_from_context(context)
+        if self._canonical_json(target) != self._canonical_json(self._target):
+            raise IncompatibleCheckpointError(
+                "terminal checkpoint target position is incompatible"
+            )
+        try:
+            return self._terminal_episode(
+                run_id,
+                particle_id,
+                iteration_id,
+                events,
+                status,
+                evaluation,
+                evaluated,
+                realized,
+                adherence,
+                *references,
+            )
+        except (TypeError, ValueError) as error:
+            raise IncompatibleCheckpointError(
+                "terminal checkpoint contains invalid episode state"
+            ) from error
+
+    def _terminal_fields_from_context(
+        self, context: Mapping[str, JsonValue]
+    ) -> tuple[
+        EpisodeStatus,
+        Evaluation | None,
+        JsonValue,
+        JsonValue | None,
+        JsonValue,
+        Mapping[str, JsonValue],
+        tuple[str | None, str | None, str | None, str | None],
+    ]:
+        try:
+            status_value = context["episode_status"]
+            status = EpisodeStatus(status_value)
+            evaluation_value = context["evaluation"]
+            evaluation = (
+                None
+                if evaluation_value is None
+                else Evaluation.model_validate(evaluation_value)
+            )
+            target = self._require_json(context, "target_position")
+            realized = self._require_json(context, "realized_position")
+            evaluated = self._require_json(context, "evaluated_position")
+            adherence = self._require_mapping(context, "adherence")
+            raw_references = tuple(
+                context[key]
+                for key in (
+                    "candidate_reference",
+                    "candidate_hash",
+                    "hypothesis_reference",
+                    "evaluation_reference",
+                )
+            )
+            if any(value is not None and not isinstance(value, str) for value in raw_references):
+                raise TypeError("episode references must be strings or null")
+            references = raw_references
+        except (KeyError, TypeError, ValueError) as error:
+            raise IncompatibleCheckpointError(
+                "terminal checkpoint lacks deterministic episode state"
+            ) from error
+        return (
+            status,
+            evaluation,
+            target,
+            realized,
+            evaluated,
+            adherence,
+            references,  # type: ignore[return-value]
+        )
+
+    def _tool_result_from_context(
+        self, context: Mapping[str, JsonValue]
+    ) -> ToolResult:
+        try:
+            value = self._require_mapping(context, "tool_result")
+            artifacts = value["artifacts"]
+            if not isinstance(artifacts, list):
+                raise TypeError("tool result artifacts must be a list")
+            return ToolResult(
+                ToolStatus(value["status"]),
+                self._require_mapping(value, "payload"),
+                tuple(ArtifactRef.model_validate(item) for item in artifacts),
+                value.get("error"),  # type: ignore[arg-type]
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise IncompatibleCheckpointError(
+                "checkpoint tool result is invalid"
+            ) from error
+
+    def _candidate_from_context(
+        self, context: Mapping[str, JsonValue]
+    ) -> CandidateRef:
+        try:
+            value = self._require_mapping(context, "candidate")
+            artifacts = value["artifacts"]
+            if not isinstance(artifacts, list):
+                raise TypeError("candidate artifacts must be a list")
+            return CandidateRef(
+                value["reference"],  # type: ignore[arg-type]
+                value["candidate_hash"],  # type: ignore[arg-type]
+                tuple(ArtifactRef.model_validate(item) for item in artifacts),
+                self._require_mapping(value, "metadata"),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise IncompatibleCheckpointError(
+                "checkpoint candidate is invalid"
+            ) from error
+
+    def _evaluation_from_context(
+        self, context: Mapping[str, JsonValue]
+    ) -> Evaluation:
+        try:
+            return Evaluation.model_validate(context["evaluation"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise IncompatibleCheckpointError(
+                "checkpoint evaluation is invalid"
+            ) from error
+
+    def _validate_restored_thread(
+        self,
+        thread: ThreadRef,
+        particle_id: str,
+        checkpoint: EpisodeCheckpoint,
+    ) -> None:
+        if not isinstance(thread, ThreadRef):
+            raise IncompatibleCheckpointError(
+                "runtime restored an invalid thread reference"
+            )
+        expected = self._thread_identity(checkpoint.thread_json)
+        actual = self._thread_identity(thread.to_json())
+        if (
+            thread.particle_id != particle_id
+            or thread.workspace != self._workspace
+            or actual != expected
+        ):
+            raise IncompatibleCheckpointError(
+                "runtime restored a mismatched thread reference"
+            )
+
+    @staticmethod
+    def _thread_identity(value: object) -> tuple[object, ...]:
+        if not isinstance(value, Mapping):
+            raise IncompatibleCheckpointError("checkpoint thread identity is invalid")
+        try:
+            return (
+                value["logical_id"],
+                value["particle_id"],
+                value["generation"],
+                value["workspace"],
+                value.get("provider_id"),
+            )
+        except KeyError as error:
+            raise IncompatibleCheckpointError(
+                "checkpoint thread identity is incomplete"
+            ) from error
+
+    def _require_json(
+        self, context: Mapping[str, JsonValue], key: str
+    ) -> JsonValue:
+        if key not in context:
+            raise IncompatibleCheckpointError(
+                f"checkpoint context is missing {key}"
+            )
+        return self._copy_json(context[key])
+
+    def _require_mapping(
+        self, context: Mapping[str, JsonValue], key: str
+    ) -> Mapping[str, JsonValue]:
+        value = self._require_json(context, key)
+        if not isinstance(value, Mapping):
+            raise IncompatibleCheckpointError(
+                f"checkpoint context {key} must be an object"
+            )
+        return value
+
+    @staticmethod
+    def _canonical_json(value: object) -> str:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
     async def _start_thread(self, particle_id: str) -> ThreadRef:
         async with self._resources.agent_slot():
             return await self._runtime.start_thread(particle_id, self._workspace)
+
+    async def _restore_thread(
+        self, particle_id: str, checkpoint: EpisodeCheckpoint
+    ) -> ThreadRef:
+        checkpoint_json = self._copy_json(checkpoint.model_dump(mode="json"))
+        if not isinstance(checkpoint_json, Mapping):
+            raise AssertionError("checkpoint JSON must be an object")
+        async with self._resources.agent_slot():
+            return await self._runtime.restore_thread(
+                particle_id, self._workspace, checkpoint_json
+            )
 
     async def _finish_episode(
         self,
@@ -606,11 +1333,34 @@ class AgentLoop:
         evaluation_reference: str | None = None,
     ) -> AgentEpisode:
         primary_status = status
-        final_context = (
+        base_final_context = (
             owner.last_safe_checkpoint_context
             if owner.last_safe_checkpoint_context is not None
             else self._checkpoint_context(context)
         )
+        final_context = dict(base_final_context)
+        rebuild_state: dict[str, JsonValue] = {
+            "episode_status": status.value,
+            "evaluation": (
+                None if evaluation is None else evaluation.model_dump(mode="json")
+            ),
+            "target_position": self._target,
+            "realized_position": realized,
+            "evaluated_position": evaluated,
+            "adherence": adherence,
+            "candidate_reference": candidate_reference,
+            "candidate_hash": candidate_hash,
+            "hypothesis_reference": hypothesis_reference,
+            "evaluation_reference": evaluation_reference,
+        }
+        try:
+            copied_rebuild_state = self._copy_json(rebuild_state)
+        except _JsonBoundaryError:
+            final_context["episode_rebuild_unavailable"] = True
+        else:
+            if not isinstance(copied_rebuild_state, Mapping):
+                raise AssertionError("episode rebuild state must be an object")
+            final_context.update(copied_rebuild_state)
         self._started(
             run_id,
             particle_id,
@@ -650,6 +1400,14 @@ class AgentLoop:
             raise close_error
         if close_error is not None and status is EpisodeStatus.COMPLETED:
             status = EpisodeStatus.FAILED
+            final_context["episode_status"] = status.value
+            for key in (
+                "candidate_reference",
+                "candidate_hash",
+                "hypothesis_reference",
+                "evaluation_reference",
+            ):
+                final_context[key] = None
         terminal_type = "completed" if close_error is None else "cleanup_failed"
         terminal_payload: dict[str, JsonValue] = {
             "finalization": terminal_type,
@@ -750,8 +1508,14 @@ class AgentLoop:
         stage: AgentStage,
         context: dict[str, JsonValue],
         events: list[StageEvent],
+        *,
+        start_attempt: int = 0,
     ) -> Mapping[str, JsonValue] | None:
-        for attempt in range(3):
+        if type(start_attempt) is not int or not 0 <= start_attempt <= 2:
+            raise IncompatibleCheckpointError(
+                "checkpoint agent-stage attempt must be between zero and two"
+            )
+        for attempt in range(start_attempt, 3):
             try:
                 stage_context = self._copy_json(context)
             except _JsonBoundaryError as error:

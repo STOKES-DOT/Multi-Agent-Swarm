@@ -17,7 +17,11 @@ from multi_agent_pso.core import (
     StageEvent,
     StoredStageEvent,
 )
-from multi_agent_pso.orchestration import AgentLoop, AuditPersistenceError
+from multi_agent_pso.orchestration import (
+    AgentLoop,
+    AuditPersistenceError,
+    IncompatibleCheckpointError,
+)
 import multi_agent_pso.orchestration.agent_loop as agent_loop_module
 from multi_agent_pso.protocols import (
     ArtifactIntegrityError,
@@ -1581,6 +1585,495 @@ def test_audit_payload_catches_unexpected_validator_exception(tmp_path, monkeypa
     event = dependencies["run_store"].events[-1]
     assert event.payload["truncated"] is True
     assert_audit_events_within_v1_budget(dependencies)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage", "next_stage", "forbidden", "tool_calls", "evaluation_calls"),
+    [
+        (AgentStage.PROPOSING_ACTION, AgentStage.EXECUTING, {AgentStage.HYPOTHESIZING, AgentStage.PROPOSING_ACTION}, 1, 1),
+        (AgentStage.EXECUTING, AgentStage.EVALUATING, {AgentStage.HYPOTHESIZING, AgentStage.PROPOSING_ACTION}, 1, 1),
+        (AgentStage.EVALUATING, AgentStage.REFLECTING, {AgentStage.HYPOTHESIZING, AgentStage.PROPOSING_ACTION}, 1, 1),
+        (AgentStage.REFLECTING, AgentStage.COMPLETED, set(AgentStage), 1, 1),
+    ],
+)
+async def test_resume_skips_committed_prefix_after_transition_interrupt(
+    tmp_path, stage, next_stage, forbidden, tool_calls, evaluation_calls
+):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        interrupt_after_transition=(stage, "completed"),
+    )
+    loop = AgentLoop(**dependencies)
+    with pytest.raises(KeyboardInterrupt):
+        await loop.run_particle("run-1", "p0", 0)
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    )
+    assert checkpoint.next_stage is next_stage
+    dependencies["runtime"].stages.clear()
+
+    await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert forbidden.isdisjoint(dependencies["runtime"].stages)
+    assert len(dependencies["tool_provider"].executed_keys) == tool_calls
+    assert dependencies["evaluator"].calls == evaluation_calls
+    assert dependencies["runtime"].restored_threads == ["p0"]
+
+
+@pytest.mark.asyncio
+async def test_resume_continues_schema_correction_from_next_attempt(tmp_path):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        invalid_responses=1,
+        interrupt_after_transition=(AgentStage.HYPOTHESIZING, "failed"),
+    )
+    loop = AgentLoop(**dependencies)
+    with pytest.raises(KeyboardInterrupt):
+        await loop.run_particle("run-1", "p0", 0)
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    )
+    assert checkpoint.next_stage is AgentStage.HYPOTHESIZING
+    assert checkpoint.next_attempt == 1
+
+    episode = await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert episode.status is EpisodeStatus.COMPLETED
+    assert dependencies["runtime"].stages.count(AgentStage.HYPOTHESIZING) <= 3
+
+
+@pytest.mark.asyncio
+async def test_resume_terminal_checkpoint_rebuilds_episode_without_external_calls(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path)
+    loop = AgentLoop(**dependencies)
+    original = await loop.run_particle("run-1", "p0", 0)
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    )
+    before = (
+        len(dependencies["runtime"].started_threads),
+        len(dependencies["runtime"].restored_threads),
+        len(dependencies["runtime"].close_attempts),
+        len(dependencies["tool_provider"].executed_keys),
+        dependencies["evaluator"].calls,
+        len(dependencies["run_store"].append_attempts),
+    )
+
+    rebuilt = await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert rebuilt.model_dump(mode="json") == original.model_dump(mode="json")
+    after = (
+        len(dependencies["runtime"].started_threads),
+        len(dependencies["runtime"].restored_threads),
+        len(dependencies["runtime"].close_attempts),
+        len(dependencies["tool_provider"].executed_keys),
+        dependencies["evaluator"].calls,
+        len(dependencies["run_store"].append_attempts),
+    )
+    assert after == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["identity", "hash", "stale", "context"])
+async def test_resume_rejects_incompatible_checkpoint_without_external_calls(
+    tmp_path, case: str
+):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        interrupt_after_transition=(AgentStage.PROPOSING_ACTION, "completed"),
+    )
+    loop = AgentLoop(**dependencies)
+    with pytest.raises(KeyboardInterrupt):
+        await loop.run_particle("run-1", "p0", 0)
+    store = dependencies["run_store"]
+    checkpoint = EpisodeCheckpoint.model_validate(
+        store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    )
+    if case == "identity":
+        checkpoint = checkpoint.model_copy(update={"particle_id": "other"})
+    elif case == "hash":
+        store.run_hashes["run-1"] = "0" * 64
+    elif case == "stale":
+        checkpoint = checkpoint.model_copy(update={"next_attempt": 1})
+    else:
+        del store.checkpoints[("run-1", "p0", 0)][-1]["context"]["proposal"]
+        checkpoint = EpisodeCheckpoint.model_validate(
+            store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+        )
+    before = (
+        len(dependencies["runtime"].started_threads),
+        len(dependencies["runtime"].restored_threads),
+        len(dependencies["runtime"].close_attempts),
+        len(dependencies["tool_provider"].executed_keys),
+        dependencies["evaluator"].calls,
+        len(store.append_attempts),
+    )
+
+    with pytest.raises(IncompatibleCheckpointError):
+        await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    after = (
+        len(dependencies["runtime"].started_threads),
+        len(dependencies["runtime"].restored_threads),
+        len(dependencies["runtime"].close_attempts),
+        len(dependencies["tool_provider"].executed_keys),
+        dependencies["evaluator"].calls,
+        len(store.append_attempts),
+    )
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_resume_verifies_cached_tool_artifacts_before_restore(tmp_path):
+    artifact = ArtifactRef(
+        relative_path="run-1/p0/result.json",
+        sha256="1" * 64,
+        size_bytes=2,
+        media_type="application/json",
+        committed=True,
+    )
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        tool_artifacts=(artifact,),
+        interrupt_after_transition=(AgentStage.EXECUTING, "completed"),
+    )
+    loop = AgentLoop(**dependencies)
+    with pytest.raises(KeyboardInterrupt):
+        await loop.run_particle("run-1", "p0", 0)
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json(
+            "run-1", "p0", 0
+        )
+    )
+    dependencies["artifact_store"].invalid.add(artifact.relative_path)
+    event_count = len(dependencies["run_store"].append_attempts)
+
+    with pytest.raises(ArtifactIntegrityError):
+        await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert dependencies["runtime"].restored_threads == []
+    assert len(dependencies["tool_provider"].executed_keys) == 1
+    assert dependencies["evaluator"].calls == 0
+    assert len(dependencies["run_store"].append_attempts) == event_count
+
+
+@pytest.mark.asyncio
+async def test_resume_verifies_terminal_checkpoint_tool_artifacts(tmp_path):
+    artifact = ArtifactRef(
+        relative_path="run-1/p0/final.json",
+        sha256="2" * 64,
+        size_bytes=2,
+        media_type="application/json",
+        committed=True,
+    )
+    dependencies = make_fake_dependencies(tmp_path, tool_artifacts=(artifact,))
+    loop = AgentLoop(**dependencies)
+    await loop.run_particle("run-1", "p0", 0)
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json(
+            "run-1", "p0", 0
+        )
+    )
+    dependencies["artifact_store"].invalid.add(artifact.relative_path)
+
+    with pytest.raises(ArtifactIntegrityError):
+        await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert dependencies["runtime"].restored_threads == []
+
+
+@pytest.mark.asyncio
+async def test_resume_closes_mismatched_restored_thread_once_without_audit(tmp_path):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        interrupt_after_transition=(AgentStage.PROPOSING_ACTION, "completed"),
+    )
+    loop = AgentLoop(**dependencies)
+    with pytest.raises(KeyboardInterrupt):
+        await loop.run_particle("run-1", "p0", 0)
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json(
+            "run-1", "p0", 0
+        )
+    )
+    dependencies["runtime"].restore_thread_override = ThreadRef(
+        "wrong-thread", "p0", 0, dependencies["workspace"]
+    )
+    close_count = len(dependencies["runtime"].close_attempts)
+    event_count = len(dependencies["run_store"].append_attempts)
+
+    with pytest.raises(IncompatibleCheckpointError, match="mismatched"):
+        await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert dependencies["runtime"].restored_threads == ["p0"]
+    assert len(dependencies["runtime"].close_attempts) == close_count + 1
+    assert len(dependencies["run_store"].append_attempts) == event_count
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("completed_stage", "context_key", "replacement"),
+    [
+        (
+            AgentStage.EXECUTING,
+            "tool_result",
+            {
+                "status": "FAILED",
+                "payload": {},
+                "artifacts": [],
+                "error": "failed",
+            },
+        ),
+        (
+            AgentStage.EVALUATING,
+            "evaluation",
+            {
+                "status": "INVALID",
+                "feasible": False,
+                "metrics": {},
+                "constraints": [],
+                "fitness": None,
+                "uncertainty": None,
+                "provenance": {},
+            },
+        ),
+    ],
+)
+async def test_resume_rejects_completed_boundary_with_non_success_state(
+    tmp_path, completed_stage, context_key, replacement
+):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        interrupt_after_transition=(completed_stage, "completed"),
+    )
+    loop = AgentLoop(**dependencies)
+    with pytest.raises(KeyboardInterrupt):
+        await loop.run_particle("run-1", "p0", 0)
+    store = dependencies["run_store"]
+    store.checkpoints[("run-1", "p0", 0)][-1]["context"][context_key] = replacement
+    checkpoint = EpisodeCheckpoint.model_validate(
+        store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    )
+
+    with pytest.raises(IncompatibleCheckpointError):
+        await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert dependencies["runtime"].restored_threads == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dependency_overrides",
+    [
+        {"tool_status": ToolStatus.REJECTED},
+        {"evaluator_status": EvaluationStatus.INVALID},
+    ],
+)
+async def test_resume_rebuilds_non_success_terminal_episode_without_external_calls(
+    tmp_path, dependency_overrides
+):
+    dependencies = make_fake_dependencies(tmp_path, **dependency_overrides)
+    loop = AgentLoop(**dependencies)
+    original = await loop.run_particle("run-1", "p0", 0)
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json(
+            "run-1", "p0", 0
+        )
+    )
+    before = (
+        len(dependencies["runtime"].started_threads),
+        len(dependencies["runtime"].restored_threads),
+        len(dependencies["runtime"].close_attempts),
+        len(dependencies["tool_provider"].executed_keys),
+        dependencies["evaluator"].calls,
+        len(dependencies["run_store"].append_attempts),
+    )
+
+    rebuilt = await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert rebuilt.model_dump(mode="json") == original.model_dump(mode="json")
+    after = (
+        len(dependencies["runtime"].started_threads),
+        len(dependencies["runtime"].restored_threads),
+        len(dependencies["runtime"].close_attempts),
+        len(dependencies["tool_provider"].executed_keys),
+        dependencies["evaluator"].calls,
+        len(dependencies["run_store"].append_attempts),
+    )
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_terminal_summary_missing_rebuild_state(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path)
+    loop = AgentLoop(**dependencies)
+    await loop.run_particle("run-1", "p0", 0)
+    store = dependencies["run_store"]
+    del store.checkpoints[("run-1", "p0", 0)][-1]["context"]["evaluation"]
+    checkpoint = EpisodeCheckpoint.model_validate(
+        store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    )
+    event_count = len(store.append_attempts)
+
+    with pytest.raises(IncompatibleCheckpointError, match="deterministic"):
+        await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert dependencies["runtime"].restored_threads == []
+    assert len(store.append_attempts) == event_count
+
+
+@pytest.mark.asyncio
+async def test_resume_reports_invalid_terminal_episode_fields_as_incompatible(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path)
+    loop = AgentLoop(**dependencies)
+    await loop.run_particle("run-1", "p0", 0)
+    store = dependencies["run_store"]
+    store.checkpoints[("run-1", "p0", 0)][-1]["context"][
+        "candidate_hash"
+    ] = "invalid"
+    checkpoint = EpisodeCheckpoint.model_validate(
+        store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    )
+
+    with pytest.raises(IncompatibleCheckpointError):
+        await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert dependencies["runtime"].restored_threads == []
+
+
+@pytest.mark.asyncio
+async def test_fake_store_rejects_missing_persisted_prefix_terminal(tmp_path):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        interrupt_after_transition=(AgentStage.PROPOSING_ACTION, "completed"),
+    )
+    loop = AgentLoop(**dependencies)
+    with pytest.raises(KeyboardInterrupt):
+        await loop.run_particle("run-1", "p0", 0)
+    store = dependencies["run_store"]
+    hypothesis_index = next(
+        index
+        for index, stored in enumerate(store.stored_events)
+        if stored.event.stage is AgentStage.HYPOTHESIZING
+        and stored.event.event_type == "completed"
+    )
+    stored = store.stored_events[hypothesis_index]
+    store.stored_events[hypothesis_index] = StoredStageEvent(
+        sequence=stored.sequence,
+        event=stored.event.model_copy(update={"particle_id": "other"}),
+    )
+    with pytest.raises(RuntimeError, match="store corrupted"):
+        store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupted_stage", [AgentStage.HYPOTHESIZING, AgentStage.EXECUTING])
+async def test_resume_resolves_persisted_interrupted_attempt(
+    tmp_path, interrupted_stage
+):
+    overrides = (
+        {"cancel_stage": interrupted_stage}
+        if interrupted_stage is AgentStage.HYPOTHESIZING
+        else {"candidate_exception": asyncio.CancelledError()}
+    )
+    dependencies = make_fake_dependencies(tmp_path, **overrides)
+    loop = AgentLoop(**dependencies)
+    with pytest.raises(asyncio.CancelledError):
+        await loop.run_particle("run-1", "p0", 0)
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json(
+            "run-1", "p0", 0
+        )
+    )
+    assert checkpoint.completed_stage is interrupted_stage
+    assert checkpoint.terminal_event_type == "interrupted"
+    dependencies["runtime"].cancel_stage = None
+    dependencies["task_adapter"].candidate_exception = None
+
+    episode = await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert episode.status is EpisodeStatus.COMPLETED
+    matching = [
+        event.event_type
+        for event in episode.events
+        if event.stage is interrupted_stage and event.attempt == 0
+    ]
+    assert matching == ["interrupted", "completed"]
+    assert len(dependencies["tool_provider"].executed_keys) == 1
+    terminal_checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json(
+            "run-1", "p0", 0
+        )
+    )
+    rebuilt = await loop.run_particle(
+        "run-1", "p0", 0, resume=terminal_checkpoint
+    )
+    assert rebuilt.model_dump(mode="json") == episode.model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+async def test_resume_resolves_completed_finalization_interruption(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path)
+    runtime = dependencies["runtime"]
+    normal_close = runtime.close_thread
+    close_started = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def cancellable_close(thread):
+        runtime.close_attempts.append(thread.logical_id)
+        close_started.set()
+        await never_finish.wait()
+
+    runtime.close_thread = cancellable_close
+    loop = AgentLoop(**dependencies)
+    task = asyncio.create_task(loop.run_particle("run-1", "p0", 0))
+    await close_started.wait()
+    task.cancel("interrupt finalization")
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json(
+            "run-1", "p0", 0
+        )
+    )
+    assert checkpoint.next_stage is AgentStage.COMPLETED
+    runtime.close_thread = normal_close
+
+    episode = await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert episode.status is EpisodeStatus.COMPLETED
+    assert [
+        event.event_type
+        for event in episode.events
+        if event.stage is AgentStage.COMPLETED
+    ] == ["interrupted", "completed"]
+
+
+def test_fake_run_store_allows_interrupted_then_resolution_only() -> None:
+    store = FakeRunStore()
+    store.create_run("run-1", "a" * 64)
+    interrupted = StageEvent(
+        run_id="run-1", particle_id="p0", iteration_id=0,
+        stage=AgentStage.EXECUTING, attempt=0, event_type="interrupted",
+    )
+    interrupted_checkpoint = _fake_checkpoint().model_copy(
+        update={
+            "terminal_event_type": "interrupted",
+            "next_stage": AgentStage.EXECUTING,
+        }
+    )
+    store.commit_stage_transition(interrupted, interrupted_checkpoint)
+    store.commit_stage_transition(interrupted, interrupted_checkpoint)
+    resolution = interrupted.model_copy(update={"event_type": "completed"})
+    store.commit_stage_transition(resolution, _fake_checkpoint())
+    store.commit_stage_transition(resolution, _fake_checkpoint())
+    assert [
+        stored.event.event_type
+        for stored in store.list_stage_events("run-1", "p0", 0)
+    ] == ["interrupted", "completed"]
+    with pytest.raises(ValueError, match="conflict"):
+        store.commit_stage_transition(interrupted, interrupted_checkpoint)
 
 
 def test_fake_run_store_create_run_and_transition_match_real_first_wins() -> None:

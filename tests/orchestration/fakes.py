@@ -128,6 +128,7 @@ class FakeRunStore:
         audit_failure_event_type: str | None = "interrupted",
         audit_failure_nth: int = 1,
         audit_failure_persistent: bool = False,
+        interrupt_after_transition: tuple[AgentStage, str] | None = None,
     ) -> None:
         self.events: list[StageEvent] = []
         self.append_attempts: list[StageEvent] = []
@@ -151,6 +152,8 @@ class FakeRunStore:
         self.audit_failure_nth = audit_failure_nth
         self.audit_failure_persistent = audit_failure_persistent
         self._matching_append_attempts = 0
+        self.interrupt_after_transition = interrupt_after_transition
+        self._transition_interrupted = False
 
     def append_stage_event(self, event: StageEvent) -> None:
         if not isinstance(event, StageEvent):
@@ -253,7 +256,15 @@ class FakeRunStore:
         with self._lock:
             if self.run_hashes.get(event.run_id) != checkpoint.protocol_snapshot_hash:
                 raise ValueError("checkpoint protocol hash does not match run snapshot hash")
-            existing = self._transitions.get(transition_key)
+            interrupted_key = (*transition_key, "interrupted")
+            resolution_key = (*transition_key, "resolution")
+            is_interrupted = event.event_type == "interrupted"
+            if is_interrupted and resolution_key in self._transitions:
+                raise ValueError(
+                    "stage transition conflict: interrupted follows resolution"
+                )
+            classified_key = interrupted_key if is_interrupted else resolution_key
+            existing = self._transitions.get(classified_key)
             if existing is not None:
                 existing_event, existing_checkpoint = existing
                 comparable = copy.deepcopy(existing_checkpoint)
@@ -275,7 +286,16 @@ class FakeRunStore:
             )
             key = (checkpoint.run_id, checkpoint.particle_id, checkpoint.iteration_id)
             self.checkpoints.setdefault(key, []).append(stored_checkpoint)
-            self._transitions[transition_key] = (event, copy.deepcopy(stored_checkpoint))
+            self._transitions[classified_key] = (
+                event,
+                copy.deepcopy(stored_checkpoint),
+            )
+            if (
+                not self._transition_interrupted
+                and self.interrupt_after_transition == (event.stage, event.event_type)
+            ):
+                self._transition_interrupted = True
+                raise KeyboardInterrupt("interrupted after committed transition")
 
     def get_latest_stage_checkpoint_json(
         self, run_id: str, particle_id: str, iteration_id: int
@@ -330,10 +350,114 @@ class FakeRunStore:
                     and stored.event.attempt == checkpoint.completed_attempt
                     and stored.event.event_type != "started"
                 ]
-                if len(terminals) != 1 or terminals[0].sequence != sequence:
+                interrupted = [
+                    stored
+                    for stored in terminals
+                    if stored.event.event_type == "interrupted"
+                ]
+                resolutions = [
+                    stored
+                    for stored in terminals
+                    if stored.event.event_type != "interrupted"
+                ]
+                if len(interrupted) > 1 or len(resolutions) > 1:
                     raise ValueError(
-                        "checkpoint stage attempt does not have one terminal event"
+                        "checkpoint stage attempt has duplicate terminal events"
                     )
+                if event.event_type == "interrupted":
+                    if (
+                        len(interrupted) != 1
+                        or interrupted[0].sequence != sequence
+                        or resolutions
+                    ):
+                        raise ValueError(
+                            "interrupted checkpoint is not the unresolved cursor"
+                        )
+                elif (
+                    len(resolutions) != 1
+                    or resolutions[0].sequence != sequence
+                    or (interrupted and interrupted[0].sequence >= sequence)
+                ):
+                    raise ValueError(
+                        "resolution checkpoint has invalid terminal ordering"
+                    )
+                checkpoint_sequences = [
+                    candidate.get("terminal_event_sequence")
+                    for candidate in values
+                ]
+                if any(
+                    checkpoint_sequences.count(stored.sequence) != 1
+                    for stored in terminals
+                ):
+                    raise ValueError(
+                        "checkpoint stage attempt terminal is missing its checkpoint"
+                    )
+                all_terminals = [
+                    stored
+                    for stored in self.stored_events
+                    if stored.event.run_id == checkpoint.run_id
+                    and stored.event.particle_id == checkpoint.particle_id
+                    and stored.event.iteration_id == checkpoint.iteration_id
+                    and stored.event.event_type != "started"
+                ]
+                if set(checkpoint_sequences) != {
+                    stored.sequence for stored in all_terminals
+                } or any(
+                    checkpoint_sequences.count(stored.sequence) != 1
+                    for stored in all_terminals
+                ):
+                    raise ValueError(
+                        "episode terminal events and checkpoints are not paired"
+                    )
+                grouped: dict[
+                    tuple[AgentStage, int], dict[str, int]
+                ] = {}
+                terminal_by_sequence = {
+                    stored.sequence: stored.event for stored in all_terminals
+                }
+                if not terminal_by_sequence or sequence != max(terminal_by_sequence):
+                    raise ValueError(
+                        "latest checkpoint does not reference the latest terminal event"
+                    )
+                for stored in all_terminals:
+                    classification = (
+                        "interrupted"
+                        if stored.event.event_type == "interrupted"
+                        else "resolution"
+                    )
+                    classifications = grouped.setdefault(
+                        (stored.event.stage, stored.event.attempt), {}
+                    )
+                    if classification in classifications:
+                        raise ValueError("episode has duplicate terminal events")
+                    if (
+                        classification == "interrupted"
+                        and "resolution" in classifications
+                    ):
+                        raise ValueError("interrupted terminal follows resolution")
+                    classifications[classification] = stored.sequence
+                for value in values:
+                    candidate = EpisodeCheckpoint.model_validate(value)
+                    candidate_sequence = candidate.terminal_event_sequence
+                    candidate_event = terminal_by_sequence[candidate_sequence]
+                    if (
+                        candidate.run_id,
+                        candidate.particle_id,
+                        candidate.iteration_id,
+                        candidate.completed_stage,
+                        candidate.completed_attempt,
+                        candidate.terminal_event_type,
+                    ) != (
+                        candidate_event.run_id,
+                        candidate_event.particle_id,
+                        candidate_event.iteration_id,
+                        candidate_event.stage,
+                        candidate_event.attempt,
+                        candidate_event.event_type,
+                    ):
+                        raise ValueError(
+                            "stored checkpoint does not match its terminal event"
+                        )
                 if self.run_hashes.get(run) != checkpoint.protocol_snapshot_hash:
                     raise ValueError("checkpoint protocol hash does not match run")
                 value = _canonical_copy(checkpoint.model_dump(mode="json"))
@@ -526,12 +650,13 @@ class FakeResources:
 
 
 class FakeRuntime:
-    def __init__(self, *, resources: FakeResources, invalid_responses: int, cancel_stage: AgentStage | None, payload: Mapping[str, object], close_failure: BaseException | None, stage_exceptions: Mapping[AgentStage, BaseException] | None = None, start_exception: BaseException | None = None, raw_responses: Mapping[AgentStage, str] | None = None, stage_outputs: Mapping[AgentStage, Mapping[str, object]] | None = None, provider_metadata: Mapping[str, object] | None = None) -> None:
+    def __init__(self, *, resources: FakeResources, invalid_responses: int, cancel_stage: AgentStage | None, payload: Mapping[str, object], close_failure: BaseException | None, stage_exceptions: Mapping[AgentStage, BaseException] | None = None, start_exception: BaseException | None = None, raw_responses: Mapping[AgentStage, str] | None = None, stage_outputs: Mapping[AgentStage, Mapping[str, object]] | None = None, provider_metadata: Mapping[str, object] | None = None, restore_thread_override: ThreadRef | None = None) -> None:
         self.resources = resources
         self.invalid_remaining = invalid_responses
         self.cancel_stage = cancel_stage
         self.payload = payload
         self.stages: list[AgentStage] = []
+        self.started_threads: list[str] = []
         self.closed_threads: list[str] = []
         self.restored_threads: list[str] = []
         self.close_attempts: list[str] = []
@@ -541,9 +666,11 @@ class FakeRuntime:
         self.raw_responses = dict(raw_responses or {})
         self.stage_outputs = dict(stage_outputs or {})
         self.provider_metadata = dict(provider_metadata or {})
+        self.restore_thread_override = restore_thread_override
 
     async def start_thread(self, particle_id: str, workspace: Path) -> ThreadRef:
         assert self.resources.agent_active
+        self.started_threads.append(particle_id)
         if self.start_exception is not None:
             raise self.start_exception
         return ThreadRef(f"thread-{particle_id}", particle_id, 0, workspace)
@@ -551,6 +678,8 @@ class FakeRuntime:
     async def restore_thread(self, particle_id: str, workspace: Path, checkpoint: Mapping[str, object]) -> ThreadRef:
         assert self.resources.agent_active
         self.restored_threads.append(particle_id)
+        if self.restore_thread_override is not None:
+            return self.restore_thread_override
         return ThreadRef(f"thread-{particle_id}", particle_id, 0, workspace)
 
     async def run_stage(self, thread: ThreadRef, request: StageRequest) -> StageResponse:
@@ -604,9 +733,11 @@ class FakeAdapter:
         realized_value: object | None = None,
         evaluated_value: object | None = None,
         adherence_value: Mapping[str, object] | None = None,
+        candidate_exception: BaseException | None = None,
     ) -> None:
         self.contexts: dict[AgentStage, list[dict[str, object]]] = {stage: [] for stage in AgentStage}
         self.candidate_failure = candidate_failure
+        self.candidate_exception = candidate_exception
         self.mutate_context = mutate_context
         self.request_stage_override = request_stage_override
         self.invalid_stage_request = invalid_stage_request
@@ -639,6 +770,8 @@ class FakeAdapter:
         return value
 
     def candidate_from_tool_result(self, result: ToolResult, context: ToolContext) -> CandidateRef:
+        if self.candidate_exception is not None:
+            raise self.candidate_exception
         if self.candidate_failure:
             raise ValueError("fake candidate failure")
         metadata = result.payload if self.candidate_metadata is None else self.candidate_metadata
@@ -665,17 +798,18 @@ class FakeAdapter:
 
 
 class FakeTool:
-    def __init__(self, status: ToolStatus = ToolStatus.SUCCESS, exception: BaseException | None = None, payload: Mapping[str, object] | None = None) -> None:
+    def __init__(self, status: ToolStatus = ToolStatus.SUCCESS, exception: BaseException | None = None, payload: Mapping[str, object] | None = None, artifacts: tuple[ArtifactRef, ...] = ()) -> None:
         self.executed_keys: list[str] = []
         self.status = status
         self.exception = exception
         self.payload = dict(payload or {"tool": "ok"})
+        self.artifacts = artifacts
 
     async def execute(self, request: ToolRequest, context: ToolContext) -> ToolResult:
         self.executed_keys.append(request.idempotency_key)
         if self.exception is not None:
             raise self.exception
-        return ToolResult(self.status, self.payload, error="fake tool failure" if self.status is not ToolStatus.SUCCESS else None)
+        return ToolResult(self.status, self.payload, self.artifacts, error="fake tool failure" if self.status is not ToolStatus.SUCCESS else None)
 
 
 class FakeArtifactStore:
@@ -706,9 +840,11 @@ class FakeEvaluator:
         self.status = status
         self.exception = exception
         self.metrics = dict(metrics or {})
+        self.calls = 0
 
     async def evaluate(self, candidate: CandidateRef, context: EvaluationContext) -> Evaluation:
         assert self.resources.evaluation_active
+        self.calls += 1
         if self.exception is not None:
             raise self.exception
         if self.status is EvaluationStatus.SUCCESS:
@@ -750,6 +886,10 @@ def make_fake_dependencies(
     realized_value: object | None = None,
     evaluated_value: object | None = None,
     adherence_value: Mapping[str, object] | None = None,
+    interrupt_after_transition: tuple[AgentStage, str] | None = None,
+    restore_thread_override: ThreadRef | None = None,
+    tool_artifacts: tuple[ArtifactRef, ...] = (),
+    candidate_exception: BaseException | None = None,
 ) -> dict[str, object]:
     workspace = (tmp_path / "workspace").resolve()
     workspace.mkdir()
@@ -759,7 +899,7 @@ def make_fake_dependencies(
     cached = ToolResult(ToolStatus.SUCCESS, {"tool": "cached"}) if cached_tool_result else None
     resources = FakeResources()
     return {
-        "runtime": FakeRuntime(resources=resources, invalid_responses=invalid_responses, cancel_stage=cancel_stage, payload=payload, close_failure=close_failure, stage_exceptions=stage_exceptions, start_exception=start_exception, raw_responses=raw_responses, stage_outputs=stage_outputs, provider_metadata=provider_metadata),
+        "runtime": FakeRuntime(resources=resources, invalid_responses=invalid_responses, cancel_stage=cancel_stage, payload=payload, close_failure=close_failure, stage_exceptions=stage_exceptions, start_exception=start_exception, raw_responses=raw_responses, stage_outputs=stage_outputs, provider_metadata=provider_metadata, restore_thread_override=restore_thread_override),
         "task_adapter": FakeAdapter(
             candidate_failure,
             mutate_context,
@@ -771,9 +911,10 @@ def make_fake_dependencies(
             realized_value,
             evaluated_value,
             adherence_value,
+            candidate_exception,
         ),
         "evaluator": FakeEvaluator(resources, evaluator_status, evaluator_exception, evaluation_metrics),
-        "tool_provider": FakeTool(tool_status, tool_exception, tool_payload),
+        "tool_provider": FakeTool(tool_status, tool_exception, tool_payload, tool_artifacts),
         "artifact_store": FakeArtifactStore(),
         "resource_manager": resources,
         "run_store": FakeRunStore(
@@ -783,6 +924,7 @@ def make_fake_dependencies(
             audit_failure_event_type=audit_failure_event_type,
             audit_failure_nth=audit_failure_nth,
             audit_failure_persistent=audit_failure_persistent,
+            interrupt_after_transition=interrupt_after_transition,
         ),
         "target_position": {"x": 1},
         "workspace": workspace,
