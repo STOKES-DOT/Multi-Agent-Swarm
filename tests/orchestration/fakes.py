@@ -9,7 +9,7 @@ import json
 import math
 import threading
 from collections.abc import Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -28,6 +28,7 @@ from multi_agent_pso.core import (
 from multi_agent_pso.protocols import (
     AgentRuntime,
     CandidateRef,
+    EpisodeClaimConflict,
     EvaluationContext,
     ResourceManager,
     StageRequest,
@@ -146,6 +147,7 @@ class FakeRunStore:
         self._transitions: dict[tuple[object, ...], tuple[StageEvent, dict[str, JsonValue]]] = {}
         self._next_event_sequence = 1
         self._lock = threading.RLock()
+        self._episode_claims: dict[tuple[str, str, int], threading.Lock] = {}
         self.audit_failure = audit_failure
         self.audit_failure_stage = audit_failure_stage
         self.audit_failure_event_type = audit_failure_event_type
@@ -154,6 +156,22 @@ class FakeRunStore:
         self._matching_append_attempts = 0
         self.interrupt_after_transition = interrupt_after_transition
         self._transition_interrupted = False
+
+    @contextmanager
+    def episode_claim(self, run_id: str, particle_id: str, iteration_id: int):
+        key = (
+            _require_identifier(run_id, "run_id"),
+            _require_identifier(particle_id, "particle_id"),
+            _require_iteration(iteration_id),
+        )
+        with self._lock:
+            claim = self._episode_claims.setdefault(key, threading.Lock())
+        if not claim.acquire(blocking=False):
+            raise EpisodeClaimConflict("particle episode is already claimed")
+        try:
+            yield
+        finally:
+            claim.release()
 
     def append_stage_event(self, event: StageEvent) -> None:
         if not isinstance(event, StageEvent):

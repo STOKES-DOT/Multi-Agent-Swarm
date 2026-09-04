@@ -25,6 +25,7 @@ from multi_agent_pso.orchestration import (
 import multi_agent_pso.orchestration.agent_loop as agent_loop_module
 from multi_agent_pso.protocols import (
     ArtifactIntegrityError,
+    EpisodeClaimConflict,
     StageResponse,
     ThreadRef,
     TokenUsage,
@@ -1940,6 +1941,245 @@ async def test_resume_reports_invalid_terminal_episode_fields_as_incompatible(tm
         await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
 
     assert dependencies["runtime"].restored_threads == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_resume_has_single_cross_worker_claim(tmp_path):
+    dependencies = make_fake_dependencies(
+        tmp_path, cancel_stage=AgentStage.HYPOTHESIZING
+    )
+    loop = AgentLoop(**dependencies)
+    with pytest.raises(asyncio.CancelledError):
+        await loop.run_particle("run-1", "p0", 0)
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json(
+            "run-1", "p0", 0
+        )
+    )
+    runtime = dependencies["runtime"]
+    runtime.cancel_stage = None
+    original_run_stage = runtime.run_stage
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_run_stage(thread, request):
+        entered.set()
+        await release.wait()
+        return await original_run_stage(thread, request)
+
+    runtime.run_stage = blocked_run_stage
+    first = asyncio.create_task(
+        loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+    )
+    await entered.wait()
+    with pytest.raises(EpisodeClaimConflict):
+        await asyncio.wait_for(
+            loop.run_particle("run-1", "p0", 0, resume=checkpoint), 1
+        )
+    release.set()
+    episode = await first
+
+    assert episode.status is EpisodeStatus.COMPLETED
+    assert runtime.restored_threads == ["p0"]
+    assert dependencies["evaluator"].calls == 1
+    hypothesis_started = [
+        event
+        for event in dependencies["run_store"].events
+        if event.stage is AgentStage.HYPOTHESIZING
+        and event.event_type == "started"
+    ]
+    assert len(hypothesis_started) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "completed_stage",
+    [
+        AgentStage.EXECUTING,
+        AgentStage.EVALUATING,
+        AgentStage.REFLECTING,
+        AgentStage.COMPLETED,
+    ],
+)
+@pytest.mark.parametrize("cache_corruption", ["missing", "different"])
+async def test_resume_requires_authoritative_committed_tool_result(
+    tmp_path, completed_stage, cache_corruption
+):
+    kwargs = (
+        {}
+        if completed_stage is AgentStage.COMPLETED
+        else {"interrupt_after_transition": (completed_stage, "completed")}
+    )
+    dependencies = make_fake_dependencies(tmp_path, **kwargs)
+    loop = AgentLoop(**dependencies)
+    if completed_stage is AgentStage.COMPLETED:
+        await loop.run_particle("run-1", "p0", 0)
+    else:
+        with pytest.raises(KeyboardInterrupt):
+            await loop.run_particle("run-1", "p0", 0)
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json(
+            "run-1", "p0", 0
+        )
+    )
+    store = dependencies["run_store"]
+    key = next(iter(store.recorded))
+    if cache_corruption == "missing":
+        store.recorded.clear()
+    else:
+        store.recorded[key] = ToolResult(ToolStatus.SUCCESS, {"different": True})
+    before = (
+        len(dependencies["runtime"].restored_threads),
+        dependencies["evaluator"].calls,
+        len(store.append_attempts),
+    )
+
+    with pytest.raises(IncompatibleCheckpointError, match="tool result"):
+        await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert (
+        len(dependencies["runtime"].restored_threads),
+        dependencies["evaluator"].calls,
+        len(store.append_attempts),
+    ) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("generation", "0"),
+        ("workspace", "relative"),
+        ("particle_id", "other"),
+        ("provider_id", 7),
+        ("extra", "unexpected"),
+    ],
+)
+async def test_resume_strictly_hydrates_thread_ref_before_restore(
+    tmp_path, field, value
+):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        interrupt_after_transition=(AgentStage.PROPOSING_ACTION, "completed"),
+    )
+    loop = AgentLoop(**dependencies)
+    with pytest.raises(KeyboardInterrupt):
+        await loop.run_particle("run-1", "p0", 0)
+    store = dependencies["run_store"]
+    store.checkpoints[("run-1", "p0", 0)][-1]["thread_json"][field] = value
+    checkpoint = EpisodeCheckpoint.model_validate(
+        store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    )
+
+    with pytest.raises(IncompatibleCheckpointError, match="thread"):
+        await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert dependencies["runtime"].restored_threads == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tamper", ["candidate", "evaluation", "reference", "references_missing"]
+)
+async def test_resume_cross_validates_checkpoint_context_with_stage_evidence(
+    tmp_path, tamper
+):
+    completed_stage = {
+        "candidate": AgentStage.EXECUTING,
+        "evaluation": AgentStage.EVALUATING,
+        "reference": AgentStage.COMPLETED,
+        "references_missing": AgentStage.COMPLETED,
+    }[tamper]
+    kwargs = (
+        {}
+        if completed_stage is AgentStage.COMPLETED
+        else {"interrupt_after_transition": (completed_stage, "completed")}
+    )
+    dependencies = make_fake_dependencies(tmp_path, **kwargs)
+    loop = AgentLoop(**dependencies)
+    if completed_stage is AgentStage.COMPLETED:
+        await loop.run_particle("run-1", "p0", 0)
+    else:
+        with pytest.raises(KeyboardInterrupt):
+            await loop.run_particle("run-1", "p0", 0)
+    store = dependencies["run_store"]
+    context = store.checkpoints[("run-1", "p0", 0)][-1]["context"]
+    if tamper == "candidate":
+        context["candidate"]["reference"] = "tampered-candidate"
+    elif tamper == "evaluation":
+        context["evaluation"]["fitness"] = 9.5
+    else:
+        context["candidate_reference"] = "tampered-candidate"
+    if tamper == "references_missing":
+        for key in (
+            "candidate_reference",
+            "candidate_hash",
+            "hypothesis_reference",
+            "evaluation_reference",
+        ):
+            context[key] = None
+    checkpoint = EpisodeCheckpoint.model_validate(
+        store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    )
+
+    with pytest.raises(IncompatibleCheckpointError, match="evidence|reference"):
+        await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert dependencies["runtime"].restored_threads == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("evaluation_status", "episode_status"),
+    [
+        (EvaluationStatus.INVALID, EpisodeStatus.INVALID),
+        (EvaluationStatus.FAILED, EpisodeStatus.FAILED),
+        (EvaluationStatus.TIMEOUT, EpisodeStatus.TIMEOUT),
+    ],
+)
+async def test_resume_non_success_completed_interruption_preserves_outcome(
+    tmp_path, evaluation_status, episode_status
+):
+    dependencies = make_fake_dependencies(
+        tmp_path, evaluator_status=evaluation_status
+    )
+    runtime = dependencies["runtime"]
+    normal_close = runtime.close_thread
+    close_started = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def cancellable_close(thread):
+        runtime.close_attempts.append(thread.logical_id)
+        close_started.set()
+        await never_finish.wait()
+
+    runtime.close_thread = cancellable_close
+    loop = AgentLoop(**dependencies)
+    task = asyncio.create_task(loop.run_particle("run-1", "p0", 0))
+    await close_started.wait()
+    task.cancel("interrupt non-success finalization")
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json(
+            "run-1", "p0", 0
+        )
+    )
+    runtime.close_thread = normal_close
+    runtime.stages.clear()
+
+    episode = await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert episode.status is episode_status
+    assert episode.evaluation is not None
+    assert episode.evaluation.status is evaluation_status
+    assert runtime.stages == []
+    assert dependencies["evaluator"].calls == 1
+    assert [
+        event.event_type
+        for event in episode.events
+        if event.stage is AgentStage.COMPLETED
+    ] == ["interrupted", "completed"]
 
 
 @pytest.mark.asyncio

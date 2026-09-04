@@ -3,19 +3,27 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import sqlite3
 import stat
+import threading
 import time
 from collections.abc import Mapping
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Self
+from typing import Iterator, Self
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - fail-closed platform branch
+    fcntl = None  # type: ignore[assignment]
 
 from pydantic import JsonValue
 
 from multi_agent_pso.core import ArtifactRef, EpisodeCheckpoint, StageEvent, StoredStageEvent
-from multi_agent_pso.protocols import ToolResult, ToolStatus
+from multi_agent_pso.protocols import EpisodeClaimConflict, ToolResult, ToolStatus
 
 
 def _require_path(value: object) -> Path:
@@ -151,6 +159,8 @@ def _expected_schema_fingerprint() -> dict[str, str]:
 _EXPECTED_SCHEMA_FINGERPRINT = _expected_schema_fingerprint()
 _WAL_LOCK_TIMEOUT_SECONDS = 5.0
 _WAL_MAX_ATTEMPTS = 64
+_CLAIM_THREAD_GUARD = threading.Lock()
+_CLAIM_THREAD_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 
 
 class SQLiteRunStore:
@@ -158,6 +168,7 @@ class SQLiteRunStore:
 
     def __init__(self, database_path: Path) -> None:
         self._path = _require_path(database_path)
+        self._claim_directory = self._path.with_name(f".{self._path.name}.episode-locks")
         created = self._prepare_database_file()
         if not created:
             self._validate_existing_database_read_only()
@@ -181,6 +192,68 @@ class SQLiteRunStore:
         finally:
             connection.close()
             self._secure_database_files(suppress_errors=True)
+
+    @contextmanager
+    def episode_claim(
+        self, run_id: str, particle_id: str, iteration_id: int
+    ) -> Iterator[None]:
+        run = _require_identifier(run_id, "run_id")
+        particle = _require_identifier(particle_id, "particle_id")
+        iteration = _require_iteration(iteration_id)
+        if fcntl is None or not all(
+            hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW")
+        ):
+            raise RuntimeError("episode claims require POSIX file locking")
+        key_json = _canonical_json([run, particle, iteration])
+        digest = hashlib.sha256(key_json.encode("utf-8")).hexdigest()
+        registry_key = (str(self._path), digest)
+        with _CLAIM_THREAD_GUARD:
+            thread_lock = _CLAIM_THREAD_LOCKS.setdefault(
+                registry_key, threading.Lock()
+            )
+        if not thread_lock.acquire(blocking=False):
+            raise EpisodeClaimConflict("particle episode is already claimed")
+        directory_fd: int | None = None
+        lock_fd: int | None = None
+        try:
+            try:
+                self._claim_directory.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            directory_fd = os.open(
+                self._claim_directory,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            directory_metadata = os.fstat(directory_fd)
+            if not stat.S_ISDIR(directory_metadata.st_mode):
+                raise RuntimeError("episode claim directory is not a safe directory")
+            os.fchmod(directory_fd, 0o700)
+            lock_fd = os.open(
+                f"{digest}.lock",
+                os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            lock_metadata = os.fstat(lock_fd)
+            if not stat.S_ISREG(lock_metadata.st_mode):
+                raise RuntimeError("episode claim path is not a regular file")
+            os.fchmod(lock_fd, 0o600)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise EpisodeClaimConflict(
+                    "particle episode is already claimed"
+                ) from error
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+            if directory_fd is not None:
+                os.close(directory_fd)
+            thread_lock.release()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._path)

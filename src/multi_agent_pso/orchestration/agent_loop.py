@@ -314,6 +314,18 @@ class AgentLoop:
             raise ValueError("iteration_id must be a nonnegative integer")
         if resume is not None and not isinstance(resume, EpisodeCheckpoint):
             raise IncompatibleCheckpointError("resume must be an EpisodeCheckpoint")
+        with self._store.episode_claim(run_id, particle_id, iteration_id):
+            return await self._run_claimed_particle(
+                run_id, particle_id, iteration_id, resume
+            )
+
+    async def _run_claimed_particle(
+        self,
+        run_id: str,
+        particle_id: str,
+        iteration_id: int,
+        resume: EpisodeCheckpoint | None,
+    ) -> AgentEpisode:
         resume_context: dict[str, JsonValue] | None = None
         resume_events: list[StageEvent] = []
         stored_hash = self._store.get_run_snapshot_hash(run_id)
@@ -424,6 +436,30 @@ class AgentLoop:
                     raise AssertionError("resume cursor must be nonterminal")
 
             start_index = _STAGE_ORDER.index(start_stage)
+            if self._is_non_success_finalization(resume, context):
+                (
+                    resumed_status,
+                    resumed_evaluation,
+                    _,
+                    realized,
+                    evaluated,
+                    adherence,
+                    _,
+                ) = self._terminal_fields_from_context(context)
+                current_stage = AgentStage.COMPLETED
+                return await self._finish_episode(
+                    owner,
+                    run_id,
+                    particle_id,
+                    iteration_id,
+                    events,
+                    resumed_status,
+                    resumed_evaluation,
+                    evaluated,
+                    realized,
+                    adherence,
+                    context,
+                )
             if start_index > _STAGE_ORDER.index(AgentStage.PROPOSING_ACTION):
                 proposal = self._require_mapping(context, "proposal")
             if start_index > _STAGE_ORDER.index(AgentStage.EXECUTING):
@@ -925,7 +961,7 @@ class AgentLoop:
                 raise IncompatibleCheckpointError(
                     "checkpoint context must be a JSON object"
                 )
-            self._validate_resume_context(latest, context_value)
+            self._validate_resume_context(latest, context_value, events)
         except ArtifactIntegrityError:
             raise
         except IncompatibleCheckpointError:
@@ -948,7 +984,6 @@ class AgentLoop:
         selected: StageEvent | None = None
         restored: list[StageEvent] = []
         latest_terminal_sequence = 0
-        completed_stages: set[AgentStage] = set()
         for stored in stored_events:
             sequence = getattr(stored, "sequence", None)
             event = getattr(stored, "event", None)
@@ -1001,8 +1036,6 @@ class AgentLoop:
                 )
             classified[classification] = sequence
             latest_terminal_sequence = sequence
-            if event.event_type == "completed":
-                completed_stages.add(event.stage)
             if sequence == checkpoint.terminal_event_sequence:
                 selected = event
             if event.stage is not AgentStage.PENDING:
@@ -1029,20 +1062,13 @@ class AgentLoop:
             raise IncompatibleCheckpointError(
                 "checkpoint terminal event does not match its sequence"
             )
-        if checkpoint.next_stage is not None:
-            cursor_index = _STAGE_ORDER.index(checkpoint.next_stage)
-            required_prefix = {
-                AgentStage.PENDING,
-                *_STAGE_ORDER[:cursor_index],
-            }
-            if not required_prefix.issubset(completed_stages):
-                raise IncompatibleCheckpointError(
-                    "checkpoint is missing a completed stage prefix"
-                )
         return restored
 
     def _validate_resume_context(
-        self, checkpoint: EpisodeCheckpoint, context: dict[str, JsonValue]
+        self,
+        checkpoint: EpisodeCheckpoint,
+        context: dict[str, JsonValue],
+        events: list[StageEvent],
     ) -> None:
         required_identity = {
             "run_id": checkpoint.run_id,
@@ -1058,10 +1084,42 @@ class AgentLoop:
             raise IncompatibleCheckpointError(
                 "checkpoint target position is incompatible"
             )
-        if "tool_result" in context:
-            self._verify_tool_result_artifacts(
-                self._tool_result_from_context(context)
+        requires_tool_result = any(
+            event.stage is AgentStage.EXECUTING
+            and event.event_type == "completed"
+            for event in events
+        ) or any(
+            event.stage is AgentStage.EXECUTING
+            and "tool_result" in event.payload
+            for event in events
+        )
+        if checkpoint.next_stage is not None:
+            requires_tool_result = requires_tool_result or (
+                _STAGE_ORDER.index(checkpoint.next_stage)
+                > _STAGE_ORDER.index(AgentStage.EXECUTING)
             )
+        if requires_tool_result and "tool_result" not in context:
+            raise IncompatibleCheckpointError(
+                "checkpoint is missing its authoritative tool result"
+            )
+        if "tool_result" in context:
+            context_result = self._tool_result_from_context(context)
+            tool_key = self._identity(
+                "tool",
+                checkpoint.run_id,
+                checkpoint.particle_id,
+                checkpoint.iteration_id,
+                AgentStage.EXECUTING.value,
+            )
+            committed_result = self._store.get_committed_tool_result(tool_key)
+            if committed_result is None or self._canonical_json(
+                committed_result.to_json()
+            ) != self._canonical_json(context_result.to_json()):
+                raise IncompatibleCheckpointError(
+                    "checkpoint tool result does not match committed tool result"
+                )
+            self._verify_tool_result_artifacts(committed_result)
+        self._validate_context_evidence(checkpoint, context, events)
         if checkpoint.next_stage is None:
             self._terminal_fields_from_context(context)
             return
@@ -1069,7 +1127,10 @@ class AgentLoop:
             raise IncompatibleCheckpointError(
                 "resumable checkpoint is missing thread identity"
             )
-        self._thread_identity(checkpoint.thread_json)
+        self._hydrate_checkpoint_thread(checkpoint.thread_json, checkpoint.particle_id)
+        if self._is_non_success_finalization(checkpoint, context):
+            self._terminal_fields_from_context(context)
+            return
         stage_index = _STAGE_ORDER.index(checkpoint.next_stage)
         if checkpoint.next_attempt:
             self._require_mapping(context, "correction")
@@ -1093,6 +1154,246 @@ class AgentLoop:
                 raise IncompatibleCheckpointError(
                     "completed evaluation boundary is not successful"
                 )
+
+    def _validate_context_evidence(
+        self,
+        checkpoint: EpisodeCheckpoint,
+        context: Mapping[str, JsonValue],
+        events: list[StageEvent],
+    ) -> None:
+        completed_indices: list[int] = []
+        completed_stages: set[AgentStage] = set()
+        for event in events:
+            if event.event_type != "completed" or event.stage is AgentStage.COMPLETED:
+                continue
+            index = _STAGE_ORDER.index(event.stage)
+            if event.stage in completed_stages:
+                raise IncompatibleCheckpointError(
+                    "stage evidence has duplicate completed resolutions"
+                )
+            completed_stages.add(event.stage)
+            completed_indices.append(index)
+        if completed_indices and completed_indices != list(
+            range(max(completed_indices) + 1)
+        ):
+            raise IncompatibleCheckpointError(
+                "stage evidence does not form an ordered completed prefix"
+            )
+
+        non_success_finalization = self._is_non_success_finalization(
+            checkpoint, context
+        )
+        if checkpoint.next_stage is not None and not non_success_finalization:
+            cursor_index = _STAGE_ORDER.index(checkpoint.next_stage)
+            required = set(_STAGE_ORDER[:cursor_index])
+            if not required.issubset(completed_stages):
+                raise IncompatibleCheckpointError(
+                    "stage evidence is missing a completed prefix"
+                )
+
+        evidence_keys = {
+            "hypothesis": "output",
+            "proposal": "output",
+            "tool_request": "tool_request",
+            "tool_result": "tool_result",
+            "candidate": "candidate",
+            "realized_position": "realized_position",
+            "evaluated_position": "evaluated_position",
+            "adherence": "adherence",
+            "evaluation": "evaluation",
+            "reflection": "output",
+        }
+        evidence_stages = {
+            "hypothesis": AgentStage.HYPOTHESIZING,
+            "proposal": AgentStage.PROPOSING_ACTION,
+            "tool_request": AgentStage.EXECUTING,
+            "tool_result": AgentStage.EXECUTING,
+            "candidate": AgentStage.EXECUTING,
+            "realized_position": AgentStage.EXECUTING,
+            "evaluated_position": AgentStage.EXECUTING,
+            "adherence": AgentStage.EXECUTING,
+            "evaluation": AgentStage.EVALUATING,
+            "reflection": AgentStage.REFLECTING,
+        }
+        for context_key, payload_key in evidence_keys.items():
+            if context_key not in context:
+                continue
+            matching = [
+                event
+                for event in events
+                if event.stage is evidence_stages[context_key]
+                and event.event_type != "interrupted"
+                and payload_key in event.payload
+            ]
+            if not matching and self._matches_interrupted_execution_authority(
+                checkpoint, context_key, context
+            ):
+                continue
+            if not matching and self._matches_terminal_default(
+                context_key, context
+            ):
+                continue
+            if not matching or matching[-1].payload.get("truncated") is True:
+                raise IncompatibleCheckpointError(
+                    f"checkpoint {context_key} has no trustworthy stage evidence"
+                )
+            if self._canonical_json(context[context_key]) != self._canonical_json(
+                matching[-1].payload[payload_key]
+            ):
+                raise IncompatibleCheckpointError(
+                    f"checkpoint {context_key} differs from stage evidence"
+                )
+
+        reference_keys = (
+            "candidate_reference",
+            "candidate_hash",
+            "hypothesis_reference",
+            "evaluation_reference",
+        )
+        if any(key in context for key in reference_keys):
+            if not all(key in context for key in reference_keys):
+                raise IncompatibleCheckpointError(
+                    "checkpoint episode references are incomplete"
+                )
+            references = tuple(context[key] for key in reference_keys)
+            completed_episode = (
+                context.get("episode_status") == EpisodeStatus.COMPLETED.value
+            )
+            if completed_episode and not all(
+                isinstance(value, str) and value for value in references
+            ):
+                raise IncompatibleCheckpointError(
+                    "completed checkpoint episode references are missing"
+                )
+            if not completed_episode and any(
+                value is not None for value in references
+            ):
+                raise IncompatibleCheckpointError(
+                    "non-success checkpoint must not contain best references"
+                )
+            if completed_episode:
+                candidate = self._candidate_from_context(context)
+                expected = (
+                    candidate.reference,
+                    candidate.candidate_hash,
+                    self._identity(
+                        "hypothesis",
+                        checkpoint.run_id,
+                        checkpoint.particle_id,
+                        checkpoint.iteration_id,
+                    ),
+                    self._identity(
+                        "evaluation",
+                        checkpoint.run_id,
+                        checkpoint.particle_id,
+                        checkpoint.iteration_id,
+                    ),
+                )
+                if references != expected:
+                    raise IncompatibleCheckpointError(
+                        "checkpoint episode references are incompatible"
+                    )
+
+    def _matches_interrupted_execution_authority(
+        self,
+        checkpoint: EpisodeCheckpoint,
+        key: str,
+        context: Mapping[str, JsonValue],
+    ) -> bool:
+        if not (
+            checkpoint.completed_stage is AgentStage.EXECUTING
+            and checkpoint.terminal_event_type == "interrupted"
+            and key in {"tool_request", "tool_result"}
+        ):
+            return False
+        if key == "tool_result":
+            return True
+        try:
+            proposal = self._require_mapping(context, "proposal")
+            provider = proposal["provider"]
+            operation = proposal["operation"]
+            payload = proposal["tool_payload"]
+            if (
+                not isinstance(provider, str)
+                or not provider
+                or not isinstance(operation, str)
+                or not operation
+                or not isinstance(payload, Mapping)
+            ):
+                return False
+            expected = ToolRequest(
+                self._identity(
+                    "request",
+                    checkpoint.run_id,
+                    checkpoint.particle_id,
+                    checkpoint.iteration_id,
+                    provider,
+                    operation,
+                ),
+                provider,
+                operation,
+                payload,
+                self._identity(
+                    "tool",
+                    checkpoint.run_id,
+                    checkpoint.particle_id,
+                    checkpoint.iteration_id,
+                    AgentStage.EXECUTING.value,
+                ),
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+        return self._canonical_json(context[key]) == self._canonical_json(
+            expected.to_json()
+        )
+
+    @staticmethod
+    def _is_non_success_finalization(
+        checkpoint: EpisodeCheckpoint | None,
+        context: Mapping[str, JsonValue],
+    ) -> bool:
+        return (
+            checkpoint is not None
+            and checkpoint.completed_stage is AgentStage.COMPLETED
+            and checkpoint.terminal_event_type == "interrupted"
+            and checkpoint.next_stage is AgentStage.COMPLETED
+            and context.get("episode_status")
+            in {
+                EpisodeStatus.INVALID.value,
+                EpisodeStatus.FAILED.value,
+                EpisodeStatus.TIMEOUT.value,
+            }
+        )
+
+    def _matches_terminal_default(
+        self, key: str, context: Mapping[str, JsonValue]
+    ) -> bool:
+        if key == "evaluation":
+            try:
+                status = EpisodeStatus(context["episode_status"])
+                expected_status = {
+                    EpisodeStatus.INVALID: EvaluationStatus.INVALID,
+                    EpisodeStatus.FAILED: EvaluationStatus.FAILED,
+                    EpisodeStatus.TIMEOUT: EvaluationStatus.TIMEOUT,
+                }[status]
+                expected = Evaluation(status=expected_status, feasible=False)
+                actual = Evaluation.model_validate(context[key])
+            except (KeyError, TypeError, ValueError):
+                return False
+            return self._canonical_json(
+                actual.model_dump(mode="json")
+            ) == self._canonical_json(expected.model_dump(mode="json"))
+        if "candidate" in context:
+            return False
+        if key == "realized_position":
+            return context[key] is None
+        if key == "evaluated_position":
+            return self._canonical_json(context[key]) == self._canonical_json(
+                self._target
+            )
+        if key == "adherence":
+            return self._canonical_json(context[key]) == "{}"
+        return False
 
     def _rebuild_terminal_episode(
         self,
@@ -1241,33 +1542,50 @@ class AgentLoop:
             raise IncompatibleCheckpointError(
                 "runtime restored an invalid thread reference"
             )
-        expected = self._thread_identity(checkpoint.thread_json)
-        actual = self._thread_identity(thread.to_json())
-        if (
-            thread.particle_id != particle_id
-            or thread.workspace != self._workspace
-            or actual != expected
-        ):
+        expected = self._hydrate_checkpoint_thread(
+            checkpoint.thread_json, particle_id
+        )
+        if thread != expected:
             raise IncompatibleCheckpointError(
                 "runtime restored a mismatched thread reference"
             )
 
-    @staticmethod
-    def _thread_identity(value: object) -> tuple[object, ...]:
+    def _hydrate_checkpoint_thread(
+        self, value: object, particle_id: str
+    ) -> ThreadRef:
         if not isinstance(value, Mapping):
             raise IncompatibleCheckpointError("checkpoint thread identity is invalid")
+        expected_keys = {
+            "logical_id",
+            "particle_id",
+            "generation",
+            "workspace",
+            "provider_id",
+        }
+        if set(value) != expected_keys:
+            raise IncompatibleCheckpointError(
+                "checkpoint thread identity has missing or extra fields"
+            )
         try:
-            return (
+            workspace_value = value["workspace"]
+            if not isinstance(workspace_value, str):
+                raise TypeError("thread workspace must be a string")
+            thread = ThreadRef(
                 value["logical_id"],
                 value["particle_id"],
                 value["generation"],
-                value["workspace"],
+                Path(workspace_value),
                 value.get("provider_id"),
             )
-        except KeyError as error:
+        except (KeyError, TypeError, ValueError) as error:
             raise IncompatibleCheckpointError(
-                "checkpoint thread identity is incomplete"
+                "checkpoint thread identity is invalid"
             ) from error
+        if thread.particle_id != particle_id or thread.workspace != self._workspace:
+            raise IncompatibleCheckpointError(
+                "checkpoint thread identity does not match the episode"
+            )
+        return thread
 
     def _require_json(
         self, context: Mapping[str, JsonValue], key: str
@@ -1291,7 +1609,7 @@ class AgentLoop:
     @staticmethod
     def _canonical_json(value: object) -> str:
         return json.dumps(
-            value,
+            _bounded_json_copy(value, boundary="canonical comparison"),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),

@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import os
+import multiprocessing
+import stat
 import threading
 from pathlib import Path
 
@@ -18,7 +20,7 @@ from multi_agent_pso.core import (
     StoredStageEvent,
 )
 from multi_agent_pso.protocols import ToolResult, ToolStatus
-from multi_agent_pso.storage import SQLiteRunStore
+from multi_agent_pso.storage import EpisodeClaimConflict, SQLiteRunStore
 from multi_agent_pso.storage.sqlite_store import _SCHEMA
 import multi_agent_pso.storage.sqlite_store as sqlite_store_module
 
@@ -61,6 +63,67 @@ def _checkpoint(
         ),
         protocol_snapshot_hash=protocol_hash,
     )
+
+
+def _hold_episode_claim(database_path: str, ready, release, crash: bool) -> None:
+    store = SQLiteRunStore(Path(database_path))
+    with store.episode_claim("run-1", "p0", 0):
+        ready.set()
+        if crash:
+            os._exit(0)
+        release.wait(10)
+
+
+def test_episode_claim_conflicts_across_store_instances_and_releases(tmp_path: Path) -> None:
+    path = tmp_path / "runs.sqlite"
+    first = SQLiteRunStore(path)
+    second = SQLiteRunStore(path)
+
+    with first.episode_claim("run-1", "p0", 0):
+        with pytest.raises(EpisodeClaimConflict):
+            with second.episode_claim("run-1", "p0", 0):
+                pass
+    with second.episode_claim("run-1", "p0", 0):
+        pass
+    lock_directory = path.with_name(f".{path.name}.episode-locks")
+    assert stat.S_IMODE(lock_directory.stat().st_mode) == 0o700
+    lock_files = tuple(lock_directory.iterdir())
+    assert len(lock_files) == 1
+    assert lock_files[0].name.endswith(".lock")
+    assert "run-1" not in lock_files[0].name
+    assert stat.S_IMODE(lock_files[0].stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("crash", [False, True])
+def test_episode_claim_is_cross_process_and_crash_released(
+    tmp_path: Path, crash: bool
+) -> None:
+    path = tmp_path / "runs.sqlite"
+    SQLiteRunStore(path)
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    process = context.Process(
+        target=_hold_episode_claim,
+        args=(str(path), ready, release, crash),
+    )
+    process.start()
+    assert ready.wait(10)
+    store = SQLiteRunStore(path)
+    if crash:
+        process.join(10)
+        assert process.exitcode == 0
+        with store.episode_claim("run-1", "p0", 0):
+            pass
+    else:
+        with pytest.raises(EpisodeClaimConflict):
+            with store.episode_claim("run-1", "p0", 0):
+                pass
+        release.set()
+        process.join(10)
+        assert process.exitcode == 0
+        with store.episode_claim("run-1", "p0", 0):
+            pass
 
 
 def test_iteration_transaction_rolls_back_all_state(tmp_path: Path) -> None:

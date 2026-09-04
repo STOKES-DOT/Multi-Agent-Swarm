@@ -21,6 +21,10 @@ class ArtifactIntegrityError(RuntimeError):
     """A committed artifact reference does not match immutable storage."""
 
 
+class EpisodeClaimConflict(RuntimeError):
+    """Another worker already owns the requested particle episode."""
+
+
 @runtime_checkable
 class IterationTransaction(Protocol):
     """The explicit, synchronous state writes belonging to one iteration."""
@@ -43,6 +47,10 @@ class RunStore(Protocol):
     """Append-only run persistence plus explicit iteration transactions."""
 
     def create_run(self, run_id: str, snapshot_hash: str) -> None: ...
+
+    def episode_claim(
+        self, run_id: str, particle_id: str, iteration_id: int
+    ) -> ContextManager[None]: ...
 
     def get_run_snapshot_hash(self, run_id: str) -> str | None: ...
 
@@ -94,4 +102,10 @@ class ArtifactStore(Protocol):
     def verify(self, reference: ArtifactRef) -> None: ...
 
 
-__all__ = ["ArtifactIntegrityError", "ArtifactStore", "IterationTransaction", "RunStore"]
+__all__ = [
+    "ArtifactIntegrityError",
+    "ArtifactStore",
+    "EpisodeClaimConflict",
+    "IterationTransaction",
+    "RunStore",
+]

@@ -144,6 +144,7 @@ def test_protocol_method_names_and_async_boundaries_are_exact() -> None:
     }
     assert _protocol_methods(RunStore) == {
         "create_run",
+        "episode_claim",
         "get_run_snapshot_hash",
         "append_stage_event",
         "list_stage_events",
@@ -257,6 +258,11 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
 
         def create_run(self, run_id: str, snapshot_hash: str) -> None:
             return None
+
+        def episode_claim(
+            self, run_id: str, particle_id: str, iteration_id: int
+        ) -> ContextManager[None]:
+            raise NotImplementedError
 
         def get_run_snapshot_hash(self, run_id: str) -> str | None:
             return None
@@ -402,6 +408,7 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
             RunStoreFake(),
             {
                 "create_run": (("self", "run_id", "snapshot_hash"), {"run_id": str, "snapshot_hash": str, "return": type(None)}),
+                "episode_claim": (("self", "run_id", "particle_id", "iteration_id"), {"run_id": str, "particle_id": str, "iteration_id": int, "return": ContextManager[None]}),
                 "get_run_snapshot_hash": (("self", "run_id"), {"run_id": str, "return": str | None}),
                 "append_stage_event": (("self", "event"), {"event": StageEvent, "return": type(None)}),
                 "list_stage_events": (("self", "run_id", "particle_id", "iteration_id"), {"run_id": str, "particle_id": str, "iteration_id": int, "return": tuple[StoredStageEvent, ...]}),

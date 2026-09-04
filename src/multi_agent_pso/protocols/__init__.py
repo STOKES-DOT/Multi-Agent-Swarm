@@ -6,7 +6,13 @@ from typing import Protocol
 from .agent_runtime import AgentRuntime, StageRequest, StageResponse, ThreadRef, TokenUsage
 from .evaluator import EvaluationContext, Evaluator
 from .resources import ResourceManager, WikiHit, WikiQuery, WikiRetriever
-from .storage import ArtifactIntegrityError, ArtifactStore, IterationTransaction, RunStore
+from .storage import (
+    ArtifactIntegrityError,
+    ArtifactStore,
+    EpisodeClaimConflict,
+    IterationTransaction,
+    RunStore,
+)
 from .task_adapter import TaskAdapter
 from .tools import CandidateRef, ToolContext, ToolProvider, ToolRequest, ToolResult, ToolStatus
 
@@ -41,6 +47,7 @@ __all__ = [
     "AgentRuntime",
     "ArtifactIntegrityError",
     "ArtifactStore",
+    "EpisodeClaimConflict",
     "CandidateRef",
     "EvaluationContext",
     "Evaluator",
