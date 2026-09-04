@@ -863,3 +863,28 @@ def test_latest_checkpoint_returns_validated_defensive_canonical_copy(tmp_path: 
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+@pytest.mark.parametrize("second_event_type", ["completed", "failed"])
+def test_latest_checkpoint_rejects_multiple_terminal_events_for_stage_attempt(
+    tmp_path: Path, second_event_type: str
+) -> None:
+    path = tmp_path / "runs.sqlite"
+    store = SQLiteRunStore(path)
+    store.create_run("run-1", "a" * 64)
+    event = StageEvent(
+        run_id="run-1", particle_id="p0", iteration_id=0,
+        stage=AgentStage.EXECUTING, attempt=0, event_type="completed",
+    )
+    store.commit_stage_transition(event, _checkpoint())
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """INSERT INTO stage_events
+            (run_id, particle_id, iteration_id, stage, attempt, event_type, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("run-1", "p0", 0, "EXECUTING", 0, second_event_type, "{}"),
+        )
+        connection.commit()
+
+    with pytest.raises(RuntimeError, match="store corrupted"):
+        store.get_latest_stage_checkpoint_json("run-1", "p0", 0)

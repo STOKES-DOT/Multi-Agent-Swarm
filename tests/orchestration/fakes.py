@@ -319,6 +319,20 @@ class FakeRunStore:
                     event.event_type,
                 ):
                     raise ValueError("checkpoint terminal event does not match")
+                terminals = [
+                    stored
+                    for stored in self.stored_events
+                    if stored.event.run_id == checkpoint.run_id
+                    and stored.event.particle_id == checkpoint.particle_id
+                    and stored.event.iteration_id == checkpoint.iteration_id
+                    and stored.event.stage is checkpoint.completed_stage
+                    and stored.event.attempt == checkpoint.completed_attempt
+                    and stored.event.event_type != "started"
+                ]
+                if len(terminals) != 1 or terminals[0].sequence != sequence:
+                    raise ValueError(
+                        "checkpoint stage attempt does not have one terminal event"
+                    )
                 if self.run_hashes.get(run) != checkpoint.protocol_snapshot_hash:
                     raise ValueError("checkpoint protocol hash does not match run")
                 value = _canonical_copy(checkpoint.model_dump(mode="json"))

@@ -543,6 +543,23 @@ class SQLiteRunStore:
                     event.event_type,
                 ):
                     raise ValueError("checkpoint terminal event does not match")
+                terminal_rows = connection.execute(
+                    """SELECT event_id FROM stage_events
+                    WHERE run_id = ? AND particle_id = ? AND iteration_id = ?
+                    AND stage = ? AND attempt = ? AND event_type <> 'started'""",
+                    (
+                        checkpoint.run_id,
+                        checkpoint.particle_id,
+                        checkpoint.iteration_id,
+                        checkpoint.completed_stage.value,
+                        checkpoint.completed_attempt,
+                    ),
+                ).fetchall()
+                if (
+                    len(terminal_rows) != 1
+                    or terminal_rows[0]["event_id"] != sequence
+                ):
+                    raise ValueError("checkpoint stage attempt does not have one terminal event")
                 run_row = connection.execute(
                     "SELECT snapshot_hash FROM runs WHERE run_id = ?", (run,)
                 ).fetchone()

@@ -1346,6 +1346,23 @@ def test_fake_latest_checkpoint_rejects_cross_record_corruption(corruption: str)
         store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
 
 
+@pytest.mark.parametrize("second_event_type", ["completed", "failed"])
+def test_fake_latest_checkpoint_rejects_multiple_terminal_events_for_stage_attempt(
+    second_event_type: str,
+) -> None:
+    store = FakeRunStore()
+    store.create_run("run-1", "a" * 64)
+    event = StageEvent(
+        run_id="run-1", particle_id="p0", iteration_id=0,
+        stage=AgentStage.EXECUTING, attempt=0, event_type="completed",
+    )
+    store.commit_stage_transition(event, _fake_checkpoint())
+    store.append_stage_event(event.model_copy(update={"event_type": second_event_type}))
+
+    with pytest.raises(RuntimeError, match="store corrupted"):
+        store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+
+
 @pytest.mark.parametrize("different", [False, True])
 def test_fake_stage_transition_concurrency_matches_first_wins(different: bool) -> None:
     store = FakeRunStore()
