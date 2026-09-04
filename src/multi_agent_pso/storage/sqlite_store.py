@@ -215,6 +215,8 @@ class SQLiteRunStore:
             raise EpisodeClaimConflict("particle episode is already claimed")
         directory_fd: int | None = None
         lock_fd: int | None = None
+        lock_acquired = False
+        primary_error: BaseException | None = None
         try:
             try:
                 self._claim_directory.mkdir(mode=0o700)
@@ -227,6 +229,8 @@ class SQLiteRunStore:
             directory_metadata = os.fstat(directory_fd)
             if not stat.S_ISDIR(directory_metadata.st_mode):
                 raise RuntimeError("episode claim directory is not a safe directory")
+            if hasattr(os, "getuid") and directory_metadata.st_uid != os.getuid():
+                raise RuntimeError("episode claim directory has an unsafe owner")
             os.fchmod(directory_fd, 0o700)
             lock_fd = os.open(
                 f"{digest}.lock",
@@ -235,8 +239,15 @@ class SQLiteRunStore:
                 dir_fd=directory_fd,
             )
             lock_metadata = os.fstat(lock_fd)
-            if not stat.S_ISREG(lock_metadata.st_mode):
-                raise RuntimeError("episode claim path is not a regular file")
+            if (
+                not stat.S_ISREG(lock_metadata.st_mode)
+                or lock_metadata.st_nlink != 1
+                or (
+                    hasattr(os, "getuid")
+                    and lock_metadata.st_uid != os.getuid()
+                )
+            ):
+                raise RuntimeError("episode claim path is not a safe regular file")
             os.fchmod(lock_fd, 0o600)
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -244,16 +255,48 @@ class SQLiteRunStore:
                 raise EpisodeClaimConflict(
                     "particle episode is already claimed"
                 ) from error
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_acquired = True
+            yield
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
+            cleanup_errors: list[tuple[str, BaseException]] = []
+            if lock_acquired and lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except BaseException as error:
+                    cleanup_errors.append(("episode claim unlock failed", error))
             if lock_fd is not None:
-                os.close(lock_fd)
+                try:
+                    os.close(lock_fd)
+                except BaseException as error:
+                    cleanup_errors.append(("episode claim file close failed", error))
             if directory_fd is not None:
-                os.close(directory_fd)
-            thread_lock.release()
+                try:
+                    os.close(directory_fd)
+                except BaseException as error:
+                    cleanup_errors.append(
+                        ("episode claim directory close failed", error)
+                    )
+            try:
+                thread_lock.release()
+            except BaseException as error:
+                cleanup_errors.append(("episode claim thread release failed", error))
+            if cleanup_errors:
+                if primary_error is not None:
+                    for label, error in cleanup_errors:
+                        primary_error.add_note(
+                            f"{label}: {type(error).__name__}: {error}"
+                        )
+                else:
+                    first_label, first_error = cleanup_errors[0]
+                    for label, error in cleanup_errors[1:]:
+                        first_error.add_note(
+                            f"{label}: {type(error).__name__}: {error}"
+                        )
+                    first_error.add_note(first_label)
+                    raise first_error
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._path)

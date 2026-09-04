@@ -2183,6 +2183,64 @@ async def test_resume_non_success_completed_interruption_preserves_outcome(
 
 
 @pytest.mark.asyncio
+async def test_cached_execution_interruption_accepts_synthetic_request(tmp_path):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        cached_tool_result=True,
+        candidate_exception=asyncio.CancelledError(),
+    )
+    loop = AgentLoop(**dependencies)
+    with pytest.raises(asyncio.CancelledError):
+        await loop.run_particle("run-1", "p0", 0)
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json(
+            "run-1", "p0", 0
+        )
+    )
+    dependencies["task_adapter"].candidate_exception = None
+
+    episode = await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert episode.status is EpisodeStatus.COMPLETED
+    assert dependencies["tool_provider"].executed_keys == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failing_method",
+    ["realized_position", "evaluated_position", "position_adherence"],
+)
+async def test_partial_candidate_invalid_terminal_is_resumable(
+    tmp_path, failing_method
+):
+    dependencies = make_fake_dependencies(tmp_path)
+    adapter = dependencies["task_adapter"]
+
+    def fail(*args):
+        raise ValueError(f"{failing_method} failed")
+
+    setattr(adapter, failing_method, fail)
+    loop = AgentLoop(**dependencies)
+    original = await loop.run_particle("run-1", "p0", 0)
+    executing = [
+        event
+        for event in dependencies["run_store"].events
+        if event.stage is AgentStage.EXECUTING and event.event_type == "invalid"
+    ]
+    assert executing[0].payload["candidate"]["reference"] == "candidate-p0"
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json(
+            "run-1", "p0", 0
+        )
+    )
+
+    rebuilt = await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert rebuilt.model_dump(mode="json") == original.model_dump(mode="json")
+    assert dependencies["runtime"].restored_threads == []
+
+
+@pytest.mark.asyncio
 async def test_fake_store_rejects_missing_persisted_prefix_terminal(tmp_path):
     dependencies = make_fake_dependencies(
         tmp_path,

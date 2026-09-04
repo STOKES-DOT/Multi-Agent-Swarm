@@ -126,6 +126,92 @@ def test_episode_claim_is_cross_process_and_crash_released(
             pass
 
 
+def test_episode_claim_cleanup_preserves_body_primary_and_releases_thread_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = SQLiteRunStore(tmp_path / "runs.sqlite")
+    real_flock = sqlite_store_module.fcntl.flock
+    real_close = os.close
+    primary = RuntimeError("body primary")
+
+    def failing_unlock(descriptor, operation):
+        real_flock(descriptor, operation)
+        if operation == sqlite_store_module.fcntl.LOCK_UN:
+            raise OSError("unlock failed")
+
+    def failing_close(descriptor):
+        real_close(descriptor)
+        raise OSError(f"close failed {descriptor}")
+
+    monkeypatch.setattr(sqlite_store_module.fcntl, "flock", failing_unlock)
+    monkeypatch.setattr(sqlite_store_module.os, "close", failing_close)
+    with pytest.raises(RuntimeError) as raised:
+        with store.episode_claim("run-1", "p0", 0):
+            raise primary
+    assert raised.value is primary
+    notes = getattr(primary, "__notes__", [])
+    assert any("unlock failed" in note for note in notes)
+    assert sum("close failed" in note for note in notes) == 2
+
+    monkeypatch.setattr(sqlite_store_module.fcntl, "flock", real_flock)
+    monkeypatch.setattr(sqlite_store_module.os, "close", real_close)
+    with store.episode_claim("run-1", "p0", 0):
+        pass
+
+
+def test_episode_claim_cleanup_raises_first_error_after_all_cleanup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = SQLiteRunStore(tmp_path / "runs.sqlite")
+    real_flock = sqlite_store_module.fcntl.flock
+    real_close = os.close
+    unlock_error = OSError("unlock primary")
+    closed: list[int] = []
+
+    def failing_unlock(descriptor, operation):
+        real_flock(descriptor, operation)
+        if operation == sqlite_store_module.fcntl.LOCK_UN:
+            raise unlock_error
+
+    def failing_close(descriptor):
+        real_close(descriptor)
+        closed.append(descriptor)
+        raise OSError(f"secondary close {descriptor}")
+
+    monkeypatch.setattr(sqlite_store_module.fcntl, "flock", failing_unlock)
+    monkeypatch.setattr(sqlite_store_module.os, "close", failing_close)
+    with pytest.raises(OSError) as raised:
+        with store.episode_claim("run-1", "p0", 0):
+            pass
+
+    assert raised.value is unlock_error
+    assert len(closed) == 2
+    assert sum(
+        "secondary close" in note
+        for note in getattr(unlock_error, "__notes__", [])
+    ) == 2
+
+
+def test_episode_claim_rejects_hardlinked_lock_without_chmod_victim(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runs.sqlite"
+    store = SQLiteRunStore(path)
+    with store.episode_claim("run-1", "p0", 0):
+        pass
+    lock_directory = path.with_name(f".{path.name}.episode-locks")
+    lock_path = next(lock_directory.iterdir())
+    lock_path.unlink()
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do not mutate", encoding="utf-8")
+    victim.chmod(0o644)
+    os.link(victim, lock_path)
+
+    with pytest.raises(RuntimeError, match="safe regular file"):
+        with store.episode_claim("run-1", "p0", 0):
+            pass
+
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
 def test_iteration_transaction_rolls_back_all_state(tmp_path: Path) -> None:
     path = tmp_path / "runs.sqlite"
     store = SQLiteRunStore(path)

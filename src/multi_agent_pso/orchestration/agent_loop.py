@@ -584,6 +584,31 @@ class AgentLoop:
                     evaluated = self._copy_json(evaluated)
                     adherence = self._copy_json(adherence)
                 except ValueError as error:
+                    invalid_payload: dict[str, JsonValue] = {
+                        "tool_request": request_json,
+                        "tool_result": tool_result_json,
+                        "cached": cached,
+                        **self._request_error(error),
+                    }
+                    if candidate is not None:
+                        invalid_payload["candidate"] = candidate_json
+                        try:
+                            partial_positions = self._copy_json(
+                                {
+                                    "realized_position": realized,
+                                    "evaluated_position": evaluated,
+                                    "adherence": adherence,
+                                }
+                            )
+                        except _JsonBoundaryError:
+                            pass
+                        else:
+                            if not isinstance(partial_positions, Mapping):
+                                raise AssertionError(
+                                    "partial positions must be an object"
+                                )
+                            invalid_payload.update(partial_positions)
+                            context.update(partial_positions)
                     self._terminal_event(
                         run_id,
                         particle_id,
@@ -592,12 +617,7 @@ class AgentLoop:
                         "invalid",
                         events,
                         attempt=0,
-                        payload={
-                            "tool_request": request_json,
-                            "tool_result": tool_result_json,
-                            "cached": cached,
-                            **self._request_error(error),
-                        },
+                        payload=invalid_payload,
                         context=context,
                         thread=thread,
                         owner=owner,
@@ -1321,6 +1341,13 @@ class AgentLoop:
                 or not isinstance(payload, Mapping)
             ):
                 return False
+            tool_key = self._identity(
+                "tool",
+                checkpoint.run_id,
+                checkpoint.particle_id,
+                checkpoint.iteration_id,
+                AgentStage.EXECUTING.value,
+            )
             expected = ToolRequest(
                 self._identity(
                     "request",
@@ -1333,19 +1360,28 @@ class AgentLoop:
                 provider,
                 operation,
                 payload,
+                tool_key,
+            )
+            cached = ToolRequest(
                 self._identity(
-                    "tool",
+                    "request",
                     checkpoint.run_id,
                     checkpoint.particle_id,
                     checkpoint.iteration_id,
-                    AgentStage.EXECUTING.value,
+                    "cached",
                 ),
+                "cache",
+                "reuse",
+                {},
+                tool_key,
             )
         except (KeyError, TypeError, ValueError):
             return False
-        return self._canonical_json(context[key]) == self._canonical_json(
-            expected.to_json()
-        )
+        actual = self._canonical_json(context[key])
+        return actual in {
+            self._canonical_json(expected.to_json()),
+            self._canonical_json(cached.to_json()),
+        }
 
     @staticmethod
     def _is_non_success_finalization(
