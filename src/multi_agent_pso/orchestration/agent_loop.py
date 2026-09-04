@@ -84,7 +84,7 @@ class AgentLoop:
 
             current_stage = AgentStage.EXECUTING
             self._started(run_id, particle_id, iteration_id, current_stage, 0, {"proposal": proposal})
-            tool_result, request = await self._execute_tool(run_id, particle_id, iteration_id, proposal)
+            tool_result, request, cached = await self._execute_tool(run_id, particle_id, iteration_id, proposal)
             context["tool_request"] = request.to_json()
             context["tool_result"] = tool_result.to_json()
             tool_status = episode_status_for_tool(tool_result.status)
@@ -94,7 +94,7 @@ class AgentLoop:
                     run_id, particle_id, iteration_id, events, tool_status,
                     self._evaluation_for_tool(tool_result.status), evaluated, realized, adherence,
                 )
-            self._terminal_event(run_id, particle_id, iteration_id, current_stage, "completed", events, payload={"tool_result": tool_result.to_json(), "cache": request.request_id.endswith(":cached")})
+            self._terminal_event(run_id, particle_id, iteration_id, current_stage, "completed", events, payload={"tool_request": request.to_json(), "tool_result": tool_result.to_json(), "cached": cached})
             tool_context = ToolContext(run_id, particle_id, iteration_id, current_stage, 0, self._workspace)
             candidate = self._adapter.candidate_from_tool_result(tool_result, tool_context)
             context["candidate"] = candidate.to_json()
@@ -106,11 +106,12 @@ class AgentLoop:
             context["adherence"] = adherence
 
             current_stage = AgentStage.EVALUATING
-            self._started(run_id, particle_id, iteration_id, current_stage, 0)
+            evaluation_context = EvaluationContext(run_id, particle_id, iteration_id, self._workspace, self._protocol_hash)
+            self._started(run_id, particle_id, iteration_id, current_stage, 0, {"candidate": candidate.to_json(), "evaluation_context": evaluation_context.to_json()})
             async with self._resources.evaluation_slot():
                 evaluation = await self._evaluator.evaluate(
                     candidate,
-                    EvaluationContext(run_id, particle_id, iteration_id, self._workspace, self._protocol_hash),
+                    evaluation_context,
                 )
             context["evaluation"] = evaluation.model_dump(mode="json")
             status = episode_status_for_evaluation(evaluation.status)
@@ -121,13 +122,16 @@ class AgentLoop:
 
             current_stage = AgentStage.REFLECTING
             if await self._agent_stage(thread, current_stage, context, events) is None:
-                return self._terminal_episode(run_id, particle_id, iteration_id, events, EpisodeStatus.INVALID, self._invalid_evaluation(), evaluated, realized, adherence)
+                return self._terminal_episode(run_id, particle_id, iteration_id, events, EpisodeStatus.INVALID, evaluation, evaluated, realized, adherence)
             current_stage = AgentStage.COMPLETED
             self._started(run_id, particle_id, iteration_id, current_stage, 0, {"episode": "complete"})
             self._terminal_event(run_id, particle_id, iteration_id, current_stage, "completed", events, payload={"evaluation": evaluation.model_dump(mode="json")})
             return self._terminal_episode(run_id, particle_id, iteration_id, events, EpisodeStatus.COMPLETED, evaluation, evaluated, realized, adherence)
-        except asyncio.CancelledError:
-            self._terminal_event(run_id, particle_id, iteration_id, current_stage, "interrupted", events)
+        except asyncio.CancelledError as error:
+            try:
+                self._terminal_event(run_id, particle_id, iteration_id, current_stage, "interrupted", events)
+            except Exception as audit_error:
+                error.add_note(f"interruption audit failed: {type(audit_error).__name__}: {str(audit_error)[:512]}")
             raise
         except TimeoutError:
             self._terminal_event(run_id, particle_id, iteration_id, current_stage, "timeout", events)
@@ -152,8 +156,16 @@ class AgentLoop:
                         await self._runtime.close_thread(thread)
                 except asyncio.CancelledError:
                     raise
-                except Exception:
-                    pass
+                except Exception as error:
+                    self._terminal_event(
+                        run_id,
+                        particle_id,
+                        iteration_id,
+                        current_stage,
+                        "cleanup_failed",
+                        events,
+                        payload={"type": type(error).__name__, "message": str(error)[:512]},
+                    )
 
     async def _start_thread(self, particle_id: str) -> ThreadRef:
         async with self._resources.agent_slot():
@@ -186,20 +198,20 @@ class AgentLoop:
             return parsed
         raise AssertionError("unreachable")
 
-    async def _execute_tool(self, run_id: str, particle_id: str, iteration_id: int, proposal: Mapping[str, JsonValue]) -> tuple[ToolResult, ToolRequest]:
+    async def _execute_tool(self, run_id: str, particle_id: str, iteration_id: int, proposal: Mapping[str, JsonValue]) -> tuple[ToolResult, ToolRequest, bool]:
         key = self._identity("tool", run_id, particle_id, iteration_id, "EXECUTING")
         cached = self._store.get_committed_tool_result(key)
         if cached is not None:
-            return cached, ToolRequest(self._identity("request", run_id, particle_id, iteration_id, "cached"), "cache", "reuse", {}, key)
-        provider = proposal.get("provider", "task")
-        operation = proposal.get("operation", "execute")
-        payload = proposal.get("tool_payload", proposal)
-        if not isinstance(provider, str) or not isinstance(operation, str) or not isinstance(payload, Mapping):
-            return ToolResult(ToolStatus.REJECTED, error="invalid tool proposal"), ToolRequest(self._identity("request", run_id, particle_id, iteration_id, "invalid"), "task", "invalid", {}, key)
+            return cached, ToolRequest(self._identity("request", run_id, particle_id, iteration_id, "cached"), "cache", "reuse", {}, key), True
+        provider = proposal.get("provider")
+        operation = proposal.get("operation")
+        payload = proposal.get("tool_payload")
+        if not isinstance(provider, str) or not provider or not isinstance(operation, str) or not operation or not isinstance(payload, Mapping):
+            return ToolResult(ToolStatus.REJECTED, error="invalid tool proposal"), ToolRequest(self._identity("request", run_id, particle_id, iteration_id, "invalid"), "task", "invalid", {}, key), False
         request = ToolRequest(self._identity("request", run_id, particle_id, iteration_id, provider, operation), provider, operation, payload, key)
         result = await self._tool.execute(request, ToolContext(run_id, particle_id, iteration_id, AgentStage.EXECUTING, 0, self._workspace))
         self._store.record_tool_result(key, result)
-        return result, request
+        return result, request, False
 
     def _context(self, run_id: str, particle_id: str, iteration_id: int) -> Mapping[str, JsonValue]:
         return {"run_id": run_id, "particle_id": particle_id, "iteration_id": iteration_id, "target_position": self._target, "protocol_snapshot_hash": self._protocol_hash}

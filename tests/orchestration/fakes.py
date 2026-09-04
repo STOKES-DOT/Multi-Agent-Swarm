@@ -81,43 +81,61 @@ class FakeResources:
     def __init__(self) -> None:
         self.agent_entries = 0
         self.evaluation_entries = 0
+        self.agent_active = 0
+        self.evaluation_active = 0
 
     @asynccontextmanager
     async def agent_slot(self) -> AsyncIterator[None]:
         self.agent_entries += 1
-        yield
+        self.agent_active += 1
+        try:
+            yield
+        finally:
+            self.agent_active -= 1
 
     @asynccontextmanager
     async def evaluation_slot(self) -> AsyncIterator[None]:
         self.evaluation_entries += 1
-        yield
+        self.evaluation_active += 1
+        try:
+            yield
+        finally:
+            self.evaluation_active -= 1
 
 
 class FakeRuntime:
-    def __init__(self, *, invalid_responses: int, cancel_stage: AgentStage | None, payload: Mapping[str, object]) -> None:
+    def __init__(self, *, resources: FakeResources, invalid_responses: int, cancel_stage: AgentStage | None, payload: Mapping[str, object], close_failure: bool) -> None:
+        self.resources = resources
         self.invalid_remaining = invalid_responses
         self.cancel_stage = cancel_stage
         self.payload = payload
         self.stages: list[AgentStage] = []
         self.closed_threads: list[str] = []
+        self.close_failure = close_failure
 
     async def start_thread(self, particle_id: str, workspace: Path) -> ThreadRef:
+        assert self.resources.agent_active
         return ThreadRef(f"thread-{particle_id}", particle_id, 0, workspace)
 
     async def run_stage(self, thread: ThreadRef, request: StageRequest) -> StageResponse:
+        assert self.resources.agent_active
         self.stages.append(request.stage)
         if self.cancel_stage is request.stage:
             raise asyncio.CancelledError
         if self.invalid_remaining:
             self.invalid_remaining -= 1
             return StageResponse("not-json", TokenUsage(1, 1))
-        return StageResponse(json.dumps(dict(self.payload), sort_keys=True), TokenUsage(1, 1))
+        output = {"stage": request.stage.value, **self.payload}
+        return StageResponse(json.dumps(output, sort_keys=True), TokenUsage(1, 1))
 
     async def rotate_thread(self, thread: ThreadRef, checkpoint: Mapping[str, object]) -> ThreadRef:
         return thread
 
     async def close_thread(self, thread: ThreadRef) -> None:
+        assert self.resources.agent_active
         self.closed_threads.append(thread.logical_id)
+        if self.close_failure:
+            raise RuntimeError("fake close failure")
 
 
 class FakeAdapter:
@@ -165,10 +183,12 @@ class FakeTool:
 class FakeEvaluator:
     fixed_fitness = 1.25
 
-    def __init__(self, status: EvaluationStatus = EvaluationStatus.SUCCESS) -> None:
+    def __init__(self, resources: FakeResources, status: EvaluationStatus = EvaluationStatus.SUCCESS) -> None:
+        self.resources = resources
         self.status = status
 
     async def evaluate(self, candidate: CandidateRef, context: EvaluationContext) -> Evaluation:
+        assert self.resources.evaluation_active
         if self.status is EvaluationStatus.SUCCESS:
             return Evaluation(status=self.status, feasible=True, fitness=self.fixed_fitness)
         return Evaluation(status=self.status, feasible=False)
@@ -190,12 +210,13 @@ def make_fake_dependencies(
     if agent_payload:
         payload.update(agent_payload)
     cached = ToolResult(ToolStatus.SUCCESS, {"tool": "cached"}) if cached_tool_result else None
+    resources = FakeResources()
     return {
-        "runtime": FakeRuntime(invalid_responses=invalid_responses, cancel_stage=cancel_stage, payload=payload),
+        "runtime": FakeRuntime(resources=resources, invalid_responses=invalid_responses, cancel_stage=cancel_stage, payload=payload, close_failure=close_failure),
         "task_adapter": FakeAdapter(),
-        "evaluator": FakeEvaluator(evaluator_status),
+        "evaluator": FakeEvaluator(resources, evaluator_status),
         "tool_provider": FakeTool(),
-        "resource_manager": FakeResources(),
+        "resource_manager": resources,
         "run_store": FakeRunStore(cached),
         "target_position": {"x": 1},
         "workspace": workspace,
