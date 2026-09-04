@@ -78,6 +78,7 @@ async def test_exhausted_schema_corrections_produce_typed_invalid_terminal(tmp_p
     assert episode.evaluation is not None
     assert episode.evaluation.status is EvaluationStatus.INVALID
     assert episode.events[-1].event_type == "invalid"
+    assert episode.events[-1].payload["request"]["stage"] == "HYPOTHESIZING"
     assert dependencies["runtime"].stages == [AgentStage.HYPOTHESIZING] * 3
 
 
@@ -111,7 +112,10 @@ async def test_stage_audit_payloads_carry_context_outputs_and_reflection_inputs(
     reflection_context = dependencies["task_adapter"].contexts[AgentStage.REFLECTING][-1]
     assert {"hypothesis", "proposal", "tool_request", "tool_result", "candidate", "evaluation"} <= set(reflection_context)
     assert dependencies["run_store"].events[0].event_type == "started"
-    assert "request" in dependencies["run_store"].events[2].payload
+    stage_started, stage_completed = dependencies["run_store"].events[2:4]
+    assert stage_started.payload["attempt"] == 0
+    assert "context" in stage_started.payload
+    assert "request" in stage_completed.payload
 
 
 @pytest.mark.asyncio
@@ -123,6 +127,12 @@ async def test_corrections_supply_bounded_diagnostics_to_next_request(tmp_path):
     assert contexts[1]["correction"]["attempt"] == 1
     assert len(contexts[1]["correction"]["message"]) <= 512
     assert len(contexts[1]["correction"]["response_excerpt"]) <= 1024
+    failed = next(
+        event
+        for event in dependencies["run_store"].events
+        if event.stage is AgentStage.HYPOTHESIZING and event.event_type == "failed"
+    )
+    assert failed.payload["request"]["stage"] == "HYPOTHESIZING"
 
 
 @pytest.mark.asyncio
@@ -236,6 +246,12 @@ async def test_mutating_adapter_context_does_not_change_episode_target(tmp_path)
     dependencies = make_fake_dependencies(tmp_path, mutate_context=True)
     episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
     assert episode.model_dump(mode="json")["target_position"] == {"x": 1}
+    started = next(
+        event
+        for event in dependencies["run_store"].events
+        if event.stage is AgentStage.HYPOTHESIZING and event.event_type == "started"
+    )
+    assert started.payload["context"]["target_position"] == {"x": 1}
 
 
 @pytest.mark.asyncio
@@ -456,8 +472,66 @@ async def test_agent_stage_rejects_invalid_request_before_runtime(tmp_path, inva
     ]
     assert [event.event_type for event in stage_attempts] == ["started", "failed"]
     if invalid_kind == "wrong_type":
-        assert dict(stage_attempts[0].payload["request"]) == {"type": "dict"}
+        assert dict(stage_attempts[-1].payload["request"]) == {"type": "dict"}
     else:
-        assert stage_attempts[0].payload["request"]["stage"] == "PROPOSING_ACTION"
+        assert stage_attempts[-1].payload["request"]["stage"] == "PROPOSING_ACTION"
     assert len(stage_attempts[-1].payload["message"]) <= 512
     assert stage_attempts[-1].payload["type"] in {"TypeError", "ValueError"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("primary", "terminal_type", "episode_status"),
+    [
+        (RuntimeError("build primary"), "failed", EpisodeStatus.FAILED),
+        (TimeoutError("build timeout"), "timeout", EpisodeStatus.TIMEOUT),
+    ],
+)
+async def test_adapter_build_failure_keeps_started_terminal_pair_without_runtime(
+    tmp_path, primary, terminal_type, episode_status
+):
+    dependencies = make_fake_dependencies(tmp_path, build_exception=primary)
+
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert episode.status is episode_status
+    assert dependencies["runtime"].stages == []
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+    attempts = [
+        event
+        for event in dependencies["run_store"].append_attempts
+        if event.stage is AgentStage.HYPOTHESIZING and event.attempt == 0
+    ]
+    assert [event.event_type for event in attempts] == ["started", terminal_type]
+    assert attempts[0].payload["attempt"] == 0
+    assert attempts[0].payload["context"]["particle_id"] == "p0"
+    assert attempts[-1].payload["context"]["particle_id"] == "p0"
+    assert len(attempts[-1].payload["message"]) <= 512
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("primary", "terminal_type", "episode_status"),
+    [
+        (RuntimeError("runtime primary"), "failed", EpisodeStatus.FAILED),
+        (TimeoutError("runtime timeout"), "timeout", EpisodeStatus.TIMEOUT),
+    ],
+)
+async def test_runtime_failure_terminal_carries_active_stage_request(
+    tmp_path, primary, terminal_type, episode_status
+):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        stage_exceptions={AgentStage.HYPOTHESIZING: primary},
+    )
+
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert episode.status is episode_status
+    terminal = next(
+        event
+        for event in dependencies["run_store"].events
+        if event.stage is AgentStage.HYPOTHESIZING
+        and event.event_type == terminal_type
+    )
+    assert terminal.payload["request"]["stage"] == "HYPOTHESIZING"

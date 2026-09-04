@@ -187,17 +187,21 @@ class FakeAdapter:
         mutate_context: bool = False,
         request_stage_override: AgentStage | None = None,
         invalid_stage_request: bool = False,
+        build_exception: BaseException | None = None,
     ) -> None:
         self.contexts: dict[AgentStage, list[dict[str, object]]] = {stage: [] for stage in AgentStage}
         self.candidate_failure = candidate_failure
         self.mutate_context = mutate_context
         self.request_stage_override = request_stage_override
         self.invalid_stage_request = invalid_stage_request
+        self.build_exception = build_exception
 
     def build_stage_request(self, stage: AgentStage, context: Mapping[str, object]) -> StageRequest:
         self.contexts[stage].append(copy.deepcopy(dict(context)))
         if self.mutate_context and stage is AgentStage.HYPOTHESIZING:
             context["target_position"]["x"] = 999  # type: ignore[index]
+        if self.build_exception is not None:
+            raise self.build_exception
         if self.invalid_stage_request:
             return {"invalid": "request"}  # type: ignore[return-value]
         request_stage = self.request_stage_override or stage
@@ -283,6 +287,7 @@ def make_fake_dependencies(
     mutate_context: bool = False,
     request_stage_override: AgentStage | None = None,
     invalid_stage_request: bool = False,
+    build_exception: BaseException | None = None,
 ) -> dict[str, object]:
     workspace = (tmp_path / "workspace").resolve()
     workspace.mkdir()
@@ -298,6 +303,7 @@ def make_fake_dependencies(
             mutate_context,
             request_stage_override,
             invalid_stage_request,
+            build_exception,
         ),
         "evaluator": FakeEvaluator(resources, evaluator_status, evaluator_exception),
         "tool_provider": FakeTool(tool_status, tool_exception),

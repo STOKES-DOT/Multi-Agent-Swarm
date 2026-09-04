@@ -37,6 +37,9 @@ from .failure_policy import (
     episode_status_for_tool,
 )
 
+_ACTIVE_STAGE_CONTEXT = "_active_stage_context"
+_ACTIVE_STAGE_REQUEST = "_active_stage_request"
+
 
 @dataclass(slots=True)
 class _ThreadOwner:
@@ -196,7 +199,7 @@ class AgentLoop:
             if owner.close_attempted:
                 raise
             try:
-                self._terminal_event(run_id, particle_id, iteration_id, current_stage, "timeout", events, payload={"type": type(error).__name__, "message": str(error)[:512]})
+                self._terminal_event(run_id, particle_id, iteration_id, current_stage, "timeout", events, payload=self._failure_payload(error, context))
             except AuditPersistenceError as audit_error:
                 self._add_secondary(error, "timeout audit failed", audit_error)
                 raise error from audit_error
@@ -215,7 +218,7 @@ class AgentLoop:
             if owner.close_attempted:
                 raise
             try:
-                self._terminal_event(run_id, particle_id, iteration_id, current_stage, "failed", events, payload={"type": type(error).__name__, "message": str(error)[:512]})
+                self._terminal_event(run_id, particle_id, iteration_id, current_stage, "failed", events, payload=self._failure_payload(error, context))
             except AuditPersistenceError as audit_error:
                 self._add_secondary(error, "failure audit failed", audit_error)
                 raise error from audit_error
@@ -271,13 +274,25 @@ class AgentLoop:
         events: list[StageEvent],
     ) -> Mapping[str, JsonValue] | None:
         for attempt in range(3):
-            request = self._adapter.build_stage_request(stage, self._copy_json(context))
+            stage_context = self._copy_json(context)
+            self._started(
+                str(context["run_id"]),
+                str(context["particle_id"]),
+                int(context["iteration_id"]),
+                stage,
+                attempt,
+                {"attempt": attempt, "context": stage_context},
+            )
+            context[_ACTIVE_STAGE_CONTEXT] = stage_context
+            request = self._adapter.build_stage_request(
+                stage, self._copy_json(stage_context)
+            )
             request_payload: Mapping[str, JsonValue]
             if isinstance(request, StageRequest):
                 request_payload = request.to_json()
             else:
                 request_payload = {"type": type(request).__name__[:128]}
-            self._started(str(context["run_id"]), str(context["particle_id"]), int(context["iteration_id"]), stage, attempt, {"request": request_payload, "context": context})
+            context[_ACTIVE_STAGE_REQUEST] = request_payload
             if not isinstance(request, StageRequest):
                 raise TypeError("task adapter must return a StageRequest")
             if request.stage is not stage:
@@ -289,16 +304,19 @@ class AgentLoop:
                 if not isinstance(parsed, Mapping):
                     raise ValueError("parsed response must be a mapping")
             except Exception as error:
-                diagnostic = {"attempt": attempt + 1, "type": type(error).__name__, "message": str(error)[:512], "response_excerpt": response.raw_text[:1024], "response_sha256": hashlib.sha256(response.raw_text.encode()).hexdigest()}
+                diagnostic = {"attempt": attempt + 1, "type": type(error).__name__, "message": str(error)[:512], "request": request_payload, "response_excerpt": response.raw_text[:1024], "response_sha256": hashlib.sha256(response.raw_text.encode()).hexdigest()}
                 context["correction"] = diagnostic
                 if attempt == 2:
                     self._terminal_event(str(context["run_id"]), str(context["particle_id"]), int(context["iteration_id"]), stage, "invalid", events, attempt, diagnostic)
+                    self._clear_stage_boundary(context)
                     return None
                 self._terminal_event(str(context["run_id"]), str(context["particle_id"]), int(context["iteration_id"]), stage, "failed", events, attempt, diagnostic)
+                self._clear_stage_boundary(context)
                 continue
             parsed = self._copy_json(parsed)
             context.pop("correction", None)
-            self._terminal_event(str(context["run_id"]), str(context["particle_id"]), int(context["iteration_id"]), stage, "completed", events, attempt, {"output": parsed, "usage": response.usage.to_json(), "provider_metadata": dict(response.provider_metadata)})
+            self._terminal_event(str(context["run_id"]), str(context["particle_id"]), int(context["iteration_id"]), stage, "completed", events, attempt, {"request": request_payload, "output": parsed, "usage": response.usage.to_json(), "provider_metadata": dict(response.provider_metadata)})
+            self._clear_stage_boundary(context)
             return parsed
         raise AssertionError("unreachable")
 
@@ -355,6 +373,26 @@ class AgentLoop:
                 attempt=event.attempt,
                 event_type=event.event_type,
             ) from error
+
+    def _failure_payload(
+        self, error: BaseException, context: dict[str, JsonValue]
+    ) -> dict[str, JsonValue]:
+        payload: dict[str, JsonValue] = {
+            "type": type(error).__name__[:128],
+            "message": str(error)[:512],
+        }
+        stage_context = context.pop(_ACTIVE_STAGE_CONTEXT, None)
+        stage_request = context.pop(_ACTIVE_STAGE_REQUEST, None)
+        if stage_context is not None:
+            payload["context"] = self._copy_json(stage_context)
+        if stage_request is not None:
+            payload["request"] = self._copy_json(stage_request)
+        return payload
+
+    @staticmethod
+    def _clear_stage_boundary(context: dict[str, JsonValue]) -> None:
+        context.pop(_ACTIVE_STAGE_CONTEXT, None)
+        context.pop(_ACTIVE_STAGE_REQUEST, None)
 
     @staticmethod
     def _add_secondary(primary: BaseException, label: str, secondary: BaseException) -> None:
