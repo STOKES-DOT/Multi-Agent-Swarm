@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
-import copy
+import math
+import threading
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,6 +17,7 @@ from pydantic import JsonValue
 
 from multi_agent_pso.core import (
     AgentStage,
+    ArtifactRef,
     EpisodeCheckpoint,
     EpisodeStatus,
     Evaluation,
@@ -40,10 +43,78 @@ from multi_agent_pso.protocols import (
 )
 
 
+def _json_value(value: object) -> JsonValue:
+    if isinstance(value, Mapping):
+        result: dict[str, JsonValue] = {}
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                raise TypeError("JSON object keys must be strings")
+            result[key] = _json_value(nested)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_json_value(nested) for nested in value]
+    if value is None or type(value) in (bool, str, int):
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("JSON values must not contain NaN or infinity")
+        return value
+    raise TypeError("value must be JSON-compatible")
+
+
 def _canonical_json(value: object) -> str:
-    return json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    serialized = json.dumps(
+        _json_value(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
     )
+    serialized.encode("utf-8")
+    return serialized
+
+
+def _canonical_copy(value: object) -> JsonValue:
+    return json.loads(_canonical_json(value))
+
+
+def _tool_result_copy(result: ToolResult) -> ToolResult:
+    document = _canonical_copy(result.to_json())
+    if not isinstance(document, dict):
+        raise TypeError("tool result must serialize as a JSON object")
+    artifacts = document["artifacts"]
+    if not isinstance(artifacts, list):
+        raise TypeError("tool result artifacts must serialize as a JSON array")
+    return ToolResult(
+        ToolStatus(document["status"]),
+        document["payload"],
+        tuple(ArtifactRef.model_validate(item) for item in artifacts),
+        document["error"],
+    )
+
+
+def _require_identifier(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
+    if not value:
+        raise ValueError(f"{name} must not be empty")
+    return value
+
+
+def _require_iteration(value: object) -> int:
+    if type(value) is not int:
+        raise TypeError("iteration_id must be an integer")
+    if value < 0:
+        raise ValueError("iteration_id must be non-negative")
+    return value
+
+
+def _require_hash(value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError("snapshot_hash must be a string")
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise ValueError("snapshot_hash must be a lowercase SHA-256 digest")
+    return value
 
 
 class FakeRunStore:
@@ -72,6 +143,7 @@ class FakeRunStore:
         self.stored_events: list[StoredStageEvent] = []
         self._transitions: dict[tuple[object, ...], tuple[StageEvent, dict[str, JsonValue]]] = {}
         self._next_event_sequence = 1
+        self._lock = threading.RLock()
         self.audit_failure = audit_failure
         self.audit_failure_stage = audit_failure_stage
         self.audit_failure_event_type = audit_failure_event_type
@@ -80,49 +152,75 @@ class FakeRunStore:
         self._matching_append_attempts = 0
 
     def append_stage_event(self, event: StageEvent) -> None:
-        self.append_attempts.append(event)
-        matches_stage = self.audit_failure_stage is None or event.stage is self.audit_failure_stage
-        matches_type = (
-            self.audit_failure_event_type is None
-            or event.event_type == self.audit_failure_event_type
-        )
-        if self.audit_failure is not None and matches_stage and matches_type:
-            self._matching_append_attempts += 1
-            should_fail = self.audit_failure_persistent or (
-                self._matching_append_attempts == self.audit_failure_nth
+        if not isinstance(event, StageEvent):
+            raise TypeError("event must be a StageEvent")
+        _canonical_json(event.model_dump(mode="json"))
+        with self._lock:
+            self.append_attempts.append(event)
+            matches_stage = (
+                self.audit_failure_stage is None or event.stage is self.audit_failure_stage
             )
-            if should_fail:
-                raise self.audit_failure
-        self.events.append(event)
-        self.stored_events.append(
-            StoredStageEvent(sequence=self._next_event_sequence, event=event)
-        )
-        self._next_event_sequence += 1
+            matches_type = (
+                self.audit_failure_event_type is None
+                or event.event_type == self.audit_failure_event_type
+            )
+            if self.audit_failure is not None and matches_stage and matches_type:
+                self._matching_append_attempts += 1
+                should_fail = self.audit_failure_persistent or (
+                    self._matching_append_attempts == self.audit_failure_nth
+                )
+                if should_fail:
+                    raise self.audit_failure
+            self.events.append(event)
+            self.stored_events.append(
+                StoredStageEvent(sequence=self._next_event_sequence, event=event)
+            )
+            self._next_event_sequence += 1
 
     def create_run(self, run_id: str, snapshot_hash: str) -> None:
-        existing = self.run_hashes.get(run_id)
-        if existing is None:
-            self.run_hashes[run_id] = snapshot_hash
-        elif existing != snapshot_hash:
-            raise ValueError("run_id already exists with a different snapshot_hash")
+        run = _require_identifier(run_id, "run_id")
+        digest = _require_hash(snapshot_hash)
+        with self._lock:
+            existing = self.run_hashes.get(run)
+            if existing is None:
+                self.run_hashes[run] = digest
+            elif existing != digest:
+                raise ValueError("run_id already exists with a different snapshot_hash")
 
     def get_run_snapshot_hash(self, run_id: str) -> str | None:
-        return self.run_hashes.get(run_id)
+        run = _require_identifier(run_id, "run_id")
+        with self._lock:
+            return self.run_hashes.get(run)
 
     def list_stage_events(
         self, run_id: str, particle_id: str, iteration_id: int
     ) -> tuple[StoredStageEvent, ...]:
-        return tuple(
-            stored
-            for stored in self.stored_events
-            if stored.event.run_id == run_id
-            and stored.event.particle_id == particle_id
-            and stored.event.iteration_id == iteration_id
-        )
+        run = _require_identifier(run_id, "run_id")
+        particle = _require_identifier(particle_id, "particle_id")
+        iteration = _require_iteration(iteration_id)
+        with self._lock:
+            return tuple(
+                StoredStageEvent(
+                    sequence=stored.sequence,
+                    event=StageEvent.model_validate(
+                        _canonical_copy(stored.event.model_dump(mode="json"))
+                    ),
+                )
+                for stored in self.stored_events
+                if stored.event.run_id == run
+                and stored.event.particle_id == particle
+                and stored.event.iteration_id == iteration
+            )
 
     def commit_stage_transition(
         self, event: StageEvent, checkpoint: EpisodeCheckpoint
     ) -> None:
+        if not isinstance(event, StageEvent):
+            raise TypeError("event must be a StageEvent")
+        if not isinstance(checkpoint, EpisodeCheckpoint):
+            raise TypeError("checkpoint must be an EpisodeCheckpoint")
+        if event.event_type == "started":
+            raise ValueError("stage transition requires a terminal event")
         if checkpoint.terminal_event_sequence is not None:
             raise ValueError("input checkpoint sequence must be empty")
         if (
@@ -141,8 +239,9 @@ class FakeRunStore:
             checkpoint.terminal_event_type,
         ):
             raise ValueError("event and checkpoint fields must match")
-        if self.run_hashes.get(event.run_id) != checkpoint.protocol_snapshot_hash:
-            raise ValueError("checkpoint protocol hash does not match run snapshot hash")
+        checkpoint_input = checkpoint.model_dump(mode="json")
+        canonical_checkpoint = _canonical_json(checkpoint_input)
+        canonical_event = _canonical_json(event.model_dump(mode="json"))
         transition_key = (
             event.run_id,
             event.particle_id,
@@ -150,62 +249,133 @@ class FakeRunStore:
             event.stage,
             event.attempt,
         )
-        existing = self._transitions.get(transition_key)
-        checkpoint_input = checkpoint.model_dump(mode="json")
-        if existing is not None:
-            existing_event, existing_checkpoint = existing
-            comparable = copy.deepcopy(existing_checkpoint)
-            comparable["terminal_event_sequence"] = None
-            if (
-                _canonical_json(existing_event.model_dump(mode="json"))
-                != _canonical_json(event.model_dump(mode="json"))
-                or _canonical_json(comparable) != _canonical_json(checkpoint_input)
-            ):
-                raise ValueError("stage transition conflict")
-            return
-        self.append_stage_event(event)
-        sequence = self.stored_events[-1].sequence
-        stored_checkpoint = copy.deepcopy(checkpoint_input)
-        stored_checkpoint["terminal_event_sequence"] = sequence
-        EpisodeCheckpoint.model_validate(stored_checkpoint)
-        key = (checkpoint.run_id, checkpoint.particle_id, checkpoint.iteration_id)
-        self.checkpoints.setdefault(key, []).append(stored_checkpoint)
-        self._transitions[transition_key] = (event, stored_checkpoint)
+        with self._lock:
+            if self.run_hashes.get(event.run_id) != checkpoint.protocol_snapshot_hash:
+                raise ValueError("checkpoint protocol hash does not match run snapshot hash")
+            existing = self._transitions.get(transition_key)
+            if existing is not None:
+                existing_event, existing_checkpoint = existing
+                comparable = copy.deepcopy(existing_checkpoint)
+                comparable["terminal_event_sequence"] = None
+                if (
+                    _canonical_json(existing_event.model_dump(mode="json"))
+                    != canonical_event
+                    or _canonical_json(comparable) != canonical_checkpoint
+                ):
+                    raise ValueError("stage transition conflict")
+                return
+            self.append_stage_event(event)
+            sequence = self.stored_events[-1].sequence
+            stored_checkpoint = dict(_canonical_copy(checkpoint_input))
+            stored_checkpoint["terminal_event_sequence"] = sequence
+            validated = EpisodeCheckpoint.model_validate(stored_checkpoint)
+            stored_checkpoint = dict(
+                _canonical_copy(validated.model_dump(mode="json"))
+            )
+            key = (checkpoint.run_id, checkpoint.particle_id, checkpoint.iteration_id)
+            self.checkpoints.setdefault(key, []).append(stored_checkpoint)
+            self._transitions[transition_key] = (event, copy.deepcopy(stored_checkpoint))
 
     def get_latest_stage_checkpoint_json(
         self, run_id: str, particle_id: str, iteration_id: int
     ) -> Mapping[str, JsonValue] | None:
-        values = self.checkpoints.get((run_id, particle_id, iteration_id), [])
-        return None if not values else copy.deepcopy(values[-1])
+        run = _require_identifier(run_id, "run_id")
+        particle = _require_identifier(particle_id, "particle_id")
+        iteration = _require_iteration(iteration_id)
+        with self._lock:
+            values = self.checkpoints.get((run, particle, iteration), [])
+            if not values:
+                return None
+            try:
+                checkpoint = EpisodeCheckpoint.model_validate(values[-1])
+                if (
+                    checkpoint.run_id,
+                    checkpoint.particle_id,
+                    checkpoint.iteration_id,
+                ) != (run, particle, iteration):
+                    raise ValueError("checkpoint identity does not match its index")
+                sequence = checkpoint.terminal_event_sequence
+                if sequence is None:
+                    raise ValueError("checkpoint has no terminal event sequence")
+                matches = [stored for stored in self.stored_events if stored.sequence == sequence]
+                if len(matches) != 1:
+                    raise ValueError("checkpoint terminal event is missing or duplicated")
+                event = matches[0].event
+                if event.event_type == "started":
+                    raise ValueError("checkpoint points to a started event")
+                if (
+                    checkpoint.run_id,
+                    checkpoint.particle_id,
+                    checkpoint.iteration_id,
+                    checkpoint.completed_stage,
+                    checkpoint.completed_attempt,
+                    checkpoint.terminal_event_type,
+                ) != (
+                    event.run_id,
+                    event.particle_id,
+                    event.iteration_id,
+                    event.stage,
+                    event.attempt,
+                    event.event_type,
+                ):
+                    raise ValueError("checkpoint terminal event does not match")
+                if self.run_hashes.get(run) != checkpoint.protocol_snapshot_hash:
+                    raise ValueError("checkpoint protocol hash does not match run")
+                value = _canonical_copy(checkpoint.model_dump(mode="json"))
+                if not isinstance(value, dict):
+                    raise ValueError("checkpoint must serialize as an object")
+                return value
+            except Exception as error:
+                raise RuntimeError("store corrupted: invalid stage checkpoint") from error
 
     def get_iteration_snapshot_json(
         self, run_id: str, iteration_id: int
     ) -> Mapping[str, JsonValue] | None:
-        value = self.snapshots.get((run_id, iteration_id))
-        return None if value is None else copy.deepcopy(value)
+        run = _require_identifier(run_id, "run_id")
+        iteration = _require_iteration(iteration_id)
+        with self._lock:
+            value = self.snapshots.get((run, iteration))
+            return None if value is None else dict(_canonical_copy(value))
 
     def get_latest_committed_snapshot_json(
         self, run_id: str
     ) -> Mapping[str, JsonValue] | None:
-        matches = [
-            (iteration_id, value)
-            for (candidate_run, iteration_id), value in self.snapshots.items()
-            if candidate_run == run_id
-        ]
-        return None if not matches else copy.deepcopy(max(matches, key=lambda item: item[0])[1])
+        run = _require_identifier(run_id, "run_id")
+        with self._lock:
+            matches = [
+                (iteration_id, value)
+                for (candidate_run, iteration_id), value in self.snapshots.items()
+                if candidate_run == run
+            ]
+            if not matches:
+                return None
+            return dict(_canonical_copy(max(matches, key=lambda item: item[0])[1]))
 
     def get_committed_tool_result(self, key: str) -> ToolResult | None:
-        return self.recorded.get(key, self.cached)
+        identifier = _require_identifier(key, "idempotency_key")
+        with self._lock:
+            value = self.recorded.get(identifier, self.cached)
+            return None if value is None else _tool_result_copy(value)
 
     def record_tool_result(self, key: str, result: ToolResult) -> None:
-        self.recorded[key] = result
+        identifier = _require_identifier(key, "idempotency_key")
+        if not isinstance(result, ToolResult):
+            raise TypeError("result must be a ToolResult")
+        serialized = _canonical_json(result.to_json())
+        with self._lock:
+            existing = self.recorded.get(identifier)
+            if existing is None:
+                self.recorded[identifier] = _tool_result_copy(result)
+            elif _canonical_json(existing.to_json()) != serialized:
+                raise ValueError("idempotency key conflict: committed result differs")
 
     def iteration_transaction(self, run_id: str, iteration_id: int) -> "FakeTransaction":
-        if run_id not in self.run_hashes:
-            raise ValueError("unknown run_id")
-        if type(iteration_id) is not int or iteration_id < 0:
-            raise ValueError("iteration_id must be a nonnegative integer")
-        return FakeTransaction(self, run_id, iteration_id)
+        run = _require_identifier(run_id, "run_id")
+        iteration = _require_iteration(iteration_id)
+        with self._lock:
+            if run not in self.run_hashes:
+                raise ValueError("unknown run_id")
+        return FakeTransaction(self, run, iteration)
 
 
 class FakeTransaction:
@@ -249,41 +419,61 @@ class FakeTransaction:
         if self.snapshot is None:
             self.closed = True
             raise ValueError("iteration transaction requires a snapshot before commit")
-        state = {
-            "snapshot": copy.deepcopy(self.snapshot),
-            "particles": copy.deepcopy(self.particles),
-            "pbests": copy.deepcopy(self.pbests),
-            "gbest": copy.deepcopy(self.gbest),
+        raw_state = {
+            "snapshot": self.snapshot,
+            "particles": self.particles,
+            "pbests": self.pbests,
+            "gbest": self.gbest,
         }
-        key = (self.run_id, self.iteration_id)
-        existing = self.store.iteration_states.get(key)
-        if existing is not None:
+        try:
+            with self.store._lock:
+                canonical_state = _canonical_copy(raw_state)
+                if not isinstance(canonical_state, dict):
+                    raise TypeError("iteration state must be a JSON object")
+                state = canonical_state
+                key = (self.run_id, self.iteration_id)
+                existing = self.store.iteration_states.get(key)
+                if existing is not None:
+                    if _canonical_json(existing) != _canonical_json(state):
+                        raise ValueError("iteration state conflict")
+                    return
+                snapshots = dict(self.store.snapshots)
+                particles = dict(self.store.particles)
+                iteration_particles = dict(self.store.iteration_particles)
+                pbest_history = dict(self.store.pbest_history)
+                gbest_history = dict(self.store.gbest_history)
+                iteration_states = dict(self.store.iteration_states)
+                snapshot = state["snapshot"]
+                staged_particles = state["particles"]
+                staged_pbests = state["pbests"]
+                staged_gbest = state["gbest"]
+                if not isinstance(snapshot, dict):
+                    raise TypeError("snapshot must be a JSON object")
+                if not isinstance(staged_particles, dict) or not isinstance(staged_pbests, dict):
+                    raise TypeError("particle state must be JSON object mappings")
+                snapshots[key] = copy.deepcopy(snapshot)
+                for particle_id, payload in staged_particles.items():
+                    if not isinstance(payload, dict):
+                        raise TypeError("particle payload must be a JSON object")
+                    particles[(self.run_id, particle_id)] = copy.deepcopy(payload)
+                    iteration_particles[(self.run_id, self.iteration_id, particle_id)] = copy.deepcopy(payload)
+                for particle_id, payload in staged_pbests.items():
+                    if not isinstance(payload, dict):
+                        raise TypeError("pbest payload must be a JSON object")
+                    pbest_history[(self.run_id, self.iteration_id, particle_id)] = copy.deepcopy(payload)
+                if staged_gbest is not None:
+                    if not isinstance(staged_gbest, dict):
+                        raise TypeError("gbest payload must be a JSON object")
+                    gbest_history[key] = copy.deepcopy(staged_gbest)
+                iteration_states[key] = copy.deepcopy(state)
+                self.store.snapshots = snapshots
+                self.store.particles = particles
+                self.store.iteration_particles = iteration_particles
+                self.store.pbest_history = pbest_history
+                self.store.gbest_history = gbest_history
+                self.store.iteration_states = iteration_states
+        finally:
             self.closed = True
-            if _canonical_json(existing) != _canonical_json(state):
-                raise ValueError("iteration state conflict")
-            return
-        snapshots = dict(self.store.snapshots)
-        particles = dict(self.store.particles)
-        iteration_particles = dict(self.store.iteration_particles)
-        pbest_history = dict(self.store.pbest_history)
-        gbest_history = dict(self.store.gbest_history)
-        iteration_states = dict(self.store.iteration_states)
-        snapshots[key] = copy.deepcopy(self.snapshot)
-        for particle_id, payload in self.particles.items():
-            particles[(self.run_id, particle_id)] = copy.deepcopy(payload)
-            iteration_particles[(self.run_id, self.iteration_id, particle_id)] = copy.deepcopy(payload)
-        for particle_id, payload in self.pbests.items():
-            pbest_history[(self.run_id, self.iteration_id, particle_id)] = copy.deepcopy(payload)
-        if self.gbest is not None:
-            gbest_history[key] = copy.deepcopy(self.gbest)
-        iteration_states[key] = state
-        self.store.snapshots = snapshots
-        self.store.particles = particles
-        self.store.iteration_particles = iteration_particles
-        self.store.pbest_history = pbest_history
-        self.store.gbest_history = gbest_history
-        self.store.iteration_states = iteration_states
-        self.closed = True
 
     def rollback(self) -> None:
         self._require_open()

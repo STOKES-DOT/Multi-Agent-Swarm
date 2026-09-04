@@ -758,3 +758,108 @@ def test_concurrent_different_stage_transition_is_first_wins(tmp_path: Path) -> 
         thread.join()
     assert sorted(outcomes) == ["conflict", "success"]
     assert len(store.list_stage_events("run-1", "p0", 0)) == 1
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "missing_sequence",
+        "started_sequence",
+        "other_identity",
+        "checkpoint_identity",
+        "stage",
+        "event_type",
+        "hash",
+    ],
+)
+def test_latest_checkpoint_rejects_cross_record_corruption(
+    tmp_path: Path, corruption: str
+) -> None:
+    path = tmp_path / "runs.sqlite"
+    store = SQLiteRunStore(path)
+    store.create_run("run-1", "a" * 64)
+    started = StageEvent(
+        run_id="run-1", particle_id="p0", iteration_id=0,
+        stage=AgentStage.EXECUTING, attempt=0, event_type="started",
+    )
+    store.append_stage_event(started)
+    terminal = StageEvent(
+        run_id="run-1", particle_id="p0", iteration_id=0,
+        stage=AgentStage.EXECUTING, attempt=0, event_type="completed",
+    )
+    store.commit_stage_transition(terminal, _checkpoint())
+    events = store.list_stage_events("run-1", "p0", 0)
+    started_sequence, terminal_sequence = (event.sequence for event in events)
+
+    with sqlite3.connect(path) as connection:
+        checkpoint_json = json.loads(
+            connection.execute(
+                "SELECT payload_json FROM thread_checkpoints ORDER BY checkpoint_id DESC LIMIT 1"
+            ).fetchone()[0]
+        )
+        if corruption == "missing_sequence":
+            checkpoint_json["terminal_event_sequence"] = terminal_sequence + 999
+        elif corruption == "started_sequence":
+            checkpoint_json["terminal_event_sequence"] = started_sequence
+        elif corruption == "other_identity":
+            cursor = connection.execute(
+                """INSERT INTO stage_events
+                (run_id, particle_id, iteration_id, stage, attempt, event_type, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                ("run-1", "p1", 0, "EXECUTING", 0, "completed", "{}"),
+            )
+            checkpoint_json["terminal_event_sequence"] = cursor.lastrowid
+        elif corruption == "checkpoint_identity":
+            connection.execute("INSERT INTO runs VALUES (?, ?)", ("run-2", "a" * 64))
+            cursor = connection.execute(
+                """INSERT INTO stage_events
+                (run_id, particle_id, iteration_id, stage, attempt, event_type, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                ("run-2", "p1", 0, "EXECUTING", 0, "completed", "{}"),
+            )
+            checkpoint_json["run_id"] = "run-2"
+            checkpoint_json["particle_id"] = "p1"
+            checkpoint_json["context"]["run_id"] = "run-2"
+            checkpoint_json["context"]["particle_id"] = "p1"
+            checkpoint_json["terminal_event_sequence"] = cursor.lastrowid
+        elif corruption == "stage":
+            connection.execute(
+                "UPDATE stage_events SET stage = 'EVALUATING' WHERE event_id = ?",
+                (terminal_sequence,),
+            )
+        elif corruption == "event_type":
+            connection.execute(
+                "UPDATE stage_events SET event_type = 'failed' WHERE event_id = ?",
+                (terminal_sequence,),
+            )
+        else:
+            checkpoint_json["protocol_snapshot_hash"] = "b" * 64
+            checkpoint_json["context"]["protocol_snapshot_hash"] = "b" * 64
+        connection.execute(
+            "UPDATE thread_checkpoints SET payload_json = ?",
+            (json.dumps(checkpoint_json, sort_keys=True, separators=(",", ":")),),
+        )
+        connection.commit()
+
+    with pytest.raises(RuntimeError, match="store corrupted"):
+        store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+
+
+def test_latest_checkpoint_returns_validated_defensive_canonical_copy(tmp_path: Path) -> None:
+    store = SQLiteRunStore(tmp_path / "runs.sqlite")
+    store.create_run("run-1", "a" * 64)
+    event = StageEvent(
+        run_id="run-1", particle_id="p0", iteration_id=0,
+        stage=AgentStage.EXECUTING, attempt=0, event_type="completed",
+    )
+    store.commit_stage_transition(event, _checkpoint())
+    first = store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    EpisodeCheckpoint.model_validate(first)
+    first["context"]["nested"]["values"].append(99)
+    second = store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    assert second["context"]["nested"]["values"] == [1, 2]
+    assert json.dumps(second, sort_keys=True, separators=(",", ":")) == json.dumps(
+        EpisodeCheckpoint.model_validate(second).model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    )

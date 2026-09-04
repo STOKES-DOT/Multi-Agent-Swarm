@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import threading
 from collections.abc import Mapping
 
 import pytest
@@ -12,10 +14,11 @@ from multi_agent_pso.core import (
     EpisodeStatus,
     EvaluationStatus,
     StageEvent,
+    StoredStageEvent,
 )
 from multi_agent_pso.orchestration import AgentLoop, AuditPersistenceError
 import multi_agent_pso.orchestration.agent_loop as agent_loop_module
-from multi_agent_pso.protocols import ToolStatus
+from multi_agent_pso.protocols import ToolResult, ToolStatus
 
 from .fakes import FakeRunStore, make_fake_dependencies
 
@@ -1286,3 +1289,142 @@ def test_fake_iteration_transaction_commits_and_rolls_back_atomically() -> None:
     with pytest.raises(ValueError, match="snapshot"):
         tx.commit()
     assert store.get_iteration_snapshot_json("run-1", 1) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"value": math.nan},
+        {"value": math.inf},
+        {"value": {1: "non-string key"}},
+        {"value": object()},
+    ],
+)
+def test_fake_iteration_rejects_noncanonical_json_without_writes(payload) -> None:
+    store = FakeRunStore()
+    store.create_run("run-1", "a" * 64)
+    tx = store.iteration_transaction("run-1", 0)
+    tx.put_snapshot_json(payload)
+    with pytest.raises((TypeError, ValueError)):
+        tx.commit()
+    assert store.get_latest_committed_snapshot_json("run-1") is None
+
+
+@pytest.mark.parametrize("corruption", ["sequence", "event", "checkpoint_identity", "hash"])
+def test_fake_latest_checkpoint_rejects_cross_record_corruption(corruption: str) -> None:
+    store = FakeRunStore()
+    store.create_run("run-1", "a" * 64)
+    event = StageEvent(
+        run_id="run-1", particle_id="p0", iteration_id=0,
+        stage=AgentStage.EXECUTING, attempt=0, event_type="completed",
+    )
+    store.commit_stage_transition(event, _fake_checkpoint())
+    if corruption == "sequence":
+        store.checkpoints[("run-1", "p0", 0)][-1]["terminal_event_sequence"] = 999
+    elif corruption == "event":
+        stored = store.stored_events[-1]
+        store.stored_events[-1] = StoredStageEvent(
+            sequence=stored.sequence,
+            event=stored.event.model_copy(update={"stage": AgentStage.EVALUATING}),
+        )
+    elif corruption == "checkpoint_identity":
+        store.create_run("run-2", "a" * 64)
+        foreign_event = StageEvent(
+            run_id="run-2", particle_id="p1", iteration_id=0,
+            stage=AgentStage.EXECUTING, attempt=0, event_type="completed",
+        )
+        store.append_stage_event(foreign_event)
+        value = store.checkpoints[("run-1", "p0", 0)][-1]
+        value["run_id"] = "run-2"
+        value["particle_id"] = "p1"
+        value["context"]["run_id"] = "run-2"
+        value["context"]["particle_id"] = "p1"
+        value["terminal_event_sequence"] = store.stored_events[-1].sequence
+    else:
+        store.run_hashes["run-1"] = "b" * 64
+    with pytest.raises(RuntimeError, match="store corrupted"):
+        store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+
+
+@pytest.mark.parametrize("different", [False, True])
+def test_fake_stage_transition_concurrency_matches_first_wins(different: bool) -> None:
+    store = FakeRunStore()
+    store.create_run("run-1", "a" * 64)
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def write(value: int) -> None:
+        try:
+            barrier.wait()
+            store.commit_stage_transition(
+                StageEvent(
+                    run_id="run-1", particle_id="p0", iteration_id=0,
+                    stage=AgentStage.EXECUTING, attempt=0,
+                    event_type="completed", payload={"value": value},
+                ),
+                _fake_checkpoint(),
+            )
+            outcomes.append("success")
+        except ValueError:
+            outcomes.append("conflict")
+
+    values = (1, 2) if different else (1, 1)
+    threads = [threading.Thread(target=write, args=(value,)) for value in values]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(store.list_stage_events("run-1", "p0", 0)) == 1
+    assert sorted(outcomes) == (["conflict", "success"] if different else ["success", "success"])
+
+
+@pytest.mark.parametrize("different", [False, True])
+def test_fake_tool_result_concurrency_matches_first_wins(different: bool) -> None:
+    store = FakeRunStore()
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def write(value: int) -> None:
+        try:
+            barrier.wait()
+            store.record_tool_result(
+                "key", ToolResult(ToolStatus.SUCCESS, {"value": value})
+            )
+            outcomes.append("success")
+        except ValueError:
+            outcomes.append("conflict")
+
+    values = (1, 2) if different else (1, 1)
+    threads = [threading.Thread(target=write, args=(value,)) for value in values]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(outcomes) == (["conflict", "success"] if different else ["success", "success"])
+
+
+@pytest.mark.parametrize("different", [False, True])
+def test_fake_iteration_concurrency_matches_first_wins(different: bool) -> None:
+    store = FakeRunStore()
+    store.create_run("run-1", "a" * 64)
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def write(value: int) -> None:
+        try:
+            barrier.wait()
+            with store.iteration_transaction("run-1", 0) as tx:
+                tx.put_particle_json("p0", {"position": [value]})
+                tx.put_snapshot_json({"iteration": 0, "value": value})
+            outcomes.append("success")
+        except ValueError:
+            outcomes.append("conflict")
+
+    values = (1, 2) if different else (1, 1)
+    threads = [threading.Thread(target=write, args=(value,)) for value in values]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(outcomes) == (["conflict", "success"] if different else ["success", "success"])
+    assert len(store.iteration_states) == 1

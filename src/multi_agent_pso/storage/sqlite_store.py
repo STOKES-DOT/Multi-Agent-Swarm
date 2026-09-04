@@ -490,16 +490,77 @@ class SQLiteRunStore:
     def get_latest_stage_checkpoint_json(
         self, run_id: str, particle_id: str, iteration_id: int
     ) -> dict[str, JsonValue] | None:
-        return self._get_json(
-            """SELECT payload_json FROM thread_checkpoints
-            WHERE run_id = ? AND particle_id = ? AND iteration_id = ?
-            ORDER BY checkpoint_id DESC LIMIT 1""",
-            (
-                _require_identifier(run_id, "run_id"),
-                _require_identifier(particle_id, "particle_id"),
-                _require_iteration(iteration_id),
-            ),
-        )
+        run = _require_identifier(run_id, "run_id")
+        particle = _require_identifier(particle_id, "particle_id")
+        iteration = _require_iteration(iteration_id)
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """SELECT payload_json FROM thread_checkpoints
+                WHERE run_id = ? AND particle_id = ? AND iteration_id = ?
+                ORDER BY checkpoint_id DESC LIMIT 1""",
+                (run, particle, iteration),
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                checkpoint = EpisodeCheckpoint.model_validate(
+                    json.loads(row["payload_json"])
+                )
+                if (
+                    checkpoint.run_id,
+                    checkpoint.particle_id,
+                    checkpoint.iteration_id,
+                ) != (run, particle, iteration):
+                    raise ValueError("checkpoint identity does not match its index")
+                sequence = checkpoint.terminal_event_sequence
+                if sequence is None:
+                    raise ValueError("checkpoint has no terminal event sequence")
+                event_row = connection.execute(
+                    """SELECT event_id, run_id, particle_id, iteration_id, stage,
+                    attempt, event_type, payload_json FROM stage_events
+                    WHERE event_id = ?""",
+                    (sequence,),
+                ).fetchone()
+                if event_row is None:
+                    raise ValueError("checkpoint terminal event is missing")
+                event = self._stage_event_from_row(event_row)
+                if event.event_type == "started":
+                    raise ValueError("checkpoint points to a started event")
+                if (
+                    checkpoint.run_id,
+                    checkpoint.particle_id,
+                    checkpoint.iteration_id,
+                    checkpoint.completed_stage,
+                    checkpoint.completed_attempt,
+                    checkpoint.terminal_event_type,
+                ) != (
+                    event.run_id,
+                    event.particle_id,
+                    event.iteration_id,
+                    event.stage,
+                    event.attempt,
+                    event.event_type,
+                ):
+                    raise ValueError("checkpoint terminal event does not match")
+                run_row = connection.execute(
+                    "SELECT snapshot_hash FROM runs WHERE run_id = ?", (run,)
+                ).fetchone()
+                if (
+                    run_row is None
+                    or run_row["snapshot_hash"] != checkpoint.protocol_snapshot_hash
+                ):
+                    raise ValueError("checkpoint protocol hash does not match run")
+                canonical = _canonical_json(checkpoint.model_dump(mode="json"))
+                value = json.loads(canonical)
+                if not isinstance(value, dict):
+                    raise ValueError("checkpoint must serialize as an object")
+                return value
+            except Exception as error:
+                raise RuntimeError("store corrupted: invalid stage checkpoint") from error
+        finally:
+            connection.close()
+            self._secure_database_files(suppress_errors=True)
 
     def get_committed_tool_result(self, idempotency_key: str) -> ToolResult | None:
         key = _require_identifier(idempotency_key, "idempotency_key")
