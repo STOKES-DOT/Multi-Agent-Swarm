@@ -22,6 +22,8 @@ conda run -n multi-agent-pso multi-agent-pso benchmark rastrigin --runs-dir /pri
 
 每个 run 目录包含 `runs.sqlite` 与 `artifacts/summary.json`。summary 记录 protocol/config descriptor、`initial_gbest`、`final_gbest` 和相对输出引用。相同 descriptor 在独立目录生成相同的 snapshot state；改变 seed、dimension、边界、拓扑或更新参数会改变 run/config identity。
 
+在已有 Python event loop 中，请使用 `await run_continuous_benchmark_async(...)`；同步 `run_continuous_benchmark(...)` 会明确拒绝在 active loop 内运行，避免嵌套 event loop。
+
 ## 1. 目标
 
 本项目讨论一种用于功能分子设计的 Multi-Agent PSO 架构。

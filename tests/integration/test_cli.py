@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from multi_agent_pso.cli import main
+from multi_agent_pso.benchmarks import run_continuous_benchmark, run_continuous_benchmark_async
 
 
 def test_benchmark_cli_runs_sphere_and_writes_summary(tmp_path, capsys) -> None:
@@ -33,3 +36,11 @@ def test_benchmark_rerun_keeps_summary_bytes_and_iteration_count(tmp_path, capsy
     second = json.loads(capsys.readouterr().out)
     assert second == first
     assert summary.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_async_benchmark_api_is_required_inside_running_loop(tmp_path) -> None:
+    with pytest.raises(RuntimeError, match="async"):
+        run_continuous_benchmark("sphere", 1, tmp_path)
+    result = await run_continuous_benchmark_async("sphere", 1, tmp_path, particles=2, iterations=1, dimension=2)
+    assert result.summary["benchmark"] == "sphere"

@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -34,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
             result = run_continuous_benchmark(args.name, args.seed, args.runs_dir, particles=args.particles, iterations=args.iterations, dimension=args.dimension)
             print(json.dumps(result.summary, sort_keys=True, separators=(",", ":")))
             return 0
-        except (ValueError, RuntimeError) as error:
+        except (ValueError, RuntimeError, sqlite3.Error, OSError) as error:
             print(f"benchmark error: {error}", file=sys.stderr)
             return 2
     if args.command in {"run", "resume", "status"}:

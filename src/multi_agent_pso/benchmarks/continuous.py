@@ -29,8 +29,11 @@ from multi_agent_pso.storage import FileArtifactStore, SQLiteRunStore
 
 
 def _vector(value: object) -> np.ndarray:
-    array = np.asarray(value, dtype=np.float64)
-    if array.ndim != 1 or array.size == 0 or not np.all(np.isfinite(array)):
+    raw = np.asarray(value)
+    if raw.ndim != 1 or raw.size == 0 or raw.dtype.kind not in "iuf":
+        raise ValueError("benchmark input must be a nonempty finite 1D float64 vector")
+    array = np.array(raw, dtype=np.float64, copy=True)
+    if not np.all(np.isfinite(array)):
         raise ValueError("benchmark input must be a nonempty finite 1D float64 vector")
     return array
 
@@ -160,9 +163,22 @@ def _run_id(descriptor: Mapping[str, JsonValue]) -> str:
     return "stagea-" + hashlib.sha256(_canonical(["stage-a-run", descriptor]).encode()).hexdigest()[:24]
 
 
-def run_continuous_benchmark(name: str, seed: int, runs_dir: Path, *, particles: int = 5, iterations: int = 2, dimension: int = 3) -> BenchmarkResult:
+def _validate_arguments(name: str, seed: int, runs_dir: Path, particles: int, iterations: int, dimension: int) -> None:
     if not isinstance(name, str) or name not in {"sphere", "rastrigin"} or type(seed) is not int or seed < 0 or not isinstance(runs_dir, Path) or type(particles) is not int or not 1 <= particles <= 5 or type(iterations) is not int or iterations < 1 or type(dimension) is not int or dimension < 1:
         raise ValueError("invalid Stage A benchmark arguments")
+
+
+def run_continuous_benchmark(name: str, seed: int, runs_dir: Path, *, particles: int = 5, iterations: int = 2, dimension: int = 3) -> BenchmarkResult:
+    _validate_arguments(name, seed, runs_dir, particles, iterations, dimension)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(run_continuous_benchmark_async(name, seed, runs_dir, particles=particles, iterations=iterations, dimension=dimension))
+    raise RuntimeError("run_continuous_benchmark cannot run inside an active event loop; use run_continuous_benchmark_async")
+
+
+async def run_continuous_benchmark_async(name: str, seed: int, runs_dir: Path, *, particles: int = 5, iterations: int = 2, dimension: int = 3) -> BenchmarkResult:
+    _validate_arguments(name, seed, runs_dir, particles, iterations, dimension)
     fitness = sphere_fitness if name == "sphere" else rastrigin_fitness
     descriptor = _descriptor(name, seed, particles, iterations, dimension)
     run_id = _run_id(descriptor)
@@ -180,7 +196,7 @@ def run_continuous_benchmark(name: str, seed: int, runs_dir: Path, *, particles:
     def factory(target: JsonValue) -> AgentLoop:
         return AgentLoop(runtime=runtime, task_adapter=adapter, evaluator=evaluator, tool_provider=tool, artifact_store=artifacts, resource_manager=resources, run_store=store, target_position=target, workspace=root.resolve(), protocol_snapshot_hash=config_hash)
     runner = SynchronousSwarmRunner(run_id=run_id, run_seed=seed, config_snapshot_hash=config_hash, space=space, adapter=adapter, topology=RingTopology(), update_rule=ConstrictedUpdateRule(), store=store, episode_factory=factory, particle_ids=tuple(f"p{i}" for i in range(particles)), resource_budget={"benchmark": name}, failure_threshold=2)
-    result = asyncio.run(runner.run(iterations=iterations))
+    result = await runner.run(iterations=iterations)
     initial_json = store.get_iteration_snapshot_json(run_id, 0)
     if initial_json is None:
         raise RuntimeError("committed initial snapshot is missing")
