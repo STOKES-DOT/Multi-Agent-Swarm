@@ -418,7 +418,7 @@ class IterationSnapshot(_FrozenModel):
     state_format_version: Literal[1] = 1
     run_id: str = Field(min_length=1)
     iteration_id: int = Field(ge=0)
-    particles: tuple[ParticleState, ...] = ()
+    particles: tuple[ParticleState, ...] = Field(min_length=1)
     gbest: PersonalBest | None = None
     config_snapshot_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     rng_state: JsonValue
@@ -474,6 +474,8 @@ class IterationSnapshot(_FrozenModel):
             for particle in self.particles
             if particle.pbest is not None
         }
+        if bool(bests) != (self.gbest is not None):
+            raise ValueError("global best must exist exactly when personal bests exist")
         if any(
             best.iteration_id > self.iteration_id for best in bests.values()
         ):

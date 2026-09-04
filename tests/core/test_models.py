@@ -748,6 +748,36 @@ def test_initial_snapshot_allows_no_update_traces() -> None:
     assert snapshot.update_traces == {}
 
 
+def test_snapshot_requires_particles_and_global_best_completeness() -> None:
+    with pytest.raises(ValidationError, match="particle"):
+        IterationSnapshot(
+            run_id="run-1", iteration_id=0, particles=(), gbest=None,
+            config_snapshot_hash="a" * 64, rng_state={},
+            sbest_particle_ids={}, resource_budget={}, update_traces={},
+        )
+    best = PersonalBest(
+        evaluated_position={}, candidate_reference="c", hypothesis_reference="h",
+        evaluation_reference="e", candidate_hash="a" * 64,
+        evaluation=_success_evaluation(), fitness=1.0, iteration_id=0,
+    )
+    particle_with_best = ParticleState(
+        particle_id="p0", position={}, velocity={}, pbest=best, rng_state={}
+    )
+    particle_without_best = ParticleState(
+        particle_id="p0", position={}, velocity={}, pbest=None, rng_state={}
+    )
+    common = {
+        "run_id": "run-1", "iteration_id": 0,
+        "config_snapshot_hash": "a" * 64, "rng_state": {},
+        "sbest_particle_ids": {"p0": None}, "resource_budget": {},
+        "update_traces": {},
+    }
+    with pytest.raises(ValidationError, match="global best"):
+        IterationSnapshot(**common, particles=(particle_with_best,), gbest=None)
+    with pytest.raises(ValidationError, match="global best"):
+        IterationSnapshot(**common, particles=(particle_without_best,), gbest=best)
+
+
 def test_stored_stage_event_and_episode_checkpoint_validate_identity() -> None:
     assert hasattr(core_models, "StoredStageEvent")
     assert hasattr(core_models, "EpisodeCheckpoint")

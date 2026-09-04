@@ -112,6 +112,8 @@ def _compare_bests(
     adapter: TaskAdapter[Any],
 ) -> int:
     compared = adapter.compare(left[1].evaluation, right[1].evaluation)
+    if type(compared) is not int:
+        raise TypeError("TaskAdapter.compare must return an exact int")
     if compared:
         return 1 if compared > 0 else -1
     if left[1].candidate_hash != right[1].candidate_hash:

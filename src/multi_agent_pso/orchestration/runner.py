@@ -90,9 +90,6 @@ class SynchronousSwarmRunner(Generic[P, V]):
         latest = self.store.get_latest_committed_snapshot_json(self.run_id)
         if latest is not None:
             return self._validated_snapshot(latest)
-        self.store.create_run(self.run_id, self.config_snapshot_hash)
-        if self.store.get_run_snapshot_hash(self.run_id) != self.config_snapshot_hash:
-            raise IncompatibleCheckpointError("run config snapshot hash is incompatible")
         snapshot = self._initial_snapshot
         if snapshot is None:
             snapshot = build_initial_snapshot(
@@ -103,7 +100,10 @@ class SynchronousSwarmRunner(Generic[P, V]):
                 space=self.space,
                 resource_budget=self.resource_budget,
             )
-        self._validate_snapshot_identity(snapshot)
+        self._validate_initial_snapshot(snapshot)
+        self.store.create_run(self.run_id, self.config_snapshot_hash)
+        if self.store.get_run_snapshot_hash(self.run_id) != self.config_snapshot_hash:
+            raise IncompatibleCheckpointError("run config snapshot hash is incompatible")
         self._commit_snapshot(snapshot)
         stored = self.store.get_latest_committed_snapshot_json(self.run_id)
         if stored is None:
@@ -111,11 +111,17 @@ class SynchronousSwarmRunner(Generic[P, V]):
         return self._validated_snapshot(stored)
 
     async def run(self, *, iterations: int) -> SwarmRunResult:
-        if type(iterations) is not int or iterations < 0:
-            raise ValueError("iterations must be a nonnegative absolute target")
+        if type(iterations) is not int or iterations <= 0:
+            raise ValueError("iterations must be a positive integer absolute target")
         current = self.ensure_initial_snapshot()
         snapshots = [current]
         generations: list[GenerationResult] = []
+        if current.iteration_id > iterations:
+            raise ValueError("iteration target is behind the latest snapshot")
+        if current.run_status is RunStatus.COMPLETED:
+            if current.iteration_id != iterations:
+                raise ValueError("completed run only accepts its existing target")
+            return SwarmRunResult(current, tuple(snapshots), ())
         while current.iteration_id < iterations:
             if current.run_status is RunStatus.PAUSED_NO_SUCCESS:
                 break
@@ -215,6 +221,20 @@ class SynchronousSwarmRunner(Generic[P, V]):
             self.resource_budget
         ):
             raise IncompatibleCheckpointError("snapshot resource budget is incompatible")
+
+    def _validate_initial_snapshot(self, snapshot: IterationSnapshot) -> None:
+        if not isinstance(snapshot, IterationSnapshot):
+            raise IncompatibleCheckpointError("initial snapshot must be typed")
+        if snapshot.iteration_id != 0:
+            raise IncompatibleCheckpointError("initial snapshot iteration must be zero")
+        if snapshot.run_status is not RunStatus.RUNNING:
+            raise IncompatibleCheckpointError("initial snapshot status must be RUNNING")
+        if snapshot.update_traces:
+            raise IncompatibleCheckpointError("initial snapshot update traces must be empty")
+        try:
+            self._validate_snapshot_identity(snapshot)
+        except IncompatibleCheckpointError as error:
+            raise IncompatibleCheckpointError("initial snapshot identity is incompatible") from error
 
     @staticmethod
     def _canonical_json(value: object) -> str:

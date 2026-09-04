@@ -35,6 +35,14 @@ class SelectiveTopology:
         return None if particle_id == "p0" else "p1"
 
 
+class InvalidCompareAdapter(QualityAdapter):
+    def __init__(self, result):
+        self.result = result
+
+    def compare(self, left, right):
+        return self.result
+
+
 def _episode(
     particle_id: str,
     iteration_id: int,
@@ -238,6 +246,44 @@ def test_advance_snapshot_rejects_malformed_completed_success() -> None:
         )
 
 
+@pytest.mark.parametrize("result", [True, 1.0, np.int64(1)])
+def test_best_sort_rejects_non_exact_int_compare_result(result) -> None:
+    space = ContinuousBoxPositionSpace([-1.0], [1.0])
+    snapshot = initial_snapshot(
+        run_id="run-1", run_seed=41, config_snapshot_hash="2" * 64,
+        particle_ids=("p0", "p1"), space=space,
+    )
+    with pytest.raises((TypeError, ValueError), match="compare"):
+        advance_snapshot(
+            snapshot,
+            (_episode("p0", 0, quality=1), _episode("p1", 0, quality=2)),
+            run_seed=41, space=space, adapter=InvalidCompareAdapter(result),
+            topology=RingTopology(), update_rule=ConstrictedUpdateRule(),
+            failure_threshold=2,
+        )
+
+
+@pytest.mark.parametrize("result", [False, 0.0, np.int64(0)])
+def test_pbest_update_rejects_non_exact_int_compare_result(result) -> None:
+    space = ContinuousBoxPositionSpace([-1.0], [1.0])
+    initial = initial_snapshot(
+        run_id="run-1", run_seed=43, config_snapshot_hash="3" * 64,
+        particle_ids=("p0",), space=space,
+    )
+    with_best = advance_snapshot(
+        initial, (_episode("p0", 0, quality=1),), run_seed=43,
+        space=space, adapter=QualityAdapter(), topology=RingTopology(),
+        update_rule=ConstrictedUpdateRule(), failure_threshold=2,
+    )
+    with pytest.raises((TypeError, ValueError), match="compare"):
+        advance_snapshot(
+            with_best, (_episode("p0", 1, quality=2),), run_seed=43,
+            space=space, adapter=InvalidCompareAdapter(result),
+            topology=RingTopology(), update_rule=ConstrictedUpdateRule(),
+            failure_threshold=2,
+        )
+
+
 async def test_completion_order_does_not_change_next_snapshot(tmp_path) -> None:
     fast_first = make_fake_runner(
         tmp_path / "a", delays={"p0": 0.0, "p1": 0.02}, seed=42
@@ -289,6 +335,59 @@ async def test_no_success_generation_commits_pause_and_stops(tmp_path) -> None:
     ]
     latest = runner.store.get_latest_committed_snapshot_json("run-1")
     assert latest["run_status"] == RunStatus.PAUSED_NO_SUCCESS.value
+
+
+@pytest.mark.parametrize("iterations", [0, -1, True, 1.0])
+async def test_runner_requires_positive_exact_integer_target(tmp_path, iterations) -> None:
+    runner = make_fake_runner(tmp_path, delays={}, seed=47)
+    with pytest.raises(ValueError, match="positive"):
+        await runner.run(iterations=iterations)
+    assert runner.store.get_latest_committed_snapshot_json("run-1") is None
+
+
+async def test_completed_runner_only_allows_same_absolute_target(tmp_path) -> None:
+    runner = make_fake_runner(tmp_path, delays={}, seed=53)
+    first = await runner.run(iterations=1)
+    calls = list(runner.episode_calls)
+    same = await runner.run(iterations=1)
+    assert same.final_snapshot == first.final_snapshot
+    assert same.generations == ()
+    assert runner.episode_calls == calls
+    for target in (0, 2):
+        with pytest.raises(ValueError, match="completed|target"):
+            await runner.run(iterations=target)
+    assert runner.episode_calls == calls
+
+
+async def test_target_below_latest_running_snapshot_is_rejected(tmp_path) -> None:
+    runner = make_fake_runner(tmp_path, delays={}, seed=59)
+    await runner.run(iterations=2)
+    runner.store.snapshots[("run-1", 2)]["run_status"] = RunStatus.RUNNING.value
+    with pytest.raises(ValueError, match="behind|target"):
+        await runner.run(iterations=1)
+
+
+@pytest.mark.parametrize("case", ["iteration", "status", "traces"])
+async def test_invalid_provided_initial_snapshot_has_zero_writes_or_episodes(
+    tmp_path, case
+) -> None:
+    runner = make_fake_runner(tmp_path, delays={}, seed=61)
+    supplied = initial_snapshot(
+        run_id="run-1", run_seed=61,
+        config_snapshot_hash=runner.config_snapshot_hash,
+        particle_ids=("p0", "p1"), space=runner.space,
+        resource_budget=runner.resource_budget,
+    )
+    updates = {
+        "iteration": {"iteration_id": 1, "rng_state": {"run_seed": 61, "iteration": 1}},
+        "status": {"run_status": RunStatus.COMPLETED},
+        "traces": {"update_traces": {"unexpected": object()}},
+    }[case]
+    runner._initial_snapshot = supplied.model_copy(update=updates)
+    with pytest.raises(IncompatibleCheckpointError, match="initial"):
+        await runner.run(iterations=1)
+    assert runner.store.get_latest_committed_snapshot_json("run-1") is None
+    assert runner.episode_calls == []
 
 
 async def test_generation_failure_cancels_and_drains_sibling_tasks(tmp_path) -> None:
