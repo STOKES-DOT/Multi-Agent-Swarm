@@ -582,3 +582,167 @@ async def test_build_cancellation_records_request_error_before_interruption(tmp_
     ]
     assert [event.event_type for event in attempts] == ["started", "interrupted"]
     assert attempts[0].payload["request_error"]["type"] == "CancelledError"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("primary", "terminal_type", "audit_error"),
+    [
+        (RuntimeError("runtime primary"), "failed", asyncio.CancelledError("audit cancel")),
+        (TimeoutError("timeout primary"), "timeout", asyncio.CancelledError("audit cancel")),
+        (TimeoutError("timeout primary"), "timeout", SystemExit("audit exit")),
+    ],
+)
+async def test_business_primary_survives_base_exception_from_terminal_audit(
+    tmp_path, primary, terminal_type, audit_error
+):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        stage_exceptions={AgentStage.HYPOTHESIZING: primary},
+        audit_failure=audit_error,
+        audit_failure_stage=AgentStage.HYPOTHESIZING,
+        audit_failure_event_type=terminal_type,
+    )
+
+    with pytest.raises(type(primary)) as raised:
+        await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert raised.value is primary
+    assert raised.value.__cause__ is audit_error
+    assert any(type(audit_error).__name__ in note for note in raised.value.__notes__)
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["started", "failed"])
+async def test_build_primary_survives_base_exception_from_audit(tmp_path, event_type):
+    primary = RuntimeError("build primary")
+    audit_error = asyncio.CancelledError("audit cancel")
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        build_exception=primary,
+        audit_failure=audit_error,
+        audit_failure_stage=AgentStage.HYPOTHESIZING,
+        audit_failure_event_type=event_type,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert raised.value is primary
+    assert raised.value.__cause__ is audit_error
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+
+
+@pytest.mark.asyncio
+async def test_close_primary_survives_system_exit_from_cleanup_audit(tmp_path):
+    primary = RuntimeError("close primary")
+    audit_error = SystemExit("audit exit")
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        close_failure=primary,
+        audit_failure=audit_error,
+        audit_failure_stage=AgentStage.COMPLETED,
+        audit_failure_event_type="cleanup_failed",
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert raised.value is primary
+    assert raised.value.__cause__ is audit_error
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+
+
+@pytest.mark.asyncio
+async def test_proactive_cancelled_error_from_close_is_a_cleanup_failure(tmp_path):
+    cleanup = asyncio.CancelledError("close implementation cancelled itself")
+    dependencies = make_fake_dependencies(tmp_path, close_failure=cleanup)
+
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert episode.status is EpisodeStatus.FAILED
+    assert episode.evaluation is not None
+    assert episode.evaluation.status is EvaluationStatus.SUCCESS
+    assert episode.events[-1].stage is AgentStage.COMPLETED
+    assert episode.events[-1].event_type == "cleanup_failed"
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+
+
+@pytest.mark.asyncio
+async def test_external_cancellation_during_close_records_interrupted_once(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path)
+    runtime = dependencies["runtime"]
+    close_started = asyncio.Event()
+    never_finish = asyncio.Event()
+    seen_cancellation: list[asyncio.CancelledError] = []
+
+    async def cancellable_close(thread):
+        runtime.close_attempts.append(thread.logical_id)
+        close_started.set()
+        try:
+            await never_finish.wait()
+        except asyncio.CancelledError as error:
+            seen_cancellation.append(error)
+            raise
+
+    runtime.close_thread = cancellable_close
+    task = asyncio.create_task(
+        AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+    )
+    await close_started.wait()
+    task.cancel("external cancellation")
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await task
+
+    assert raised.value is seen_cancellation[0]
+    assert runtime.close_attempts == ["thread-p0"]
+    completed_attempts = [
+        event
+        for event in dependencies["run_store"].append_attempts
+        if event.stage is AgentStage.COMPLETED and event.attempt == 0
+    ]
+    assert [event.event_type for event in completed_attempts] == ["interrupted"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_primary_survives_system_exit_from_interruption_audit(tmp_path):
+    primary = asyncio.CancelledError("runtime cancellation")
+    audit_error = SystemExit("audit exit")
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        stage_exceptions={AgentStage.HYPOTHESIZING: primary},
+        audit_failure=audit_error,
+        audit_failure_stage=AgentStage.HYPOTHESIZING,
+        audit_failure_event_type="interrupted",
+    )
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert raised.value is primary
+    assert raised.value.__cause__ is audit_error
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "audit_error",
+    [asyncio.CancelledError("audit cancel"), SystemExit("audit exit")],
+)
+async def test_audit_base_exception_without_primary_propagates_original(
+    tmp_path, audit_error
+):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        audit_failure=audit_error,
+        audit_failure_stage=AgentStage.COMPLETED,
+        audit_failure_event_type="completed",
+    )
+
+    with pytest.raises(type(audit_error)) as raised:
+        await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert raised.value is audit_error
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]

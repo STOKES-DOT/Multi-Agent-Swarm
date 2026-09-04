@@ -52,7 +52,7 @@ class _RecordedStageFailure(Exception):
     primary: Exception
     status: EpisodeStatus
     evaluation_status: EvaluationStatus
-    audit_error: AuditPersistenceError | None = None
+    audit_error: BaseException | None = None
 
 
 class AgentLoop:
@@ -208,27 +208,44 @@ class AgentLoop:
         except AuditPersistenceError:
             raise
         except asyncio.CancelledError as error:
-            if owner.close_attempted:
-                raise
+            audit_error: BaseException | None = None
             try:
-                self._terminal_event(run_id, particle_id, iteration_id, current_stage, "interrupted", events, payload=self._failure_payload(error, context))
-            except AuditPersistenceError as audit_error:
-                self._add_secondary(error, "interruption audit failed", audit_error)
-            except asyncio.CancelledError as audit_error:
-                error.add_note("interruption audit raised CancelledError")
+                self._terminal_event(
+                    run_id,
+                    particle_id,
+                    iteration_id,
+                    current_stage,
+                    "interrupted",
+                    events,
+                    payload=self._failure_payload(error, context),
+                )
+            except BaseException as secondary_error:
+                audit_error = secondary_error
+                self._add_secondary(error, "interruption audit failed", secondary_error)
             close_error = await self._close_once(owner)
             if close_error is not None:
                 self._add_secondary(error, "thread close failed", close_error)
+            if audit_error is not None:
+                raise error from audit_error
             raise
         except TimeoutError as error:
             if owner.close_attempted:
                 raise
             try:
-                self._terminal_event(run_id, particle_id, iteration_id, current_stage, "timeout", events, payload=self._failure_payload(error, context))
-            except AuditPersistenceError as audit_error:
+                self._terminal_event(
+                    run_id,
+                    particle_id,
+                    iteration_id,
+                    current_stage,
+                    "timeout",
+                    events,
+                    payload=self._failure_payload(error, context),
+                )
+            except BaseException as audit_error:
                 self._add_secondary(error, "timeout audit failed", audit_error)
                 raise error from audit_error
-            return await self._finish_episode(owner,
+            return await self._finish_episode(
+                owner,
                 run_id,
                 particle_id,
                 iteration_id,
@@ -243,18 +260,55 @@ class AgentLoop:
             if owner.close_attempted:
                 raise
             try:
-                self._terminal_event(run_id, particle_id, iteration_id, current_stage, "failed", events, payload=self._failure_payload(error, context))
-            except AuditPersistenceError as audit_error:
+                self._terminal_event(
+                    run_id,
+                    particle_id,
+                    iteration_id,
+                    current_stage,
+                    "failed",
+                    events,
+                    payload=self._failure_payload(error, context),
+                )
+            except BaseException as audit_error:
                 self._add_secondary(error, "failure audit failed", audit_error)
                 raise error from audit_error
-            return await self._finish_episode(owner, run_id, particle_id, iteration_id, events, EpisodeStatus.FAILED, self._failed_evaluation(), evaluated, realized, adherence)
+            return await self._finish_episode(
+                owner,
+                run_id,
+                particle_id,
+                iteration_id,
+                events,
+                EpisodeStatus.FAILED,
+                self._failed_evaluation(),
+                evaluated,
+                realized,
+                adherence,
+            )
 
     async def _start_thread(self, particle_id: str) -> ThreadRef:
         async with self._resources.agent_slot():
             return await self._runtime.start_thread(particle_id, self._workspace)
 
-    async def _finish_episode(self, owner: _ThreadOwner, run_id: str, particle_id: str, iteration_id: int, events: list[StageEvent], status: EpisodeStatus, evaluation: Evaluation | None, evaluated: JsonValue, realized: JsonValue | None, adherence: Mapping[str, JsonValue], complete_lifecycle: bool = False) -> AgentEpisode:
+    async def _finish_episode(
+        self,
+        owner: _ThreadOwner,
+        run_id: str,
+        particle_id: str,
+        iteration_id: int,
+        events: list[StageEvent],
+        status: EpisodeStatus,
+        evaluation: Evaluation | None,
+        evaluated: JsonValue,
+        realized: JsonValue | None,
+        adherence: Mapping[str, JsonValue],
+        complete_lifecycle: bool = False,
+    ) -> AgentEpisode:
         close_error = await self._close_once(owner)
+        if (
+            isinstance(close_error, asyncio.CancelledError)
+            and self._current_task_is_cancelling()
+        ):
+            raise close_error
         if close_error is not None and status is EpisodeStatus.COMPLETED:
             status = EpisodeStatus.FAILED
         if complete_lifecycle:
@@ -264,7 +318,7 @@ class AgentLoop:
                     self._terminal_event(run_id, particle_id, iteration_id, AgentStage.COMPLETED, "completed", events, payload={"evaluation": evaluation.model_dump(mode="json") if evaluation else {}})
                 else:
                     self._terminal_event(run_id, particle_id, iteration_id, AgentStage.COMPLETED, "cleanup_failed", events, payload={"type": type(close_error).__name__, "message": str(close_error)[:512]})
-            except AuditPersistenceError as audit_error:
+            except BaseException as audit_error:
                 if close_error is None:
                     raise
                 self._add_secondary(close_error, "cleanup audit failed", audit_error)
@@ -273,12 +327,20 @@ class AgentLoop:
             try:
                 self._started(run_id, particle_id, iteration_id, AgentStage.COMPLETED, 0, {"episode": "cleanup"})
                 self._terminal_event(run_id, particle_id, iteration_id, AgentStage.COMPLETED, "cleanup_failed", events, payload={"type": type(close_error).__name__, "message": str(close_error)[:512]})
-            except AuditPersistenceError as audit_error:
+            except BaseException as audit_error:
                 self._add_secondary(close_error, "cleanup audit failed", audit_error)
                 raise close_error from audit_error
-        if close_error is not None and not isinstance(close_error, Exception):
+        if (
+            close_error is not None
+            and not isinstance(close_error, (Exception, asyncio.CancelledError))
+        ):
             raise close_error
         return self._terminal_episode(run_id, particle_id, iteration_id, events, status, evaluation, evaluated, realized, adherence)
+
+    @staticmethod
+    def _current_task_is_cancelling() -> bool:
+        task = asyncio.current_task()
+        return task is not None and task.cancelling() > 0
 
     async def _close_once(self, owner: _ThreadOwner) -> BaseException | None:
         if owner.thread is None or owner.close_attempted:
@@ -360,7 +422,16 @@ class AgentLoop:
                 if not isinstance(parsed, Mapping):
                     raise ValueError("parsed response must be a mapping")
             except Exception as error:
-                diagnostic = {"attempt": attempt + 1, "type": type(error).__name__, "message": str(error)[:512], "request": request_payload, "response_excerpt": response.raw_text[:1024], "response_sha256": hashlib.sha256(response.raw_text.encode()).hexdigest()}
+                diagnostic = {
+                    "attempt": attempt + 1,
+                    "type": type(error).__name__,
+                    "message": str(error)[:512],
+                    "request": request_payload,
+                    "response_excerpt": response.raw_text[:1024],
+                    "response_sha256": hashlib.sha256(
+                        response.raw_text.encode()
+                    ).hexdigest(),
+                }
                 context["correction"] = diagnostic
                 if attempt == 2:
                     self._terminal_event(str(context["run_id"]), str(context["particle_id"]), int(context["iteration_id"]), stage, "invalid", events, attempt, diagnostic)
@@ -397,7 +468,7 @@ class AgentLoop:
                     "request_error": diagnostic,
                 },
             )
-        except AuditPersistenceError as audit_error:
+        except BaseException as audit_error:
             self._add_secondary(error, "request build audit failed", audit_error)
             raise error from audit_error
 
@@ -443,7 +514,7 @@ class AgentLoop:
                 attempt,
                 terminal_payload,
             )
-        except AuditPersistenceError as audit_error:
+        except BaseException as audit_error:
             failure.audit_error = audit_error
         raise failure from error
 
