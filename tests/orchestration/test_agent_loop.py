@@ -77,8 +77,10 @@ async def test_exhausted_schema_corrections_produce_typed_invalid_terminal(tmp_p
     assert episode.status is EpisodeStatus.INVALID
     assert episode.evaluation is not None
     assert episode.evaluation.status is EvaluationStatus.INVALID
-    assert episode.events[-1].event_type == "invalid"
-    assert episode.events[-1].payload["request"]["stage"] == "HYPOTHESIZING"
+    invalid = next(event for event in episode.events if event.event_type == "invalid")
+    assert invalid.payload["request"]["stage"] == "HYPOTHESIZING"
+    assert episode.events[-1].stage is AgentStage.COMPLETED
+    assert episode.events[-1].event_type == "completed"
     assert dependencies["runtime"].stages == [AgentStage.HYPOTHESIZING] * 3
 
 
@@ -238,6 +240,8 @@ async def test_start_failure_uses_pending_lifecycle_and_timeout_is_typed(tmp_pat
     assert [(event.stage, event.event_type) for event in dependencies["run_store"].events] == [
         (AgentStage.PENDING, "started"),
         (AgentStage.PENDING, "timeout"),
+        (AgentStage.COMPLETED, "started"),
+        (AgentStage.COMPLETED, "completed"),
     ]
 
 
@@ -667,11 +671,30 @@ async def test_proactive_cancelled_error_from_close_is_a_cleanup_failure(tmp_pat
     assert episode.events[-1].stage is AgentStage.COMPLETED
     assert episode.events[-1].event_type == "cleanup_failed"
     assert dependencies["runtime"].close_attempts == ["thread-p0"]
+    completed = [
+        event
+        for event in dependencies["run_store"].append_attempts
+        if event.stage is AgentStage.COMPLETED and event.attempt == 0
+    ]
+    assert [event.event_type for event in completed] == ["started", "cleanup_failed"]
 
 
 @pytest.mark.asyncio
-async def test_external_cancellation_during_close_records_interrupted_once(tmp_path):
-    dependencies = make_fake_dependencies(tmp_path)
+@pytest.mark.parametrize(
+    ("evaluation_status", "business_terminal", "primary_status"),
+    [
+        (EvaluationStatus.SUCCESS, "completed", "COMPLETED"),
+        (EvaluationStatus.INVALID, "invalid", "INVALID"),
+        (EvaluationStatus.FAILED, "failed", "FAILED"),
+        (EvaluationStatus.TIMEOUT, "timeout", "TIMEOUT"),
+    ],
+)
+async def test_external_cancellation_during_close_records_completed_interrupted_pair(
+    tmp_path, evaluation_status, business_terminal, primary_status
+):
+    dependencies = make_fake_dependencies(
+        tmp_path, evaluator_status=evaluation_status
+    )
     runtime = dependencies["runtime"]
     close_started = asyncio.Event()
     never_finish = asyncio.Event()
@@ -703,7 +726,110 @@ async def test_external_cancellation_during_close_records_interrupted_once(tmp_p
         for event in dependencies["run_store"].append_attempts
         if event.stage is AgentStage.COMPLETED and event.attempt == 0
     ]
-    assert [event.event_type for event in completed_attempts] == ["interrupted"]
+    assert [event.event_type for event in completed_attempts] == [
+        "started",
+        "interrupted",
+    ]
+    assert completed_attempts[0].payload["finalization"] == "started"
+    assert completed_attempts[0].payload["primary_status"] == primary_status
+    evaluating_terminals = [
+        event
+        for event in dependencies["run_store"].append_attempts
+        if event.stage is AgentStage.EVALUATING and event.event_type != "started"
+    ]
+    assert [event.event_type for event in evaluating_terminals] == [business_terminal]
+
+
+@pytest.mark.asyncio
+async def test_external_close_cancellation_keeps_priority_when_completed_audit_fails(
+    tmp_path,
+):
+    audit_error = SystemExit("completed interruption audit")
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        evaluator_status=EvaluationStatus.INVALID,
+        audit_failure=audit_error,
+        audit_failure_stage=AgentStage.COMPLETED,
+        audit_failure_event_type="interrupted",
+    )
+    runtime = dependencies["runtime"]
+    close_started = asyncio.Event()
+    never_finish = asyncio.Event()
+    seen_cancellation: list[asyncio.CancelledError] = []
+
+    async def cancellable_close(thread):
+        runtime.close_attempts.append(thread.logical_id)
+        close_started.set()
+        try:
+            await never_finish.wait()
+        except asyncio.CancelledError as error:
+            seen_cancellation.append(error)
+            raise
+
+    runtime.close_thread = cancellable_close
+    task = asyncio.create_task(
+        AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+    )
+    await close_started.wait()
+    task.cancel("external cancellation")
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await task
+
+    assert raised.value is seen_cancellation[0]
+    assert raised.value.__cause__ is audit_error
+    assert any("audit" in note for note in raised.value.__notes__)
+    assert runtime.close_attempts == ["thread-p0"]
+    attempts = dependencies["run_store"].append_attempts
+    assert sum(
+        event.stage is AgentStage.EVALUATING and event.event_type == "invalid"
+        for event in attempts
+    ) == 1
+    assert not any(
+        event.stage is AgentStage.EVALUATING and event.event_type == "interrupted"
+        for event in attempts
+    )
+    assert [
+        event.event_type
+        for event in attempts
+        if event.stage is AgentStage.COMPLETED
+    ] == ["started", "interrupted"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("evaluation_status", "episode_status", "business_terminal"),
+    [
+        (EvaluationStatus.INVALID, EpisodeStatus.INVALID, "invalid"),
+        (EvaluationStatus.FAILED, EpisodeStatus.FAILED, "failed"),
+        (EvaluationStatus.TIMEOUT, EpisodeStatus.TIMEOUT, "timeout"),
+    ],
+)
+async def test_self_cancelled_close_does_not_rewrite_non_success_business_stage(
+    tmp_path, evaluation_status, episode_status, business_terminal
+):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        evaluator_status=evaluation_status,
+        close_failure=asyncio.CancelledError("cleanup self-cancelled"),
+    )
+
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert episode.status is episode_status
+    evaluating_terminals = [
+        event.event_type
+        for event in dependencies["run_store"].append_attempts
+        if event.stage is AgentStage.EVALUATING and event.event_type != "started"
+    ]
+    assert evaluating_terminals == [business_terminal]
+    completed = [
+        event.event_type
+        for event in dependencies["run_store"].append_attempts
+        if event.stage is AgentStage.COMPLETED
+    ]
+    assert completed == ["started", "cleanup_failed"]
+    assert dependencies["runtime"].close_attempts == ["thread-p0"]
 
 
 @pytest.mark.asyncio

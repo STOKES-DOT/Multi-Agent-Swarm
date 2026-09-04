@@ -45,6 +45,8 @@ _ACTIVE_STAGE_REQUEST = "_active_stage_request"
 class _ThreadOwner:
     thread: ThreadRef | None = None
     close_attempted: bool = False
+    finalization_started: bool = False
+    finalization_terminal: bool = False
 
 
 @dataclass(slots=True)
@@ -187,7 +189,7 @@ class AgentLoop:
             if await self._agent_stage(thread, current_stage, context, events) is None:
                 return await self._finish_episode(owner, run_id, particle_id, iteration_id, events, EpisodeStatus.INVALID, evaluation, evaluated, realized, adherence)
             current_stage = AgentStage.COMPLETED
-            return await self._finish_episode(owner, run_id, particle_id, iteration_id, events, EpisodeStatus.COMPLETED, evaluation, evaluated, realized, adherence, complete_lifecycle=True)
+            return await self._finish_episode(owner, run_id, particle_id, iteration_id, events, EpisodeStatus.COMPLETED, evaluation, evaluated, realized, adherence)
         except _RecordedStageFailure as error:
             self._clear_stage_boundary(context)
             if error.audit_error is not None:
@@ -208,6 +210,8 @@ class AgentLoop:
         except AuditPersistenceError:
             raise
         except asyncio.CancelledError as error:
+            if owner.finalization_started or owner.finalization_terminal:
+                raise
             audit_error: BaseException | None = None
             try:
                 self._terminal_event(
@@ -301,41 +305,98 @@ class AgentLoop:
         evaluated: JsonValue,
         realized: JsonValue | None,
         adherence: Mapping[str, JsonValue],
-        complete_lifecycle: bool = False,
     ) -> AgentEpisode:
+        primary_status = status
+        self._started(
+            run_id,
+            particle_id,
+            iteration_id,
+            AgentStage.COMPLETED,
+            0,
+            {
+                "finalization": "started",
+                "primary_status": primary_status.value,
+            },
+        )
+        owner.finalization_started = True
         close_error = await self._close_once(owner)
         if (
             isinstance(close_error, asyncio.CancelledError)
             and self._current_task_is_cancelling()
         ):
+            try:
+                self._record_finalization_terminal(
+                    owner,
+                    run_id,
+                    particle_id,
+                    iteration_id,
+                    events,
+                    "interrupted",
+                    {
+                        "finalization": "interrupted",
+                        "primary_status": primary_status.value,
+                        **self._request_error(close_error),
+                    },
+                )
+            except BaseException as audit_error:
+                self._add_secondary(close_error, "interruption audit failed", audit_error)
+                raise close_error from audit_error
             raise close_error
         if close_error is not None and status is EpisodeStatus.COMPLETED:
             status = EpisodeStatus.FAILED
-        if complete_lifecycle:
-            try:
-                self._started(run_id, particle_id, iteration_id, AgentStage.COMPLETED, 0, {"episode": "complete"})
-                if close_error is None:
-                    self._terminal_event(run_id, particle_id, iteration_id, AgentStage.COMPLETED, "completed", events, payload={"evaluation": evaluation.model_dump(mode="json") if evaluation else {}})
-                else:
-                    self._terminal_event(run_id, particle_id, iteration_id, AgentStage.COMPLETED, "cleanup_failed", events, payload={"type": type(close_error).__name__, "message": str(close_error)[:512]})
-            except BaseException as audit_error:
-                if close_error is None:
-                    raise
+        terminal_type = "completed" if close_error is None else "cleanup_failed"
+        terminal_payload: dict[str, JsonValue] = {
+            "finalization": terminal_type,
+            "primary_status": primary_status.value,
+        }
+        if close_error is None:
+            terminal_payload["evaluation"] = (
+                evaluation.model_dump(mode="json") if evaluation else {}
+            )
+        else:
+            terminal_payload.update(self._request_error(close_error))
+        try:
+            self._record_finalization_terminal(
+                owner,
+                run_id,
+                particle_id,
+                iteration_id,
+                events,
+                terminal_type,
+                terminal_payload,
+            )
+        except BaseException as audit_error:
+            if close_error is not None:
                 self._add_secondary(close_error, "cleanup audit failed", audit_error)
                 raise close_error from audit_error
-        elif close_error is not None:
-            try:
-                self._started(run_id, particle_id, iteration_id, AgentStage.COMPLETED, 0, {"episode": "cleanup"})
-                self._terminal_event(run_id, particle_id, iteration_id, AgentStage.COMPLETED, "cleanup_failed", events, payload={"type": type(close_error).__name__, "message": str(close_error)[:512]})
-            except BaseException as audit_error:
-                self._add_secondary(close_error, "cleanup audit failed", audit_error)
-                raise close_error from audit_error
+            raise
         if (
             close_error is not None
             and not isinstance(close_error, (Exception, asyncio.CancelledError))
         ):
             raise close_error
         return self._terminal_episode(run_id, particle_id, iteration_id, events, status, evaluation, evaluated, realized, adherence)
+
+    def _record_finalization_terminal(
+        self,
+        owner: _ThreadOwner,
+        run_id: str,
+        particle_id: str,
+        iteration_id: int,
+        events: list[StageEvent],
+        event_type: str,
+        payload: Mapping[str, JsonValue],
+    ) -> None:
+        self._terminal_event(
+            run_id,
+            particle_id,
+            iteration_id,
+            AgentStage.COMPLETED,
+            event_type,
+            events,
+            payload=payload,
+        )
+        owner.finalization_terminal = True
 
     @staticmethod
     def _current_task_is_cancelling() -> bool:
