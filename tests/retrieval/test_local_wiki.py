@@ -819,6 +819,8 @@ def test_wiki_index_limits_are_frozen_and_have_explicit_defaults() -> None:
         max_depth=16,
         max_sections=100_000,
         max_total_tokens=2_000_000,
+        max_entries=100_000,
+        max_name_bytes=4 * 1024 * 1024,
     )
     with pytest.raises(FrozenInstanceError):
         limits.max_files = 1  # type: ignore[misc]
@@ -833,6 +835,8 @@ def test_wiki_index_limits_are_frozen_and_have_explicit_defaults() -> None:
         lambda: WikiIndexLimits(max_depth=-1),
         lambda: WikiIndexLimits(max_sections=0),
         lambda: WikiIndexLimits(max_total_tokens=0),
+        lambda: WikiIndexLimits(max_entries=0),
+        lambda: WikiIndexLimits(max_name_bytes=0),
     ],
 )
 def test_wiki_index_limits_reject_invalid_values(factory) -> None:
@@ -976,6 +980,106 @@ def test_read_exception_and_cancellation_release_all_fds(
         raise primary
 
     monkeypatch.setattr(os, "read", failing_read)
+    with pytest.raises(type(primary)) as raised:
+        LocalWikiRetriever(root)
+
+    assert raised.value is primary
+    assert opened == set()
+
+
+def test_anchors_count_toward_file_and_total_byte_limits(tmp_path: Path) -> None:
+    root = _wiki(tmp_path)
+    defaults = WikiIndexLimits()
+    with pytest.raises(ValueError, match="max_files"):
+        LocalWikiRetriever(root, limits=replace(defaults, max_files=1))
+    anchor_bytes = sum((root / name).stat().st_size for name in ("AGENTS.md", "index.md"))
+    with pytest.raises(ValueError, match="max_total_bytes"):
+        LocalWikiRetriever(
+            root,
+            limits=replace(defaults, max_total_bytes=anchor_bytes - 1),
+        )
+
+
+def test_entry_limit_stops_scandir_at_limit_plus_one(tmp_path: Path, monkeypatch) -> None:
+    root = _wiki(tmp_path)
+    sources = root / "sources"
+    sources.mkdir()
+    for index in range(20):
+        (sources / f"ignored-{index}.bin").write_bytes(b"x")
+    original_scandir = os.scandir
+    source_inode = sources.stat().st_ino
+    consumed = 0
+
+    class CountingIterator:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            self.inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.inner.__exit__(*args)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal consumed
+            value = next(self.inner)
+            consumed += 1
+            return value
+
+    def counting_scandir(fd):
+        iterator = original_scandir(fd)
+        return CountingIterator(iterator) if os.fstat(fd).st_ino == source_inode else iterator
+
+    monkeypatch.setattr(os, "scandir", counting_scandir)
+    with pytest.raises(ValueError, match="max_entries"):
+        LocalWikiRetriever(
+            root,
+            limits=replace(WikiIndexLimits(), max_entries=2),
+        )
+    assert consumed == 3
+
+
+def test_entry_name_byte_budget_counts_nonmarkdown_and_directories(tmp_path: Path) -> None:
+    root = _wiki(tmp_path)
+    sources = root / "sources"
+    sources.mkdir()
+    (sources / "directory-name").mkdir()
+    (sources / "ignored-name.bin").write_bytes(b"x")
+    with pytest.raises(ValueError, match="max_name_bytes"):
+        LocalWikiRetriever(
+            root,
+            limits=replace(WikiIndexLimits(), max_name_bytes=10),
+        )
+
+
+@pytest.mark.parametrize(
+    "primary", [RuntimeError("scan failed"), asyncio.CancelledError("cancelled")]
+)
+def test_scandir_exception_and_cancellation_release_all_fds(
+    tmp_path: Path, monkeypatch, primary: BaseException
+) -> None:
+    root = _wiki(tmp_path)
+    (root / "sources").mkdir()
+    opened = _tracked_fds(monkeypatch)
+
+    class FailingScandir:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise primary
+
+    monkeypatch.setattr(os, "scandir", lambda fd: FailingScandir())
     with pytest.raises(type(primary)) as raised:
         LocalWikiRetriever(root)
 

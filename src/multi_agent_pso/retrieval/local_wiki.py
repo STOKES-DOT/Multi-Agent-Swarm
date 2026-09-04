@@ -41,7 +41,7 @@ _HAS_REQUIRED_FD_CALLS = (
     os.open in os.supports_dir_fd
     and os.stat in os.supports_dir_fd
     and os.stat in os.supports_follow_symlinks
-    and os.listdir in os.supports_fd
+    and os.scandir in os.supports_fd
 )
 
 
@@ -63,6 +63,8 @@ class WikiIndexLimits:
     max_depth: int = 16
     max_sections: int = 100_000
     max_total_tokens: int = 2_000_000
+    max_entries: int = 100_000
+    max_name_bytes: int = 4 * 1024 * 1024
 
     def __post_init__(self) -> None:
         for name in (
@@ -71,6 +73,8 @@ class WikiIndexLimits:
             "max_total_bytes",
             "max_sections",
             "max_total_tokens",
+            "max_entries",
+            "max_name_bytes",
         ):
             _require_limit(getattr(self, name), name, minimum=1)
         _require_limit(self.max_depth, "max_depth", minimum=0)
@@ -83,6 +87,8 @@ class _IndexBudget:
     total_declared_bytes: int = 0
     section_count: int = 0
     total_tokens: int = 0
+    entry_count: int = 0
+    total_name_bytes: int = 0
 
     def reserve_file(self, size: int, label: str) -> None:
         if size > self.limits.max_file_bytes:
@@ -103,6 +109,23 @@ class _IndexBudget:
         if self.total_tokens >= self.limits.max_total_tokens:
             raise ValueError("Wiki index exceeds max_total_tokens")
         self.total_tokens += 1
+
+    def reserve_entry(self, name: object) -> str:
+        if not isinstance(name, str) or not name or name in {".", ".."}:
+            raise ValueError("Wiki entry name is invalid")
+        if "/" in name or "\\" in name or "\x00" in name:
+            raise ValueError("Wiki entry name is invalid")
+        try:
+            encoded = name.encode("utf-8")
+        except UnicodeError as error:
+            raise ValueError("Wiki entry name must be valid UTF-8") from error
+        if self.entry_count >= self.limits.max_entries:
+            raise ValueError("Wiki index exceeds max_entries")
+        if self.total_name_bytes + len(encoded) > self.limits.max_name_bytes:
+            raise ValueError("Wiki index exceeds max_name_bytes")
+        self.entry_count += 1
+        self.total_name_bytes += len(encoded)
+        return name
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,17 +172,23 @@ class LocalWikiRetriever:
         budget = _IndexBudget(limits)
         root_fd = _open_root(root)
         with _owned_fd(root_fd):
+            agents_stat = _required_regular_stat(root_fd, "AGENTS.md", "AGENTS.md")
+            budget.reserve_file(agents_stat.st_size, "AGENTS.md")
             agents = _read_utf8_at(
                 root_fd,
                 "AGENTS.md",
                 "AGENTS.md",
                 max_bytes=limits.max_file_bytes,
+                expected=agents_stat,
             )
+            index_stat = _required_regular_stat(root_fd, "index.md", "index.md")
+            budget.reserve_file(index_stat.st_size, "index.md")
             index = _read_utf8_at(
                 root_fd,
                 "index.md",
                 "index.md",
                 max_bytes=limits.max_file_bytes,
+                expected=index_stat,
             )
             sections = tuple(self._build_sections(root_fd, budget))
         self._limits = limits
@@ -328,6 +357,15 @@ def _optional_stat_at(parent_fd: int, name: str) -> os.stat_result | None:
         raise ValueError("wiki path could not be inspected") from error
 
 
+def _required_regular_stat(
+    parent_fd: int, name: str, label: str
+) -> os.stat_result:
+    value = _optional_stat_at(parent_fd, name)
+    if value is None or stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode):
+        raise ValueError(f"wiki root requires a regular {label}")
+    return value
+
+
 def _open_directory_at(
     parent_fd: int,
     name: str,
@@ -381,11 +419,7 @@ def _read_utf8_at(
     max_bytes: int,
     expected: os.stat_result | None = None,
 ) -> str:
-    before_path = _optional_stat_at(parent_fd, name)
-    if before_path is None or stat.S_ISLNK(before_path.st_mode):
-        raise ValueError(f"wiki root requires a regular {label}")
-    if not stat.S_ISREG(before_path.st_mode):
-        raise ValueError(f"wiki root requires a regular {label}")
+    before_path = _required_regular_stat(parent_fd, name, label)
     if expected is not None and (
         _inode(expected) != _inode(before_path)
         or _file_metadata(expected) != _file_metadata(before_path)
@@ -449,9 +483,11 @@ def _markdown_documents(
     depth: int,
 ) -> Iterator[tuple[str, str]]:
     try:
-        names = sorted(os.listdir(directory_fd))
+        with os.scandir(directory_fd) as entries:
+            names = [budget.reserve_entry(entry.name) for entry in entries]
     except OSError as error:
-        raise ValueError("wiki directory could not be listed") from error
+        raise ValueError("wiki directory could not be enumerated") from error
+    names.sort()
     for name in names:
         entry_stat = _optional_stat_at(directory_fd, name)
         if entry_stat is None:
