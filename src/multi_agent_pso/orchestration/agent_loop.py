@@ -14,9 +14,11 @@ from typing import Any
 
 from pydantic import JsonValue
 
-from multi_agent_pso.core import AgentEpisode, AgentStage, EpisodeStatus, Evaluation, EvaluationStatus, StageEvent
+from multi_agent_pso.core import AgentEpisode, AgentStage, EpisodeCheckpoint, EpisodeStatus, Evaluation, EvaluationStatus, StageEvent
 from multi_agent_pso.protocols import (
     AgentRuntime,
+    ArtifactIntegrityError,
+    ArtifactStore,
     EvaluationContext,
     Evaluator,
     ResourceManager,
@@ -253,13 +255,14 @@ class AgentLoop:
         task_adapter: TaskAdapter[Any],
         evaluator: Evaluator,
         tool_provider: ToolProvider,
+        artifact_store: ArtifactStore,
         resource_manager: ResourceManager,
         run_store: RunStore,
         target_position: JsonValue,
         workspace: Path,
         protocol_snapshot_hash: str,
     ) -> None:
-        if not all((isinstance(runtime, AgentRuntime), isinstance(task_adapter, TaskAdapter), isinstance(evaluator, Evaluator), isinstance(tool_provider, ToolProvider), isinstance(resource_manager, ResourceManager), isinstance(run_store, RunStore))):
+        if not all((isinstance(runtime, AgentRuntime), isinstance(task_adapter, TaskAdapter), isinstance(evaluator, Evaluator), isinstance(tool_provider, ToolProvider), isinstance(artifact_store, ArtifactStore), isinstance(resource_manager, ResourceManager), isinstance(run_store, RunStore))):
             raise TypeError("AgentLoop dependencies must implement their protocols")
         if not isinstance(workspace, Path) or not workspace.is_absolute():
             raise ValueError("workspace must be an absolute Path")
@@ -269,6 +272,7 @@ class AgentLoop:
         self._adapter = task_adapter
         self._evaluator = evaluator
         self._tool = tool_provider
+        self._artifacts = artifact_store
         self._resources = resource_manager
         self._store = run_store
         self._target = self._copy_json(target_position)
@@ -282,6 +286,8 @@ class AgentLoop:
             raise ValueError("iteration_id must be a nonnegative integer")
         owner = _ThreadOwner()
         try:
+            if self._store.get_run_snapshot_hash(run_id) is None:
+                self._store.create_run(run_id, self._protocol_hash)
             return await self._run_particle(owner, run_id, particle_id, iteration_id)
         finally:
             if owner.thread is not None and not owner.close_attempted:
@@ -833,6 +839,7 @@ class AgentLoop:
         cached = self._store.get_committed_tool_result(key)
         if cached is not None:
             self._copy_json(cached.to_json())
+            self._verify_tool_result_artifacts(cached)
             return cached, ToolRequest(self._identity("request", run_id, particle_id, iteration_id, "cached"), "cache", "reuse", {}, key), True
         provider = bounded_proposal.get("provider")
         operation = bounded_proposal.get("operation")
@@ -843,8 +850,13 @@ class AgentLoop:
         self._copy_json(request.to_json())
         result = await self._tool.execute(request, ToolContext(run_id, particle_id, iteration_id, AgentStage.EXECUTING, 0, self._workspace))
         self._copy_json(result.to_json())
+        self._verify_tool_result_artifacts(result)
         self._store.record_tool_result(key, result)
         return result, request, False
+
+    def _verify_tool_result_artifacts(self, result: ToolResult) -> None:
+        for reference in result.artifacts:
+            self._artifacts.verify(reference)
 
     def _context(self, run_id: str, particle_id: str, iteration_id: int) -> Mapping[str, JsonValue]:
         return {"run_id": run_id, "particle_id": particle_id, "iteration_id": iteration_id, "target_position": self._copy_json(self._target), "protocol_snapshot_hash": self._protocol_hash}
@@ -858,7 +870,29 @@ class AgentLoop:
 
     def _terminal_event(self, run_id: str, particle_id: str, iteration_id: int, stage: AgentStage, event_type: str, events: list[StageEvent], attempt: int = 0, payload: Mapping[str, JsonValue] | None = None) -> None:
         event = StageEvent(run_id=run_id, particle_id=particle_id, iteration_id=iteration_id, stage=stage, attempt=attempt, event_type=event_type, payload=self._audit_payload({} if payload is None else payload))
-        events.append(self._persist_event(event))
+        checkpoint = self._checkpoint_for(event)
+        try:
+            self._store.commit_stage_transition(event, checkpoint)
+        except Exception as error:
+            raise AuditPersistenceError(stage=stage.value, attempt=attempt, event_type=event_type) from error
+        events.append(event)
+
+    def _checkpoint_for(self, event: StageEvent) -> EpisodeCheckpoint:
+        next_stage = {
+            AgentStage.PENDING: AgentStage.HYPOTHESIZING,
+            AgentStage.HYPOTHESIZING: AgentStage.PROPOSING_ACTION,
+            AgentStage.PROPOSING_ACTION: AgentStage.EXECUTING,
+            AgentStage.EXECUTING: AgentStage.EVALUATING,
+            AgentStage.EVALUATING: AgentStage.REFLECTING,
+            AgentStage.REFLECTING: AgentStage.COMPLETED,
+            AgentStage.COMPLETED: None,
+        }[event.stage] if event.event_type == "completed" else None
+        next_attempt = 0
+        if event.event_type == "failed" and event.stage in {AgentStage.HYPOTHESIZING, AgentStage.PROPOSING_ACTION, AgentStage.REFLECTING} and event.attempt < 2:
+            next_stage, next_attempt = event.stage, event.attempt + 1
+        elif event.event_type == "interrupted":
+            next_stage, next_attempt = event.stage, event.attempt
+        return EpisodeCheckpoint(run_id=event.run_id, particle_id=event.particle_id, iteration_id=event.iteration_id, completed_stage=event.stage, completed_attempt=event.attempt, terminal_event_type=event.event_type, terminal_event_sequence=None, next_stage=next_stage, next_attempt=next_attempt, context={"run_id": event.run_id, "particle_id": event.particle_id, "iteration_id": event.iteration_id, "protocol_snapshot_hash": self._protocol_hash}, protocol_snapshot_hash=self._protocol_hash)
 
     def _audit_payload(self, payload: object) -> Mapping[str, JsonValue]:
         try:

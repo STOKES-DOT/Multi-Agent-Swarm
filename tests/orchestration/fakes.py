@@ -41,6 +41,7 @@ from multi_agent_pso.protocols import (
     ToolResult,
     ToolStatus,
 )
+from multi_agent_pso.protocols.storage import ArtifactIntegrityError
 
 
 def _json_value(value: object) -> JsonValue:
@@ -532,6 +533,7 @@ class FakeRuntime:
         self.payload = payload
         self.stages: list[AgentStage] = []
         self.closed_threads: list[str] = []
+        self.restored_threads: list[str] = []
         self.close_attempts: list[str] = []
         self.close_failure = close_failure
         self.start_exception = start_exception
@@ -544,6 +546,11 @@ class FakeRuntime:
         assert self.resources.agent_active
         if self.start_exception is not None:
             raise self.start_exception
+        return ThreadRef(f"thread-{particle_id}", particle_id, 0, workspace)
+
+    async def restore_thread(self, particle_id: str, workspace: Path, checkpoint: Mapping[str, object]) -> ThreadRef:
+        assert self.resources.agent_active
+        self.restored_threads.append(particle_id)
         return ThreadRef(f"thread-{particle_id}", particle_id, 0, workspace)
 
     async def run_stage(self, thread: ThreadRef, request: StageRequest) -> StageResponse:
@@ -671,6 +678,26 @@ class FakeTool:
         return ToolResult(self.status, self.payload, error="fake tool failure" if self.status is not ToolStatus.SUCCESS else None)
 
 
+class FakeArtifactStore:
+    def __init__(self) -> None:
+        self.verified: list[ArtifactRef] = []
+        self.invalid: set[str] = set()
+
+    def verify(self, reference: ArtifactRef) -> None:
+        self.verified.append(reference)
+        if reference.relative_path in self.invalid or not reference.committed:
+            raise ArtifactIntegrityError("fake artifact verification failed")
+
+    def publish_bytes(self, relative_path: str, data: bytes, media_type: str) -> ArtifactRef:
+        raise NotImplementedError
+
+    def publish_text(self, relative_path: str, text: str, media_type: str) -> ArtifactRef:
+        raise NotImplementedError
+
+    def publish_json(self, relative_path: str, payload: Mapping[str, object]) -> ArtifactRef:
+        raise NotImplementedError
+
+
 class FakeEvaluator:
     fixed_fitness = 1.25
 
@@ -747,6 +774,7 @@ def make_fake_dependencies(
         ),
         "evaluator": FakeEvaluator(resources, evaluator_status, evaluator_exception, evaluation_metrics),
         "tool_provider": FakeTool(tool_status, tool_exception, tool_payload),
+        "artifact_store": FakeArtifactStore(),
         "resource_manager": resources,
         "run_store": FakeRunStore(
             cached,

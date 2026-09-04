@@ -15,10 +15,7 @@ from secrets import token_hex
 from pydantic import JsonValue
 
 from multi_agent_pso.core import ArtifactRef
-
-
-class ArtifactIntegrityError(RuntimeError):
-    """A committed artifact reference does not match immutable storage."""
+from multi_agent_pso.protocols.storage import ArtifactIntegrityError
 
 
 def _close_fds(*descriptors: int | None, primary_error: BaseException | None = None) -> None:

@@ -126,6 +126,7 @@ def test_public_protocols_are_runtime_checkable() -> None:
 def test_protocol_method_names_and_async_boundaries_are_exact() -> None:
     assert _protocol_methods(AgentRuntime) == {
         "start_thread",
+        "restore_thread",
         "run_stage",
         "rotate_thread",
         "close_thread",
@@ -173,7 +174,7 @@ def test_protocol_method_names_and_async_boundaries_are_exact() -> None:
     assert _protocol_methods(WikiRetriever) == {"search"}
 
     for protocol, methods in (
-        (AgentRuntime, ("start_thread", "run_stage", "rotate_thread", "close_thread")),
+        (AgentRuntime, ("start_thread", "restore_thread", "run_stage", "rotate_thread", "close_thread")),
         (Evaluator, ("evaluate",)),
         (ToolProvider, ("execute",)),
     ):
@@ -194,6 +195,9 @@ def test_protocol_method_names_and_async_boundaries_are_exact() -> None:
 def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
     class RuntimeFake:
         async def start_thread(self, particle_id: str, workspace: Path) -> ThreadRef:
+            return ThreadRef("thread", particle_id, 0, workspace)
+
+        async def restore_thread(self, particle_id: str, workspace: Path, checkpoint: Mapping[str, JsonValue]) -> ThreadRef:
             return ThreadRef("thread", particle_id, 0, workspace)
 
         async def run_stage(self, thread: ThreadRef, request: StageRequest) -> StageResponse:
@@ -356,7 +360,8 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
             AgentRuntime,
             RuntimeFake(),
             {
-                "start_thread": (("self", "particle_id", "workspace"), {"particle_id": str, "workspace": Path, "return": ThreadRef}),
+                    "start_thread": (("self", "particle_id", "workspace"), {"particle_id": str, "workspace": Path, "return": ThreadRef}),
+                    "restore_thread": (("self", "particle_id", "workspace", "checkpoint"), {"particle_id": str, "workspace": Path, "checkpoint": Mapping[str, JsonValue], "return": ThreadRef}),
                 "run_stage": (("self", "thread", "request"), {"thread": ThreadRef, "request": StageRequest, "return": StageResponse}),
                 "rotate_thread": (("self", "thread", "checkpoint"), {"thread": ThreadRef, "checkpoint": Mapping[str, JsonValue], "return": ThreadRef}),
                 "close_thread": (("self", "thread"), {"thread": ThreadRef, "return": type(None)}),

@@ -17,6 +17,10 @@ from multi_agent_pso.core import (
 from .tools import ToolResult
 
 
+class ArtifactIntegrityError(RuntimeError):
+    """A committed artifact reference does not match immutable storage."""
+
+
 @runtime_checkable
 class IterationTransaction(Protocol):
     """The explicit, synchronous state writes belonging to one iteration."""
@@ -90,4 +94,4 @@ class ArtifactStore(Protocol):
     def verify(self, reference: ArtifactRef) -> None: ...
 
 
-__all__ = ["ArtifactStore", "IterationTransaction", "RunStore"]
+__all__ = ["ArtifactIntegrityError", "ArtifactStore", "IterationTransaction", "RunStore"]

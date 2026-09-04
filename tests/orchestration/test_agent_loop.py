@@ -270,6 +270,16 @@ async def test_target_is_deep_copied_before_external_calls(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_terminal_stages_commit_matching_checkpoints(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path)
+    await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    checkpoints = dependencies["run_store"].get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    assert checkpoints["completed_stage"] == "COMPLETED"
+    assert checkpoints["next_stage"] is None
+
+
+@pytest.mark.asyncio
 async def test_start_failure_uses_pending_lifecycle_and_timeout_is_typed(tmp_path):
     dependencies = make_fake_dependencies(tmp_path, start_exception=TimeoutError("start timeout"))
     episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)

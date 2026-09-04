@@ -174,6 +174,10 @@ class AgentRuntime(Protocol):
 
     async def start_thread(self, particle_id: str, workspace: Path) -> ThreadRef: ...
 
+    async def restore_thread(
+        self, particle_id: str, workspace: Path, checkpoint: Mapping[str, JsonValue]
+    ) -> ThreadRef: ...
+
     async def run_stage(self, thread: ThreadRef, request: StageRequest) -> StageResponse: ...
 
     async def rotate_thread(
