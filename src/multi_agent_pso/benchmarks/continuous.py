@@ -181,7 +181,16 @@ def run_continuous_benchmark(name: str, seed: int, runs_dir: Path, *, particles:
         return AgentLoop(runtime=runtime, task_adapter=adapter, evaluator=evaluator, tool_provider=tool, artifact_store=artifacts, resource_manager=resources, run_store=store, target_position=target, workspace=root.resolve(), protocol_snapshot_hash=config_hash)
     runner = SynchronousSwarmRunner(run_id=run_id, run_seed=seed, config_snapshot_hash=config_hash, space=space, adapter=adapter, topology=RingTopology(), update_rule=ConstrictedUpdateRule(), store=store, episode_factory=factory, particle_ids=tuple(f"p{i}" for i in range(particles)), resource_budget={"benchmark": name}, failure_threshold=2)
     result = asyncio.run(runner.run(iterations=iterations))
-    initial = result.snapshots[0].model_dump(mode="json")
+    initial_json = store.get_iteration_snapshot_json(run_id, 0)
+    if initial_json is None:
+        raise RuntimeError("committed initial snapshot is missing")
+    try:
+        initial_snapshot = IterationSnapshot.model_validate(initial_json)
+    except Exception as error:
+        raise RuntimeError("committed initial snapshot is invalid") from error
+    if initial_snapshot.run_id != run_id or initial_snapshot.iteration_id != 0 or initial_snapshot.config_snapshot_hash != config_hash:
+        raise RuntimeError("committed initial snapshot identity is invalid")
+    initial = initial_snapshot.model_dump(mode="json")
     final = result.final_snapshot.model_dump(mode="json")
     summary: dict[str, JsonValue] = {"run_id": run_id, "status": final["run_status"], "benchmark": name, "seed": seed, "particle_count": particles, "iteration_count": iterations, "dimension": dimension, "protocol_version": STAGE_A_BENCHMARK_PROTOCOL_VERSION, "config": descriptor, "initial_gbest": initial["gbest"], "final_gbest": final["gbest"], "database": "runs.sqlite", "artifacts": "artifacts/summary.json"}
     summary_json = _canonical(summary)
