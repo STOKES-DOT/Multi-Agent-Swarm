@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import copy
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -30,15 +31,15 @@ from multi_agent_pso.protocols import (
 
 
 class FakeRunStore:
-    def __init__(self, cached: ToolResult | None = None, audit_failure: bool = False) -> None:
+    def __init__(self, cached: ToolResult | None = None, audit_failure: BaseException | None = None) -> None:
         self.events: list[StageEvent] = []
         self.cached = cached
         self.recorded: dict[str, ToolResult] = {}
         self.audit_failure = audit_failure
 
     def append_stage_event(self, event: StageEvent) -> None:
-        if self.audit_failure and event.event_type == "interrupted":
-            raise RuntimeError("fake audit failure")
+        if self.audit_failure is not None and event.event_type == "interrupted":
+            raise self.audit_failure
         self.events.append(event)
 
     def create_run(self, run_id: str, snapshot_hash: str) -> None:
@@ -107,7 +108,7 @@ class FakeResources:
 
 
 class FakeRuntime:
-    def __init__(self, *, resources: FakeResources, invalid_responses: int, cancel_stage: AgentStage | None, payload: Mapping[str, object], close_failure: bool, stage_exceptions: Mapping[AgentStage, BaseException] | None = None) -> None:
+    def __init__(self, *, resources: FakeResources, invalid_responses: int, cancel_stage: AgentStage | None, payload: Mapping[str, object], close_failure: BaseException | None, stage_exceptions: Mapping[AgentStage, BaseException] | None = None, start_exception: BaseException | None = None) -> None:
         self.resources = resources
         self.invalid_remaining = invalid_responses
         self.cancel_stage = cancel_stage
@@ -115,10 +116,13 @@ class FakeRuntime:
         self.stages: list[AgentStage] = []
         self.closed_threads: list[str] = []
         self.close_failure = close_failure
+        self.start_exception = start_exception
         self.stage_exceptions = dict(stage_exceptions or {})
 
     async def start_thread(self, particle_id: str, workspace: Path) -> ThreadRef:
         assert self.resources.agent_active
+        if self.start_exception is not None:
+            raise self.start_exception
         return ThreadRef(f"thread-{particle_id}", particle_id, 0, workspace)
 
     async def run_stage(self, thread: ThreadRef, request: StageRequest) -> StageResponse:
@@ -131,7 +135,11 @@ class FakeRuntime:
         if self.invalid_remaining:
             self.invalid_remaining -= 1
             return StageResponse("not-json", TokenUsage(1, 1))
-        output = {"stage": request.stage.value, **self.payload}
+        output = {
+            AgentStage.HYPOTHESIZING: {"hypothesis": "fake"},
+            AgentStage.PROPOSING_ACTION: dict(self.payload),
+            AgentStage.REFLECTING: {"reflection": "fake"},
+        }[request.stage]
         return StageResponse(json.dumps(output, sort_keys=True), TokenUsage(1, 1))
 
     async def rotate_thread(self, thread: ThreadRef, checkpoint: Mapping[str, object]) -> ThreadRef:
@@ -140,17 +148,20 @@ class FakeRuntime:
     async def close_thread(self, thread: ThreadRef) -> None:
         assert self.resources.agent_active
         self.closed_threads.append(thread.logical_id)
-        if self.close_failure:
-            raise RuntimeError("fake close failure")
+        if self.close_failure is not None:
+            raise self.close_failure
 
 
 class FakeAdapter:
-    def __init__(self, candidate_failure: bool = False) -> None:
+    def __init__(self, candidate_failure: bool = False, mutate_context: bool = False) -> None:
         self.contexts: dict[AgentStage, list[dict[str, object]]] = {stage: [] for stage in AgentStage}
         self.candidate_failure = candidate_failure
+        self.mutate_context = mutate_context
 
     def build_stage_request(self, stage: AgentStage, context: Mapping[str, object]) -> StageRequest:
-        self.contexts[stage].append(dict(context))
+        self.contexts[stage].append(copy.deepcopy(dict(context)))
+        if self.mutate_context and stage is AgentStage.HYPOTHESIZING:
+            context["target_position"]["x"] = 999  # type: ignore[index]
         return StageRequest(stage, f"{stage.value}:{context['particle_id']}")
 
     def parse_stage_response(self, stage: AgentStage, response: StageResponse) -> Mapping[str, object]:
@@ -218,13 +229,15 @@ def make_fake_dependencies(
     cached_tool_result: bool = False,
     cancel_stage: AgentStage | None = None,
     evaluator_status: EvaluationStatus = EvaluationStatus.SUCCESS,
-    close_failure: bool = False,
+    close_failure: BaseException | None = None,
     tool_status: ToolStatus = ToolStatus.SUCCESS,
     tool_exception: BaseException | None = None,
     evaluator_exception: BaseException | None = None,
     candidate_failure: bool = False,
     stage_exceptions: Mapping[AgentStage, BaseException] | None = None,
-    audit_failure: bool = False,
+    audit_failure: BaseException | None = None,
+    start_exception: BaseException | None = None,
+    mutate_context: bool = False,
 ) -> dict[str, object]:
     workspace = (tmp_path / "workspace").resolve()
     workspace.mkdir()
@@ -234,8 +247,8 @@ def make_fake_dependencies(
     cached = ToolResult(ToolStatus.SUCCESS, {"tool": "cached"}) if cached_tool_result else None
     resources = FakeResources()
     return {
-        "runtime": FakeRuntime(resources=resources, invalid_responses=invalid_responses, cancel_stage=cancel_stage, payload=payload, close_failure=close_failure, stage_exceptions=stage_exceptions),
-        "task_adapter": FakeAdapter(candidate_failure),
+        "runtime": FakeRuntime(resources=resources, invalid_responses=invalid_responses, cancel_stage=cancel_stage, payload=payload, close_failure=close_failure, stage_exceptions=stage_exceptions, start_exception=start_exception),
+        "task_adapter": FakeAdapter(candidate_failure, mutate_context),
         "evaluator": FakeEvaluator(resources, evaluator_status, evaluator_exception),
         "tool_provider": FakeTool(tool_status, tool_exception),
         "resource_manager": resources,

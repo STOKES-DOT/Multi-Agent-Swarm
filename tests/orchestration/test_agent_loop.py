@@ -138,7 +138,7 @@ async def test_length_safe_identity_prevents_colon_tuple_tool_cache_collision(tm
 
 @pytest.mark.asyncio
 async def test_timeout_and_close_failure_are_typed_and_audited(tmp_path):
-    dependencies = make_fake_dependencies(tmp_path, evaluator_status=EvaluationStatus.TIMEOUT, close_failure=True)
+    dependencies = make_fake_dependencies(tmp_path, evaluator_status=EvaluationStatus.TIMEOUT, close_failure=RuntimeError("close"))
     episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
 
     assert episode.status is EpisodeStatus.TIMEOUT
@@ -202,7 +202,7 @@ async def test_candidate_validation_failure_is_invalid_and_reflection_has_stage_
 
 @pytest.mark.asyncio
 async def test_cancellation_preserves_notes_when_audit_and_close_fail(tmp_path):
-    dependencies = make_fake_dependencies(tmp_path, cancel_stage=AgentStage.PROPOSING_ACTION, audit_failure=True, close_failure=True)
+    dependencies = make_fake_dependencies(tmp_path, cancel_stage=AgentStage.PROPOSING_ACTION, audit_failure=RuntimeError("audit"), close_failure=RuntimeError("close"))
     with pytest.raises(asyncio.CancelledError) as error:
         await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
     assert any("audit" in note for note in error.value.__notes__)
@@ -218,3 +218,21 @@ async def test_target_is_deep_copied_before_external_calls(tmp_path):
     target["x"].append(2)
     episode = await loop.run_particle("run-1", "p0", 0)
     assert episode.model_dump(mode="json")["target_position"] == {"x": [1]}
+
+
+@pytest.mark.asyncio
+async def test_start_failure_uses_pending_lifecycle_and_timeout_is_typed(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path, start_exception=TimeoutError("start timeout"))
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+    assert episode.status is EpisodeStatus.TIMEOUT
+    assert [(event.stage, event.event_type) for event in dependencies["run_store"].events] == [
+        (AgentStage.PENDING, "started"),
+        (AgentStage.PENDING, "timeout"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mutating_adapter_context_does_not_change_episode_target(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path, mutate_context=True)
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+    assert episode.model_dump(mode="json")["target_position"] == {"x": 1}

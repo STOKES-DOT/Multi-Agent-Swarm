@@ -70,7 +70,7 @@ class AgentLoop:
             raise ValueError("iteration_id must be a nonnegative integer")
         events: list[StageEvent] = []
         thread: ThreadRef | None = None
-        current_stage = AgentStage.HYPOTHESIZING
+        current_stage = AgentStage.PENDING
         evaluation: Evaluation | None = None
         realized: JsonValue | None = None
         evaluated: JsonValue = self._target
@@ -78,11 +78,7 @@ class AgentLoop:
         context = dict(self._context(run_id, particle_id, iteration_id))
         try:
             self._started(run_id, particle_id, iteration_id, AgentStage.PENDING, 0, {"workspace": str(self._workspace)})
-            try:
-                thread = await self._start_thread(particle_id)
-            except Exception as error:
-                self._terminal_event(run_id, particle_id, iteration_id, AgentStage.PENDING, "failed", events, payload={"type": type(error).__name__, "message": str(error)[:512]})
-                return await self._finish_episode(None, run_id, particle_id, iteration_id, events, EpisodeStatus.FAILED, self._failed_evaluation(), evaluated, realized, adherence)
+            thread = await self._start_thread(particle_id)
             self._store.append_stage_event(StageEvent(run_id=run_id, particle_id=particle_id, iteration_id=iteration_id, stage=AgentStage.PENDING, attempt=0, event_type="completed", payload={"thread": thread.to_json()}))
             proposal: Mapping[str, JsonValue] = {}
             for stage in (AgentStage.HYPOTHESIZING, AgentStage.PROPOSING_ACTION):
@@ -152,17 +148,21 @@ class AgentLoop:
         except asyncio.CancelledError as error:
             try:
                 self._terminal_event(run_id, particle_id, iteration_id, current_stage, "interrupted", events)
+            except asyncio.CancelledError as audit_error:
+                error.add_note("interruption audit raised CancelledError")
             except Exception as audit_error:
                 error.add_note(f"interruption audit failed: {type(audit_error).__name__}: {str(audit_error)[:512]}")
             if thread is not None:
                 try:
                     async with self._resources.agent_slot():
                         await self._runtime.close_thread(thread)
+                except asyncio.CancelledError:
+                    error.add_note("thread close raised CancelledError")
                 except Exception as close_error:
                     error.add_note(f"thread close failed: {type(close_error).__name__}: {str(close_error)[:512]}")
             raise
-        except TimeoutError:
-            self._terminal_event(run_id, particle_id, iteration_id, current_stage, "timeout", events)
+        except TimeoutError as error:
+            self._terminal_event(run_id, particle_id, iteration_id, current_stage, "timeout", events, payload={"type": type(error).__name__, "message": str(error)[:512]})
             return await self._finish_episode(thread,
                 run_id,
                 particle_id,
@@ -174,8 +174,8 @@ class AgentLoop:
                 realized,
                 adherence,
             )
-        except Exception:
-            self._terminal_event(run_id, particle_id, iteration_id, current_stage, "failed", events)
+        except Exception as error:
+            self._terminal_event(run_id, particle_id, iteration_id, current_stage, "failed", events, payload={"type": type(error).__name__, "message": str(error)[:512]})
             return await self._finish_episode(thread, run_id, particle_id, iteration_id, events, EpisodeStatus.FAILED, self._failed_evaluation(), evaluated, realized, adherence)
 
     async def _start_thread(self, particle_id: str) -> ThreadRef:
@@ -217,6 +217,8 @@ class AgentLoop:
                 response = await self._runtime.run_stage(thread, request)
             try:
                 parsed = self._adapter.parse_stage_response(stage, response)
+                if not isinstance(parsed, Mapping):
+                    raise ValueError("parsed response must be a mapping")
             except Exception as error:
                 diagnostic = {"attempt": attempt + 1, "type": type(error).__name__, "message": str(error)[:512], "response_excerpt": response.raw_text[:1024], "response_sha256": hashlib.sha256(response.raw_text.encode()).hexdigest()}
                 context["correction"] = diagnostic
