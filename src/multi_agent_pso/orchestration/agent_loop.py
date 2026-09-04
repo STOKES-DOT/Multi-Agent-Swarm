@@ -47,6 +47,8 @@ class AgentLoop:
         workspace: Path,
         protocol_snapshot_hash: str,
     ) -> None:
+        if not all((isinstance(runtime, AgentRuntime), isinstance(task_adapter, TaskAdapter), isinstance(evaluator, Evaluator), isinstance(tool_provider, ToolProvider), isinstance(resource_manager, ResourceManager), isinstance(run_store, RunStore))):
+            raise TypeError("AgentLoop dependencies must implement their protocols")
         if not isinstance(workspace, Path) or not workspace.is_absolute():
             raise ValueError("workspace must be an absolute Path")
         if not isinstance(protocol_snapshot_hash, str) or len(protocol_snapshot_hash) != 64 or any(character not in "0123456789abcdef" for character in protocol_snapshot_hash):
@@ -98,12 +100,11 @@ class AgentLoop:
             context["tool_result"] = tool_result.to_json()
             tool_status = episode_status_for_tool(tool_result.status)
             if tool_status is not EpisodeStatus.COMPLETED:
-                self._terminal_event(run_id, particle_id, iteration_id, current_stage, tool_status.value.lower(), events)
+                self._terminal_event(run_id, particle_id, iteration_id, current_stage, tool_status.value.lower(), events, payload={"tool_request": request.to_json(), "tool_result": tool_result.to_json(), "cached": cached})
                 return await self._finish_episode(thread,
                     run_id, particle_id, iteration_id, events, tool_status,
                     self._evaluation_for_tool(tool_result.status), evaluated, realized, adherence,
                 )
-            self._terminal_event(run_id, particle_id, iteration_id, current_stage, "completed", events, payload={"tool_request": request.to_json(), "tool_result": tool_result.to_json(), "cached": cached})
             tool_context = ToolContext(run_id, particle_id, iteration_id, current_stage, 0, self._workspace)
             try:
                 candidate = self._adapter.candidate_from_tool_result(tool_result, tool_context)
@@ -112,11 +113,12 @@ class AgentLoop:
                 evaluated = self._adapter.evaluated_position(self._target, realized)
                 adherence = self._adapter.position_adherence(self._target, realized)
             except ValueError as error:
-                self._terminal_event(run_id, particle_id, iteration_id, current_stage, "invalid", events, payload={"type": type(error).__name__, "message": str(error)[:512]})
+                self._terminal_event(run_id, particle_id, iteration_id, current_stage, "invalid", events, payload={"tool_request": request.to_json(), "tool_result": tool_result.to_json(), "cached": cached, "type": type(error).__name__, "message": str(error)[:512]})
                 return await self._finish_episode(thread, run_id, particle_id, iteration_id, events, EpisodeStatus.INVALID, self._invalid_evaluation(), evaluated, realized, adherence)
             context["realized_position"] = realized
             context["evaluated_position"] = evaluated
             context["adherence"] = adherence
+            self._terminal_event(run_id, particle_id, iteration_id, current_stage, "completed", events, payload={"tool_request": request.to_json(), "tool_result": tool_result.to_json(), "cached": cached, "candidate": candidate.to_json(), "realized_position": realized, "evaluated_position": evaluated, "adherence": adherence})
 
             current_stage = AgentStage.EVALUATING
             evaluation_context = EvaluationContext(run_id, particle_id, iteration_id, self._workspace, self._protocol_hash)
@@ -129,7 +131,7 @@ class AgentLoop:
             context["evaluation"] = evaluation.model_dump(mode="json")
             status = episode_status_for_evaluation(evaluation.status)
             if status is not EpisodeStatus.COMPLETED:
-                self._terminal_event(run_id, particle_id, iteration_id, current_stage, status.value.lower(), events)
+                self._terminal_event(run_id, particle_id, iteration_id, current_stage, status.value.lower(), events, payload={"evaluation": evaluation.model_dump(mode="json")})
                 return await self._finish_episode(thread, run_id, particle_id, iteration_id, events, status, evaluation, evaluated, realized, adherence)
             self._terminal_event(run_id, particle_id, iteration_id, current_stage, "completed", events, payload={"evaluation": evaluation.model_dump(mode="json")})
 
@@ -137,9 +139,7 @@ class AgentLoop:
             if await self._agent_stage(thread, current_stage, context, events) is None:
                 return await self._finish_episode(thread, run_id, particle_id, iteration_id, events, EpisodeStatus.INVALID, evaluation, evaluated, realized, adherence)
             current_stage = AgentStage.COMPLETED
-            self._started(run_id, particle_id, iteration_id, current_stage, 0, {"episode": "complete"})
-            self._terminal_event(run_id, particle_id, iteration_id, current_stage, "completed", events, payload={"evaluation": evaluation.model_dump(mode="json")})
-            return await self._finish_episode(thread, run_id, particle_id, iteration_id, events, EpisodeStatus.COMPLETED, evaluation, evaluated, realized, adherence)
+            return await self._finish_episode(thread, run_id, particle_id, iteration_id, events, EpisodeStatus.COMPLETED, evaluation, evaluated, realized, adherence, complete_lifecycle=True)
         except asyncio.CancelledError as error:
             try:
                 self._terminal_event(run_id, particle_id, iteration_id, current_stage, "interrupted", events)
@@ -173,15 +173,24 @@ class AgentLoop:
         async with self._resources.agent_slot():
             return await self._runtime.start_thread(particle_id, self._workspace)
 
-    async def _finish_episode(self, thread: ThreadRef | None, run_id: str, particle_id: str, iteration_id: int, events: list[StageEvent], status: EpisodeStatus, evaluation: Evaluation | None, evaluated: JsonValue, realized: JsonValue | None, adherence: Mapping[str, JsonValue]) -> AgentEpisode:
+    async def _finish_episode(self, thread: ThreadRef | None, run_id: str, particle_id: str, iteration_id: int, events: list[StageEvent], status: EpisodeStatus, evaluation: Evaluation | None, evaluated: JsonValue, realized: JsonValue | None, adherence: Mapping[str, JsonValue], complete_lifecycle: bool = False) -> AgentEpisode:
+        close_error: Exception | None = None
         if thread is not None:
             try:
                 async with self._resources.agent_slot():
                     await self._runtime.close_thread(thread)
             except Exception as error:
-                self._terminal_event(run_id, particle_id, iteration_id, events[-1].stage if events else AgentStage.PENDING, "cleanup_failed", events, payload={"type": type(error).__name__, "message": str(error)[:512]})
+                close_error = error
                 if status is EpisodeStatus.COMPLETED:
                     status = EpisodeStatus.FAILED
+        if complete_lifecycle:
+            self._started(run_id, particle_id, iteration_id, AgentStage.COMPLETED, 0, {"episode": "complete"})
+            if close_error is None:
+                self._terminal_event(run_id, particle_id, iteration_id, AgentStage.COMPLETED, "completed", events, payload={"evaluation": evaluation.model_dump(mode="json") if evaluation else {}})
+            else:
+                self._terminal_event(run_id, particle_id, iteration_id, AgentStage.COMPLETED, "cleanup_failed", events, payload={"type": type(close_error).__name__, "message": str(close_error)[:512]})
+        elif close_error is not None:
+            self._terminal_event(run_id, particle_id, iteration_id, events[-1].stage if events else AgentStage.PENDING, "cleanup_failed", events, payload={"type": type(close_error).__name__, "message": str(close_error)[:512]})
         return self._terminal_episode(run_id, particle_id, iteration_id, events, status, evaluation, evaluated, realized, adherence)
 
     async def _agent_stage(
@@ -227,7 +236,7 @@ class AgentLoop:
         return result, request, False
 
     def _context(self, run_id: str, particle_id: str, iteration_id: int) -> Mapping[str, JsonValue]:
-        return {"run_id": run_id, "particle_id": particle_id, "iteration_id": iteration_id, "target_position": self._target, "protocol_snapshot_hash": self._protocol_hash}
+        return {"run_id": run_id, "particle_id": particle_id, "iteration_id": iteration_id, "target_position": self._copy_json(self._target), "protocol_snapshot_hash": self._protocol_hash}
 
     @staticmethod
     def _copy_json(value: JsonValue) -> JsonValue:
