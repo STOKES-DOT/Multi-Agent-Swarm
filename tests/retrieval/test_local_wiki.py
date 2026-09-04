@@ -298,6 +298,9 @@ def test_raw_snapshot_path_swap_after_open_is_not_exposed(
         "- Raw snapshot: raw/source/v1.pdf",
         "- Raw snapshot: `raw/source/v1.pdf`",
         "- Raw snapshot: <raw/source/v1.pdf>",
+        "- Local raw snapshot: raw/source/v1.pdf",
+        "- Local raw snapshot: `raw/source/v1.pdf`",
+        "- Local raw snapshot: <raw/source/v1.pdf>",
     ],
 )
 def test_raw_snapshot_metadata_accepts_only_standalone_canonical_lines(
@@ -341,7 +344,7 @@ def test_raw_snapshot_allows_a_regular_file_directly_under_raw(tmp_path: Path) -
     [
         "- Raw snapshot: raw/source/v1.pdf extra prose",
         "  - Raw snapshot: raw/source/v1.pdf",
-        "- Local raw snapshot: `raw/source/v1.pdf`",
+        "- Local snapshot: `raw/source/v1.pdf`",
         "The Raw snapshot: raw/source/v1.pdf is useful.",
         "[snapshot](raw/source/v1.pdf)",
     ],
@@ -364,6 +367,13 @@ def test_raw_snapshot_metadata_rejects_noncanonical_prose(
     hit = LocalWikiRetriever(root).search(WikiQuery("rawrejecttoken", 1))[0]
 
     assert hit.linked_raw_path is None
+
+
+def test_fixture_legacy_local_raw_snapshot_anchor_is_bound() -> None:
+    hit = LocalWikiRetriever(FIXTURE_WIKI).search(WikiQuery("parkanchortoken", 1))[0]
+
+    assert hit.relative_path == "sources/source-park-anchor.md"
+    assert hit.linked_raw_path == "raw/source-park-anchor/v1.pdf"
 
 
 @pytest.mark.parametrize("symlink_kind", ["file", "directory"])
@@ -438,6 +448,83 @@ def test_evidence_boundary_bullets_are_independent_typed_fragments() -> None:
         "openclaim": ("open hypothesis", 22, 22),
     }
     assert len({hit.content for hit in by_token.values()}) == 4
+
+
+def test_backtick_fence_excludes_fake_metadata_headings_and_evidence(
+    tmp_path: Path,
+) -> None:
+    root = _wiki(
+        tmp_path,
+        {
+            "sources/fenced.md": (
+                "# Real section — open hypothesis\n"
+                "```markdown\n"
+                "- Raw snapshot: raw/fake/v1.pdf\n"
+                "# Fake heading — direct evidence\n"
+                "## Evidence boundary\n"
+                "- Direct evidence: fencedclaimtoken\n"
+                "```\n"
+                "visibleclaimtoken\n"
+            )
+        },
+    )
+    raw = root / "raw/fake/v1.pdf"
+    raw.parent.mkdir(parents=True)
+    raw.write_bytes(b"fake")
+
+    retriever = LocalWikiRetriever(root)
+    visible = retriever.search(WikiQuery("visibleclaimtoken", 1))[0]
+
+    assert visible.evidence_layer == "open hypothesis"
+    assert visible.linked_raw_path is None
+    assert retriever.search(WikiQuery("fencedclaimtoken", 5)) == ()
+
+
+def test_tilde_fence_requires_same_character_and_sufficient_closing_length(
+    tmp_path: Path,
+) -> None:
+    root = _wiki(
+        tmp_path,
+        {
+            "sources/fenced.md": (
+                "# Real section — open hypothesis\n"
+                "~~~~ text\n"
+                "shortclosetoken\n"
+                "~~~\n"
+                "differentclosetoken\n"
+                "```\n"
+                "stillfencedtoken\n"
+                "~~~~~\n"
+                "afterfencetoken\n"
+            )
+        },
+    )
+
+    retriever = LocalWikiRetriever(root)
+
+    for token in ("shortclosetoken", "differentclosetoken", "stillfencedtoken"):
+        assert retriever.search(WikiQuery(token, 5)) == ()
+    assert retriever.search(WikiQuery("afterfencetoken", 1))
+
+
+def test_longer_backtick_fence_closer_ends_fence(tmp_path: Path) -> None:
+    root = _wiki(
+        tmp_path,
+        {
+            "sources/fenced.md": (
+                "# Real section — open hypothesis\n"
+                "```\n"
+                "insidefencetoken\n"
+                "````\n"
+                "outsidefencetoken\n"
+            )
+        },
+    )
+
+    retriever = LocalWikiRetriever(root)
+
+    assert retriever.search(WikiQuery("insidefencetoken", 1)) == ()
+    assert retriever.search(WikiQuery("outsidefencetoken", 1))
 
 
 def test_evidence_phrase_in_non_label_heading_is_not_promoted(tmp_path: Path) -> None:

@@ -27,12 +27,13 @@ _EVIDENCE_MARKER_RE = re.compile(
 )
 _EVIDENCE_BULLET_RE = re.compile(r"^\s*-\s*([^:]+?)\s*:\s*(\S.*?)\s*$")
 _RAW_METADATA_RE = re.compile(
-    r"^-\s*Raw snapshot:\s*"
+    r"^-\s*(?:Raw|Local raw) snapshot:\s*"
     r"(?:`(?P<backtick>raw/[^\s`<>]+)`|"
     r"<(?P<angle>raw/[^\s`<>]+)>|"
-    r"(?P<plain>raw/[^\s`<>]+))\s*$",
-    re.MULTILINE,
+    r"(?P<plain>raw/[^\s`<>]+))\s*$"
 )
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
+_FENCE_CLOSE_RE = re.compile(r"^ {0,3}(?P<fence>`+|~+)[ \t]*$")
 _WORD_RE = re.compile(r"[^\W_]+", flags=re.UNICODE)
 _DASH_RE = re.compile("[‐‑‒–—―−]")
 _READ_CHUNK_BYTES = 64 * 1024
@@ -136,8 +137,13 @@ class LocalWikiRetriever:
                 for relative_path, text in _markdown_documents(
                     namespace_fd, PurePosixPath(namespace)
                 ):
-                    linked_raw_path = _linked_raw(root_fd, relative_path, text)
-                    yield from _sections(relative_path, text, linked_raw_path)
+                    semantic_lines = _markdown_semantic_lines(text)
+                    linked_raw_path = _linked_raw(
+                        root_fd, relative_path, semantic_lines
+                    )
+                    yield from _sections(
+                        relative_path, semantic_lines, linked_raw_path
+                    )
 
     @staticmethod
     def _hit(
@@ -349,11 +355,16 @@ def _markdown_documents(
             )
 
 
-def _linked_raw(root_fd: int, relative_path: str, text: str) -> str | None:
+def _linked_raw(
+    root_fd: int, relative_path: str, lines: tuple[str, ...]
+) -> str | None:
     if not relative_path.startswith("sources/"):
         return None
     valid: list[str] = []
-    for match in _RAW_METADATA_RE.finditer(text):
+    for line in lines:
+        match = _RAW_METADATA_RE.fullmatch(line)
+        if match is None:
+            continue
         candidate = next(value for value in match.groupdict().values() if value)
         if _valid_raw_path(candidate) and _raw_regular_exists(root_fd, candidate):
             valid.append(candidate)
@@ -427,9 +438,10 @@ def _raw_regular_exists(root_fd: int, relative_path: str) -> bool:
 
 
 def _sections(
-    relative_path: str, text: str, linked_raw_path: str | None
+    relative_path: str,
+    lines: tuple[str, ...],
+    linked_raw_path: str | None,
 ) -> Iterator[_Section]:
-    lines = text.splitlines()
     starts = [
         (index, len(match.group(1)), match.group(2))
         for index, line in enumerate(lines)
@@ -576,6 +588,36 @@ def _line_fragment(
     start = max(start, match.end - max_chars)
     start = min(start, len(line) - max_chars)
     return line[start : start + max_chars]
+
+
+def _markdown_semantic_lines(text: str) -> tuple[str, ...]:
+    semantic: list[str] = []
+    fence_character: str | None = None
+    fence_length = 0
+    for line in text.splitlines():
+        if fence_character is None:
+            opening = _FENCE_OPEN_RE.match(line)
+            if opening is None:
+                semantic.append(line)
+                continue
+            fence = opening.group("fence")
+            if fence[0] == "`" and "`" in opening.group("info"):
+                semantic.append(line)
+                continue
+            fence_character = fence[0]
+            fence_length = len(fence)
+            semantic.append("")
+            continue
+        closing = _FENCE_CLOSE_RE.match(line)
+        if (
+            closing is not None
+            and closing.group("fence")[0] == fence_character
+            and len(closing.group("fence")) >= fence_length
+        ):
+            fence_character = None
+            fence_length = 0
+        semantic.append("")
+    return tuple(semantic)
 
 
 def _inode(value: os.stat_result) -> tuple[int, int]:
