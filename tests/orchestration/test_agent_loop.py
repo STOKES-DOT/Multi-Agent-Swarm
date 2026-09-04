@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping
 
 import pytest
 
@@ -894,6 +895,7 @@ def test_v1_json_boundary_constants_are_explicit() -> None:
     assert agent_loop_module.V1_JSON_MAX_DEPTH == 32
     assert agent_loop_module.V1_JSON_MAX_NODES == 10_000
     assert agent_loop_module.V1_JSON_MAX_COLLECTION_ITEMS == 4_096
+    assert agent_loop_module.V1_IDENTIFIER_MAX_UTF8_BYTES == 512
 
 
 @pytest.mark.asyncio
@@ -1066,3 +1068,97 @@ async def test_reflection_context_total_budget_fails_with_bounded_pair(tmp_path)
     assert reflection == ["started", "failed"]
     assert dependencies["runtime"].close_attempts == ["thread-p0"]
     assert_audit_events_within_v1_budget(dependencies)
+
+
+@pytest.mark.parametrize("case", ["surrogate_key", "len", "items", "iterator"])
+def test_hostile_mapping_audit_falls_back_to_fixed_bounded_summary(tmp_path, case):
+    class HostileMapping(Mapping):
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __iter__(self):
+            if case == "iterator":
+                return self
+            return iter(())
+
+        def __next__(self):
+            raise RuntimeError("hostile iterator")
+
+        def __len__(self):
+            if case == "len":
+                raise RuntimeError("hostile len")
+            return 0
+
+        def items(self):
+            if case == "items":
+                raise RuntimeError("hostile items")
+            return super().items()
+
+    payload = {"\ud800": 1} if case == "surrogate_key" else HostileMapping()
+    dependencies = make_fake_dependencies(tmp_path)
+    loop = AgentLoop(**dependencies)
+
+    loop._started("run-1", "p0", 0, AgentStage.PENDING, 0, payload)
+
+    event = dependencies["run_store"].events[-1]
+    assert dict(event.payload) == {
+        "truncated": True,
+        "reason": event.payload["reason"],
+        "type": type(payload).__name__,
+    }
+    assert len(event.payload["reason"].encode("utf-8")) <= 256
+    assert_audit_events_within_v1_budget(dependencies)
+
+
+@pytest.mark.asyncio
+async def test_unpaired_surrogate_raw_response_retries_without_parser(tmp_path):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        raw_responses={AgentStage.HYPOTHESIZING: '{"x":"\ud800"}'},
+    )
+
+    episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+
+    assert episode.status is EpisodeStatus.INVALID
+    assert dependencies["runtime"].stages == [AgentStage.HYPOTHESIZING] * 3
+    assert dependencies["task_adapter"].parse_calls == 0
+    for event in dependencies["run_store"].events:
+        json.dumps(event.model_dump(mode="json"), ensure_ascii=False).encode("utf-8")
+    assert_audit_events_within_v1_budget(dependencies)
+
+
+def test_full_stage_event_envelope_is_inside_json_budget(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path)
+    loop = AgentLoop(**dependencies)
+    near_limit = "x" * (JSON_BYTES - 100)
+
+    loop._started(
+        "run-1",
+        "p0",
+        0,
+        AgentStage.PENDING,
+        0,
+        {"blob": near_limit},
+    )
+
+    event = dependencies["run_store"].events[-1]
+    encoded = json.dumps(
+        event.model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert event.payload["truncated"] is True
+    assert len(encoded) <= JSON_BYTES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identifier", ["x" * 513, "\ud800"])
+async def test_invalid_identifier_is_rejected_before_external_calls(tmp_path, identifier):
+    dependencies = make_fake_dependencies(tmp_path)
+
+    with pytest.raises(ValueError, match="identifier"):
+        await AgentLoop(**dependencies).run_particle(identifier, "p0", 0)
+
+    assert dependencies["runtime"].stages == []
+    assert dependencies["runtime"].close_attempts == []
+    assert dependencies["run_store"].append_attempts == []

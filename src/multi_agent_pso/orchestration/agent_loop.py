@@ -43,6 +43,7 @@ V1_JSON_MAX_UTF8_BYTES = 256 * 1024
 V1_JSON_MAX_DEPTH = 32
 V1_JSON_MAX_NODES = 10_000
 V1_JSON_MAX_COLLECTION_ITEMS = 4_096
+V1_IDENTIFIER_MAX_UTF8_BYTES = 512
 _TEXT_CHUNK_CHARACTERS = 16_384
 
 
@@ -116,17 +117,30 @@ def _bounded_json_copy(value: object, *, boundary: str) -> JsonValue:
             return item
         if isinstance(item, Mapping):
             try:
-                if len(item) > V1_JSON_MAX_COLLECTION_ITEMS:
-                    budget.fail("single collection limit exceeded")
-            except TypeError:
-                budget.fail("mapping has no bounded length")
+                len(item)
+            except Exception:
+                budget.fail("mapping length failed")
+            try:
+                iterator = iter(item.items())
+            except Exception:
+                budget.fail("mapping iteration failed")
             budget.add_bytes(2)
             copied: dict[str, JsonValue] = {}
             count = 0
-            for key, nested in item.items():
-                count += 1
-                if count > V1_JSON_MAX_COLLECTION_ITEMS:
+            while True:
+                try:
+                    entry = next(iterator)
+                except StopIteration:
+                    break
+                except Exception:
+                    budget.fail("mapping iteration failed")
+                if count == V1_JSON_MAX_COLLECTION_ITEMS:
                     budget.fail("single collection limit exceeded")
+                try:
+                    key, nested = entry
+                except Exception:
+                    budget.fail("mapping items must be key-value pairs")
+                count += 1
                 if not isinstance(key, str):
                     budget.fail("object keys must be strings")
                 budget.add_node()
@@ -180,6 +194,30 @@ def _streaming_text_sha256(value: str) -> str:
         chunk = value[offset : offset + _TEXT_CHUNK_CHARACTERS]
         digest.update(chunk.encode("utf-8", "replace"))
     return digest.hexdigest()
+
+
+def _safe_utf8_text(value: object, max_bytes: int) -> str:
+    try:
+        text = str(value)
+    except Exception:
+        text = "unprintable diagnostic"
+    candidate = text[:max_bytes]
+    encoded = candidate.encode("utf-8", "backslashreplace")[:max_bytes]
+    return encoded.decode("utf-8", "ignore")
+
+
+def _validate_identifier(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} identifier must be a nonempty string")
+    if len(value) > V1_IDENTIFIER_MAX_UTF8_BYTES:
+        raise ValueError(f"{name} identifier exceeds the UTF-8 byte limit")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeError as error:
+        raise ValueError(f"{name} identifier must be valid UTF-8") from error
+    if len(encoded) > V1_IDENTIFIER_MAX_UTF8_BYTES:
+        raise ValueError(f"{name} identifier exceeds the UTF-8 byte limit")
+    return value
 
 
 @dataclass(slots=True)
@@ -236,8 +274,8 @@ class AgentLoop:
         self._protocol_hash = protocol_snapshot_hash
 
     async def run_particle(self, run_id: str, particle_id: str, iteration_id: int) -> AgentEpisode:
-        if not isinstance(run_id, str) or not run_id or not isinstance(particle_id, str) or not particle_id:
-            raise ValueError("run_id and particle_id must be nonempty strings")
+        run_id = _validate_identifier(run_id, "run_id")
+        particle_id = _validate_identifier(particle_id, "particle_id")
         if type(iteration_id) is not int or iteration_id < 0:
             raise ValueError("iteration_id must be a nonnegative integer")
         owner = _ThreadOwner()
@@ -323,7 +361,7 @@ class AgentLoop:
                 evaluated = self._copy_json(evaluated)
                 adherence = self._copy_json(adherence)
             except ValueError as error:
-                self._terminal_event(run_id, particle_id, iteration_id, current_stage, "invalid", events, payload={"tool_request": request_json, "tool_result": tool_result_json, "cached": cached, "type": type(error).__name__, "message": str(error)[:512]})
+                self._terminal_event(run_id, particle_id, iteration_id, current_stage, "invalid", events, payload={"tool_request": request_json, "tool_result": tool_result_json, "cached": cached, **self._request_error(error)})
                 return await self._finish_episode(owner, run_id, particle_id, iteration_id, events, EpisodeStatus.INVALID, self._invalid_evaluation(), evaluated, realized, adherence)
             context["realized_position"] = realized
             context["evaluated_position"] = evaluated
@@ -658,7 +696,7 @@ class AgentLoop:
                     raise AssertionError("StageRequest JSON must be an object")
                 request_payload = copied_request
             else:
-                request_payload = {"type": type(request).__name__[:128]}
+                request_payload = {"type": _safe_utf8_text(type(request).__name__, 128)}
             self._started(
                 str(context["run_id"]),
                 str(context["particle_id"]),
@@ -686,10 +724,9 @@ class AgentLoop:
             except Exception as error:
                 diagnostic = {
                     "attempt": attempt + 1,
-                    "type": type(error).__name__,
-                    "message": str(error)[:512],
+                    **self._request_error(error),
                     "request": request_payload,
-                    "response_excerpt": response.raw_text[:1024],
+                    "response_excerpt": _safe_utf8_text(response.raw_text, 1024),
                     "response_sha256": _streaming_text_sha256(response.raw_text),
                 }
                 context["correction"] = diagnostic
@@ -780,8 +817,8 @@ class AgentLoop:
     @staticmethod
     def _request_error(error: BaseException) -> dict[str, JsonValue]:
         return {
-            "type": type(error).__name__[:128],
-            "message": str(error)[:512],
+            "type": _safe_utf8_text(type(error).__name__, 128),
+            "message": _safe_utf8_text(error, 512),
         }
 
     async def _execute_tool(self, run_id: str, particle_id: str, iteration_id: int, proposal: Mapping[str, JsonValue]) -> tuple[ToolResult, ToolRequest, bool]:
@@ -819,8 +856,7 @@ class AgentLoop:
 
     def _terminal_event(self, run_id: str, particle_id: str, iteration_id: int, stage: AgentStage, event_type: str, events: list[StageEvent], attempt: int = 0, payload: Mapping[str, JsonValue] | None = None) -> None:
         event = StageEvent(run_id=run_id, particle_id=particle_id, iteration_id=iteration_id, stage=stage, attempt=attempt, event_type=event_type, payload=self._audit_payload({} if payload is None else payload))
-        self._persist_event(event)
-        events.append(event)
+        events.append(self._persist_event(event))
 
     def _audit_payload(self, payload: object) -> Mapping[str, JsonValue]:
         try:
@@ -828,26 +864,56 @@ class AgentLoop:
         except _JsonBoundaryError as error:
             summary: dict[str, JsonValue] = {
                 "truncated": True,
-                "reason": str(error)[:256],
-                "type": type(payload).__name__[:128],
+                "reason": _safe_utf8_text(error, 256),
+                "type": _safe_utf8_text(type(payload).__name__, 128),
             }
-            if isinstance(payload, Mapping):
-                keys: list[str] = []
-                try:
-                    for key in payload:
-                        keys.append(str(key)[:128])
-                        if len(keys) == 32:
-                            break
-                except Exception:
-                    keys = []
-                if keys:
-                    summary["keys"] = keys
-            copied = _bounded_json_copy(summary, boundary="audit summary")
+            try:
+                copied = _bounded_json_copy(summary, boundary="audit summary")
+            except _JsonBoundaryError:
+                copied = {
+                    "truncated": True,
+                    "reason": "audit JSON boundary rejected",
+                    "type": "object",
+                }
         if not isinstance(copied, Mapping):
             return {"value": copied}
         return copied
 
-    def _persist_event(self, event: StageEvent) -> None:
+    def _persist_event(self, event: StageEvent) -> StageEvent:
+        try:
+            _bounded_json_copy(event.model_dump(mode="json"), boundary="stage event")
+        except _JsonBoundaryError as error:
+            event = StageEvent(
+                run_id=event.run_id,
+                particle_id=event.particle_id,
+                iteration_id=event.iteration_id,
+                stage=event.stage,
+                attempt=event.attempt,
+                event_type=event.event_type,
+                payload={
+                    "truncated": True,
+                    "reason": _safe_utf8_text(error, 256),
+                    "type": "StageEvent",
+                },
+            )
+            try:
+                _bounded_json_copy(
+                    event.model_dump(mode="json"), boundary="stage event fallback"
+                )
+            except _JsonBoundaryError:
+                event = StageEvent(
+                    run_id=event.run_id,
+                    particle_id=event.particle_id,
+                    iteration_id=event.iteration_id,
+                    stage=event.stage,
+                    attempt=event.attempt,
+                    event_type=event.event_type,
+                    payload={
+                        "truncated": True,
+                        "reason": "stage event exceeded v1 JSON budget",
+                        "type": "StageEvent",
+                    },
+                )
         try:
             self._store.append_stage_event(event)
         except Exception as error:
@@ -856,14 +922,12 @@ class AgentLoop:
                 attempt=event.attempt,
                 event_type=event.event_type,
             ) from error
+        return event
 
     def _failure_payload(
         self, error: BaseException, context: dict[str, JsonValue]
     ) -> dict[str, JsonValue]:
-        payload: dict[str, JsonValue] = {
-            "type": type(error).__name__[:128],
-            "message": str(error)[:512],
-        }
+        payload = self._request_error(error)
         stage_context = context.pop(_ACTIVE_STAGE_CONTEXT, None)
         stage_request = context.pop(_ACTIVE_STAGE_REQUEST, None)
         if stage_context is not None:
@@ -880,7 +944,10 @@ class AgentLoop:
     @staticmethod
     def _add_secondary(primary: BaseException, label: str, secondary: BaseException) -> None:
         primary.add_note(
-            f"{label}: {type(secondary).__name__}: {str(secondary)[:512]}"
+            _safe_utf8_text(
+                f"{label}: {type(secondary).__name__}: {_safe_utf8_text(secondary, 512)}",
+                768,
+            )
         )
 
     def _terminal_episode(self, run_id: str, particle_id: str, iteration_id: int, events: list[StageEvent], status: EpisodeStatus, evaluation: Evaluation | None, evaluated: JsonValue, realized: JsonValue | None, adherence: Mapping[str, JsonValue]) -> AgentEpisode:
