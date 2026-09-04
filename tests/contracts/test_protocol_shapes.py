@@ -609,7 +609,7 @@ def test_records_are_frozen_deeply_immutable_and_json_serializable() -> None:
         candidate,
         EvaluationContext("run", "particle", 0, WORKSPACE, HASH, {}),
         WikiQuery("keywords", 2),
-        WikiHit("notes/example.md", 1, 2, "evidence", "content"),
+        WikiHit("notes/example.md", 1, 2, "direct evidence", "content"),
     ):
         assert not hasattr(record, "__dict__")
         serialized = record.to_json()
@@ -648,13 +648,21 @@ def test_records_are_frozen_deeply_immutable_and_json_serializable() -> None:
         (lambda: EvaluationContext("run", "", 0, WORKSPACE, HASH), "particle_id"),
         (lambda: EvaluationContext("run", "particle", 0, Path("relative"), HASH), "workspace"),
         (lambda: WikiQuery("", 1), "text"),
+        (lambda: WikiQuery("   ", 1), "text"),
         (lambda: WikiQuery("query", 0), "max_results"),
         (lambda: WikiQuery("query", 101), "max_results"),
-        (lambda: WikiHit("", 1, 1, "evidence", "content"), "relative_path"),
-        (lambda: WikiHit("/absolute/note.md", 1, 1, "evidence", "content"), "relative_path"),
-        (lambda: WikiHit("note.md", 0, 1, "evidence", "content"), "line_start"),
-        (lambda: WikiHit("note.md", 2, 1, "evidence", "content"), "line_end"),
+        (lambda: WikiQuery("query", 1, score_threshold=-0.1), "score_threshold"),
+        (lambda: WikiQuery("query", 1, score_threshold=1.1), "score_threshold"),
+        (lambda: WikiQuery("query", 1, snippet_max_chars=63), "snippet_max_chars"),
+        (lambda: WikiQuery("query", 1, snippet_max_chars=8193), "snippet_max_chars"),
+        (lambda: WikiHit("", 1, 1, "direct evidence", "content"), "relative_path"),
+        (lambda: WikiHit("/absolute/note.md", 1, 1, "direct evidence", "content"), "relative_path"),
+        (lambda: WikiHit("note.md", 0, 1, "direct evidence", "content"), "line_start"),
+        (lambda: WikiHit("note.md", 2, 1, "direct evidence", "content"), "line_end"),
         (lambda: WikiHit("note.md", 1, 1, "", "content"), "evidence_layer"),
+        (lambda: WikiHit("note.md", 1, 1, "fabricated", "content"), "evidence_layer"),
+        (lambda: WikiHit("note.md", 1, 1, "direct evidence", "content", "../raw/a.pdf"), "linked_raw_path"),
+        (lambda: WikiHit("note.md", 1, 1, "direct evidence", "content", "raw"), "linked_raw_path"),
     ],
 )
 def test_boundary_records_reject_invalid_values(factory: object, match: str) -> None:
@@ -728,9 +736,11 @@ def test_json_mapping_fields_reject_tuples_and_scalars(factory: object) -> None:
         lambda: EvaluationContext("run", "particle", 0, WORKSPACE, []),
         lambda: WikiQuery(True, 1),
         lambda: WikiQuery("query", True),
-        lambda: WikiHit("note.md", True, 1, "evidence", "content"),
+        lambda: WikiQuery("query", 1, score_threshold=True),
+        lambda: WikiQuery("query", 1, snippet_max_chars=True),
+        lambda: WikiHit("note.md", True, 1, "direct evidence", "content"),
         lambda: WikiHit("note.md", 1, 1, 1, "content"),
-        lambda: WikiHit("note.md", 1, 1, "evidence", 1),
+        lambda: WikiHit("note.md", 1, 1, "direct evidence", 1),
     ],
 )
 def test_boundary_records_reject_wrong_runtime_types(factory: object) -> None:
