@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import multi_agent_pso.tools.command_json as command_json_module
 from multi_agent_pso.tools import (
     JsonCommandLimits,
     JsonCommandProvider,
@@ -266,6 +267,244 @@ async def test_cancellation_during_spawn_reaps_created_child(
         if children and children[0].returncode is None:
             children[0].kill()
             await children[0].wait()
+
+
+async def test_spawn_timeout_waits_for_late_handle_then_reaps_child(
+    tmp_path: Path, monkeypatch
+) -> None:
+    original_spawn = asyncio.create_subprocess_exec
+    children = []
+
+    async def delayed_spawn(*args, **kwargs):
+        process = await original_spawn(*args, **kwargs)
+        children.append(process)
+        await asyncio.sleep(0.2)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+    result = await _provider().execute_json(
+        {}, cwd=tmp_path.resolve(), timeout_seconds=0.05
+    )
+
+    assert result.status is JsonCommandStatus.TIMEOUT
+    assert result.elapsed_seconds < 0.5
+    assert children[0].returncode is not None
+    assert not _pid_exists(children[0].pid)
+
+
+async def test_process_wait_uses_deadline_remaining_after_spawn(
+    tmp_path: Path, monkeypatch
+) -> None:
+    original_spawn = asyncio.create_subprocess_exec
+
+    async def delayed_spawn(*args, **kwargs):
+        process = await original_spawn(*args, **kwargs)
+        await asyncio.sleep(0.08)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+    result = await _provider("--sleep", "0.08").execute_json(
+        {}, cwd=tmp_path.resolve(), timeout_seconds=0.12
+    )
+
+    assert result.status is JsonCommandStatus.TIMEOUT
+    assert result.elapsed_seconds < 0.35
+
+
+async def test_spawn_plain_exception_maps_to_spawn_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    async def failing_spawn(*args, **kwargs):
+        raise RuntimeError("spawn adapter failed")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", failing_spawn)
+    result = await _provider().execute_json(
+        {}, cwd=tmp_path.resolve(), timeout_seconds=5
+    )
+
+    assert result.status is JsonCommandStatus.SPAWN_ERROR
+    assert result.exit_code is None
+
+
+@pytest.mark.parametrize(
+    "primary",
+    [
+        asyncio.CancelledError("spawn cancelled"),
+        KeyboardInterrupt("spawn interrupted"),
+        SystemExit("spawn exited"),
+    ],
+)
+async def test_spawn_base_exception_is_propagated_by_identity(
+    tmp_path: Path, monkeypatch, primary: BaseException
+) -> None:
+    async def failing_spawn(*args, **kwargs):
+        raise primary
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", failing_spawn)
+    with pytest.raises(type(primary)) as raised:
+        await _provider().execute_json(
+            {}, cwd=tmp_path.resolve(), timeout_seconds=5
+        )
+
+    assert raised.value is primary
+
+
+@pytest.mark.parametrize(
+    "primary",
+    [
+        asyncio.CancelledError("late spawn cancelled"),
+        KeyboardInterrupt("late spawn interrupted"),
+        SystemExit("late spawn exited"),
+    ],
+)
+async def test_late_spawn_base_exception_is_not_hidden_by_timeout(
+    tmp_path: Path, monkeypatch, primary: BaseException
+) -> None:
+    async def delayed_failure(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        raise primary
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_failure)
+    with pytest.raises(type(primary)) as raised:
+        await _provider().execute_json(
+            {}, cwd=tmp_path.resolve(), timeout_seconds=0.01
+        )
+
+    assert raised.value is primary
+
+
+async def test_second_cancellation_during_cleanup_does_not_replace_first(
+    tmp_path: Path,
+) -> None:
+    pid_file = tmp_path / "double-cancel.pid"
+    provider = _provider(
+        "--pid-file",
+        str(pid_file),
+        "--sleep",
+        "30",
+        "--ignore-term",
+        limits=replace(JsonCommandLimits(), terminate_grace_seconds=0.2),
+    )
+    task = asyncio.create_task(
+        provider.execute_json({}, cwd=tmp_path.resolve(), timeout_seconds=60)
+    )
+    pid = await _wait_for_pid(pid_file)
+    task.cancel("first")
+    await asyncio.sleep(0.03)
+    task.cancel("second")
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await task
+
+    assert raised.value.args == ("first",)
+    assert any("second" in note for note in getattr(raised.value, "__notes__", ()))
+    assert not _pid_exists(pid)
+
+
+async def test_cleanup_exception_is_noted_on_first_cancellation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    original_shutdown = command_json_module._shutdown
+
+    async def cleanup_then_fail(*args, **kwargs):
+        await original_shutdown(*args, **kwargs)
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(command_json_module, "_shutdown", cleanup_then_fail)
+    pid_file = tmp_path / "cleanup-error.pid"
+    task = asyncio.create_task(
+        _provider("--pid-file", str(pid_file), "--sleep", "30").execute_json(
+            {}, cwd=tmp_path.resolve(), timeout_seconds=60
+        )
+    )
+    pid = await _wait_for_pid(pid_file)
+    task.cancel("first")
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await task
+
+    assert raised.value.args == ("first",)
+    assert any(
+        "RuntimeError: cleanup failed" in note
+        for note in getattr(raised.value, "__notes__", ())
+    )
+    assert not _pid_exists(pid)
+
+
+async def test_cleanup_continues_to_kill_after_terminate_exception(
+    tmp_path: Path, monkeypatch
+) -> None:
+    original_spawn = asyncio.create_subprocess_exec
+    children = []
+
+    async def recording_spawn(*args, **kwargs):
+        process = await original_spawn(*args, **kwargs)
+        children.append(process)
+        return process
+
+    def failing_terminate(process):
+        raise RuntimeError("terminate failed")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", recording_spawn)
+    monkeypatch.setattr(asyncio.subprocess.Process, "terminate", failing_terminate)
+    pid_file = tmp_path / "terminate-error.pid"
+    task = asyncio.create_task(
+        _provider("--pid-file", str(pid_file), "--sleep", "30").execute_json(
+            {}, cwd=tmp_path.resolve(), timeout_seconds=60
+        )
+    )
+    pid = await _wait_for_pid(pid_file)
+    task.cancel("first")
+    try:
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        assert raised.value.args == ("first",)
+        assert any(
+            "RuntimeError: terminate failed" in note
+            for note in getattr(raised.value, "__notes__", ())
+        )
+        assert children[0].returncode is not None
+        assert not _pid_exists(pid)
+    finally:
+        if children and children[0].returncode is None:
+            children[0].kill()
+            await children[0].wait()
+
+
+async def test_spawn_cancellation_keeps_first_when_cleanup_is_cancelled_again(
+    tmp_path: Path, monkeypatch
+) -> None:
+    original_spawn = asyncio.create_subprocess_exec
+    child_ready = asyncio.Event()
+    children = []
+
+    async def delayed_spawn(*args, **kwargs):
+        process = await original_spawn(*args, **kwargs)
+        children.append(process)
+        child_ready.set()
+        await asyncio.sleep(0.08)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+    task = asyncio.create_task(
+        _provider(
+            "--sleep",
+            "30",
+            "--ignore-term",
+            limits=replace(JsonCommandLimits(), terminate_grace_seconds=0.2),
+        ).execute_json({}, cwd=tmp_path.resolve(), timeout_seconds=60)
+    )
+    await child_ready.wait()
+    task.cancel("first")
+    await asyncio.sleep(0.02)
+    task.cancel("second")
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await task
+
+    assert raised.value.args == ("first",)
+    assert any("second" in note for note in getattr(raised.value, "__notes__", ()))
+    assert children[0].returncode is not None
 
 
 async def test_distinct_commands_run_concurrently(tmp_path: Path) -> None:

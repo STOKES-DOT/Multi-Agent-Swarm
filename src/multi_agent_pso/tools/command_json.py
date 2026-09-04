@@ -126,6 +126,11 @@ class _DuplicateKey(ValueError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class _SpawnFailure:
+    error: BaseException
+
+
 def _copy_json(
     value: object,
     budget: _JsonBudget,
@@ -334,8 +339,12 @@ async def _shutdown(
     wait_task: asyncio.Task[int],
     grace_seconds: float,
 ) -> None:
+    cleanup_errors: list[Exception] = []
     if process.stdin is not None:
-        process.stdin.close()
+        try:
+            process.stdin.close()
+        except Exception as error:
+            cleanup_errors.append(error)
     for task in work_tasks:
         if not task.done():
             task.cancel()
@@ -351,6 +360,8 @@ async def _shutdown(
             process.terminate()
         except ProcessLookupError:
             pass
+        except Exception as error:
+            cleanup_errors.append(error)
     if not wait_task.done():
         done, _ = await asyncio.wait((wait_task,), timeout=grace_seconds)
         if not done and process.returncode is None:
@@ -358,7 +369,17 @@ async def _shutdown(
                 process.kill()
             except ProcessLookupError:
                 pass
-    await asyncio.gather(wait_task, *drains, return_exceptions=True)
+            except Exception as error:
+                cleanup_errors.append(error)
+    drain_results = await asyncio.gather(wait_task, *drains, return_exceptions=True)
+    cleanup_errors.extend(
+        result for result in drain_results if isinstance(result, Exception)
+    )
+    if cleanup_errors:
+        primary = cleanup_errors[0]
+        for secondary in cleanup_errors[1:]:
+            _add_secondary(primary, secondary, "JSON command cleanup also failed")
+        raise primary
 
 
 async def _cleanup_resilient(
@@ -366,29 +387,82 @@ async def _cleanup_resilient(
     work_tasks: tuple[asyncio.Task[object], ...],
     wait_task: asyncio.Task[int],
     grace_seconds: float,
+    *,
+    primary: BaseException | None = None,
 ) -> None:
     cleanup = asyncio.create_task(
         _shutdown(process, work_tasks, wait_task, grace_seconds)
     )
     interrupted: asyncio.CancelledError | None = None
+    cleanup_error: BaseException | None = None
     while not cleanup.done():
         try:
             await asyncio.shield(cleanup)
         except asyncio.CancelledError as error:
-            if interrupted is None:
+            if primary is not None:
+                _add_secondary(primary, error, "JSON command cleanup was cancelled")
+            elif interrupted is None:
                 interrupted = error
-    await cleanup
+            else:
+                _add_secondary(interrupted, error, "JSON command cleanup was cancelled")
+        except BaseException as error:
+            cleanup_error = error
+    if cleanup_error is None:
+        try:
+            cleanup.result()
+        except BaseException as error:
+            cleanup_error = error
+    if cleanup_error is not None:
+        if primary is not None:
+            _add_secondary(primary, cleanup_error, "JSON command cleanup failed")
+        elif interrupted is not None:
+            _add_secondary(interrupted, cleanup_error, "JSON command cleanup failed")
+        else:
+            raise cleanup_error
     if interrupted is not None:
         raise interrupted
 
 
-async def _await_task_without_cancelling(task: asyncio.Task[Any]) -> Any:
+def _add_secondary(
+    primary: BaseException,
+    secondary: BaseException,
+    context: str,
+) -> None:
+    try:
+        message = str(secondary)
+    except Exception:
+        message = "<unprintable>"
+    primary.add_note(
+        f"{context}: {type(secondary).__name__}: {message[:512]}"
+    )
+
+
+async def _await_task_for_primary(
+    task: asyncio.Task[Any],
+    primary: BaseException,
+    context: str,
+) -> Any:
     while not task.done():
         try:
             await asyncio.shield(task)
-        except asyncio.CancelledError:
-            continue
+        except asyncio.CancelledError as error:
+            _add_secondary(primary, error, context)
     return task.result()
+
+
+async def _capture_spawn(
+    *argv: str, cwd: Path
+) -> asyncio.subprocess.Process | _SpawnFailure:
+    try:
+        return await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=cwd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except BaseException as error:
+        return _SpawnFailure(error)
 
 
 class JsonCommandProvider:
@@ -420,51 +494,102 @@ class JsonCommandProvider:
         cwd: Path,
         timeout_seconds: int | float,
     ) -> JsonCommandResult:
-        directory = _validated_cwd(cwd)
-        timeout = _positive_finite(timeout_seconds, "timeout_seconds")
-        stdin = _canonical_stdin(payload, self._limits)
         started_at = datetime.now(timezone.utc)
         started_clock = time.monotonic()
-        spawn_task = asyncio.create_task(
-            asyncio.create_subprocess_exec(
-                *self._argv,
-                cwd=directory,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        )
+        directory = _validated_cwd(cwd)
+        timeout = _positive_finite(timeout_seconds, "timeout_seconds")
+        deadline = started_clock + timeout
+        stdin = _canonical_stdin(payload, self._limits)
+        spawn_task = asyncio.create_task(_capture_spawn(*self._argv, cwd=directory))
+        remaining = max(0.0, deadline - time.monotonic())
         try:
-            process = await asyncio.shield(spawn_task)
+            spawn_done, _ = await asyncio.wait((spawn_task,), timeout=remaining)
         except asyncio.CancelledError as cancellation:
-            process = None
-            try:
-                process = await _await_task_without_cancelling(spawn_task)
-                wait_task = asyncio.create_task(process.wait())
+            outcome = await _await_task_for_primary(
+                spawn_task,
+                cancellation,
+                "JSON command spawn cleanup was cancelled",
+            )
+            if isinstance(outcome, asyncio.subprocess.Process):
+                wait_task = asyncio.create_task(outcome.wait())
                 await _cleanup_resilient(
-                    process,
+                    outcome,
                     (),
                     wait_task,
                     self._limits.terminate_grace_seconds,
+                    primary=cancellation,
                 )
-            except BaseException as cleanup_error:
-                if cleanup_error is not cancellation:
-                    cancellation.add_note(
-                        "JSON command spawn cleanup failed: "
-                        f"{type(cleanup_error).__name__}: {cleanup_error}"
-                    )
+            else:
+                _add_secondary(
+                    cancellation,
+                    outcome.error,
+                    "JSON command spawn failed during cancellation",
+                )
             raise cancellation
-        except OSError:
+
+        if not spawn_done:
+            timeout_cancellation: asyncio.CancelledError | None = None
+            while not spawn_task.done():
+                try:
+                    await asyncio.shield(spawn_task)
+                except asyncio.CancelledError as cancellation:
+                    if timeout_cancellation is None:
+                        timeout_cancellation = cancellation
+                    else:
+                        _add_secondary(
+                            timeout_cancellation,
+                            cancellation,
+                            "JSON command spawn cleanup was cancelled",
+                        )
+            outcome = spawn_task.result()
+            if isinstance(outcome, asyncio.subprocess.Process):
+                wait_task = asyncio.create_task(outcome.wait())
+                await _cleanup_resilient(
+                    outcome,
+                    (),
+                    wait_task,
+                    self._limits.terminate_grace_seconds,
+                    primary=timeout_cancellation,
+                )
+                exit_code = outcome.returncode
+            else:
+                exit_code = None
+                if timeout_cancellation is not None:
+                    _add_secondary(
+                        timeout_cancellation,
+                        outcome.error,
+                        "JSON command spawn failed during cancellation",
+                    )
+                elif not isinstance(outcome.error, Exception):
+                    raise outcome.error
+            if timeout_cancellation is not None:
+                raise timeout_cancellation
             return self._result(
                 stdin=stdin,
                 stdout=b"",
                 stderr=b"",
-                exit_code=None,
-                status=JsonCommandStatus.SPAWN_ERROR,
+                exit_code=exit_code,
+                status=JsonCommandStatus.TIMEOUT,
                 payload=None,
                 started_at=started_at,
                 started_clock=started_clock,
             )
+
+        outcome = spawn_task.result()
+        if isinstance(outcome, _SpawnFailure):
+            if isinstance(outcome.error, Exception):
+                return self._result(
+                    stdin=stdin,
+                    stdout=b"",
+                    stderr=b"",
+                    exit_code=None,
+                    status=JsonCommandStatus.SPAWN_ERROR,
+                    payload=None,
+                    started_at=started_at,
+                    started_clock=started_clock,
+                )
+            raise outcome.error
+        process = outcome
 
         assert process.stdin is not None
         assert process.stdout is not None
@@ -487,11 +612,16 @@ class JsonCommandProvider:
         watched = (*work_tasks, wait_task)
         forced_status: JsonCommandStatus | None = None
         try:
-            done, pending = await asyncio.wait(
-                watched,
-                timeout=timeout,
-                return_when=asyncio.FIRST_EXCEPTION,
-            )
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining == 0:
+                done: set[asyncio.Task[Any]] = set()
+                pending = set(watched)
+            else:
+                done, pending = await asyncio.wait(
+                    watched,
+                    timeout=remaining,
+                    return_when=asyncio.FIRST_EXCEPTION,
+                )
             exceptions = [
                 task.exception()
                 for task in done
@@ -513,14 +643,15 @@ class JsonCommandProvider:
                 )
             else:
                 await asyncio.gather(*watched)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
             await _cleanup_resilient(
                 process,
                 work_tasks,
                 wait_task,
                 self._limits.terminate_grace_seconds,
+                primary=cancellation,
             )
-            raise
+            raise cancellation
 
         stdout = bytes(stdout_buffer)
         stderr = bytes(stderr_buffer)
