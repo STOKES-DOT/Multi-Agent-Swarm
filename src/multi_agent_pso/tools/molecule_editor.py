@@ -7,8 +7,6 @@ import math
 import re
 import sys
 import weakref
-import networkx as nx
-from rdkit import Chem
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -95,6 +93,46 @@ def _diagnostics(value: object, name: str) -> list[object]:
     return value
 
 
+def _connected_components(adjacency: Mapping[str, set[str]]) -> list[tuple[str, ...]]:
+    remaining = set(adjacency)
+    components: list[tuple[str, ...]] = []
+    while remaining:
+        pending = [min(remaining)]
+        component: set[str] = set()
+        while pending:
+            atom_id = pending.pop()
+            if atom_id in component:
+                continue
+            component.add(atom_id)
+            pending.extend(adjacency[atom_id] - component)
+        remaining -= component
+        components.append(tuple(sorted(component)))
+    return sorted(components)
+
+
+def _bridge_pairs(adjacency: Mapping[str, set[str]]) -> set[frozenset[str]]:
+    edges = {
+        frozenset((atom_id, neighbor))
+        for atom_id, neighbors in adjacency.items()
+        for neighbor in neighbors
+    }
+    bridges: set[frozenset[str]] = set()
+    for edge in edges:
+        begin, end = tuple(edge)
+        reached = {begin}
+        pending = [begin]
+        while pending:
+            atom_id = pending.pop()
+            for neighbor in adjacency[atom_id]:
+                if frozenset((atom_id, neighbor)) == edge or neighbor in reached:
+                    continue
+                reached.add(neighbor)
+                pending.append(neighbor)
+        if end not in reached:
+            bridges.add(edge)
+    return bridges
+
+
 def _validate_graph(value: object) -> dict[str, object]:
     required={"schema_version","atoms","bonds","total_charge","multiplicity","chemical_identity_hash","state_hash","parent_state_hash","next_atom_serial","next_bond_serial","geometry_status","committed_commands"}
     if not isinstance(value, dict) or set(value)!=required or value["schema_version"]!="molecule-editor:chemical-graph:v1": raise ValueError("ChemicalGraph schema is invalid")
@@ -144,8 +182,7 @@ def _validate_graph(value: object) -> dict[str, object]:
             if declared: raise ValueError("unspecified chirality has neighbor order")
         elif len(declared)!=len(set(declared)) or set(declared)!=actual:
             raise ValueError("tetrahedral neighbor order mismatches adjacency")
-    connectivity=nx.Graph(); connectivity.add_nodes_from(atom_ids); connectivity.add_edges_from((bond["begin_atom_id"],bond["end_atom_id"]) for bond in bonds)
-    if not atom_ids or not nx.is_connected(connectivity): raise ValueError("ChemicalGraph must be nonempty and connected")
+    if not atom_ids or len(_connected_components(adjacency)) != 1: raise ValueError("ChemicalGraph must be nonempty and connected")
     for bond in bonds:
         _validate_bond_stereo_refs(bond["bond_type"],bond["stereo"],bond["stereo_atom_ids"],bond["begin_atom_id"],bond["end_atom_id"],adjacency)
     return value
@@ -177,33 +214,29 @@ def _validate_views(data: dict[str, object], graph: dict[str, object]) -> None:
         if data.get("mode")=="inspect" and mapping != {value:value for value in targets}: raise ValueError("inspect mappings must be identity")
     topology=data.get("topology"); fields={"atom_count","bond_count","component_count","component_sizes","bridge_bond_ids","cycle_atom_ids","degree_by_atom_id","symmetry_class_by_atom_id"}
     if not isinstance(topology,dict) or set(topology)!=fields: raise ValueError("topology fields invalid")
-    network=nx.Graph(); network.add_nodes_from(atom_ids); edge_to_id={}
-    for bond in graph["bonds"]: network.add_edge(bond["begin_atom_id"],bond["end_atom_id"]); edge_to_id[frozenset((bond["begin_atom_id"],bond["end_atom_id"]))]=bond["bond_id"]
-    components=sorted((tuple(sorted(c)) for c in nx.connected_components(network)),key=lambda c:c)
-    bridges=sorted(edge_to_id[frozenset(edge)] for edge in nx.bridges(network)); cycles=sorted(_normalized_cycle(c) for c in nx.cycle_basis(network)); degrees={a:network.degree(a) for a in sorted(atom_ids)}
-    expected={"atom_count":len(atom_ids),"bond_count":len(bond_ids),"component_count":len(components),"component_sizes":[len(c) for c in components],"bridge_bond_ids":bridges,"cycle_atom_ids":cycles,"degree_by_atom_id":degrees}
+    adjacency={atom_id:set() for atom_id in atom_ids}; edge_to_id={}
+    for bond in graph["bonds"]:
+        begin,end=bond["begin_atom_id"],bond["end_atom_id"]
+        adjacency[begin].add(end); adjacency[end].add(begin)
+        edge_to_id[frozenset((begin,end))]=bond["bond_id"]
+    components=_connected_components(adjacency)
+    bridges=sorted(edge_to_id[edge] for edge in _bridge_pairs(adjacency)); degrees={a:len(adjacency[a]) for a in sorted(atom_ids)}
+    expected={"atom_count":len(atom_ids),"bond_count":len(bond_ids),"component_count":len(components),"component_sizes":[len(c) for c in components],"bridge_bond_ids":bridges,"degree_by_atom_id":degrees}
     if any(topology.get(k)!=v for k,v in expected.items()): raise ValueError("topology does not match graph")
+    cycles=topology["cycle_atom_ids"]
+    if not isinstance(cycles,list) or len(cycles)!=len(bond_ids)-len(atom_ids)+1: raise ValueError("cycle count does not match graph")
+    seen_cycles=set()
+    for cycle in cycles:
+        if not isinstance(cycle,list) or len(cycle)<3 or any(type(atom_id) is not str or atom_id not in atom_ids for atom_id in cycle) or len(set(cycle))!=len(cycle): raise ValueError("cycle is invalid")
+        if cycle != _normalized_cycle(cycle) or any(cycle[(index+1)%len(cycle)] not in adjacency[atom_id] for index,atom_id in enumerate(cycle)): raise ValueError("cycle is not canonical and closed")
+        identity=tuple(cycle)
+        if identity in seen_cycles: raise ValueError("cycles must be unique")
+        seen_cycles.add(identity)
+    if cycles != sorted(cycles): raise ValueError("cycles must be sorted")
     symmetry=topology["symmetry_class_by_atom_id"]
+    # Symmetry classes are derived and owned by the MoleculeEditor CLI.  The
+    # host adapter validates only their envelope and graph identity coverage.
     if not isinstance(symmetry,dict) or set(symmetry)!=atom_ids or any(type(v) is not int or v<0 for v in symmetry.values()): raise ValueError("symmetry classes invalid")
-    if symmetry != _rdkit_symmetry_classes(graph): raise ValueError("symmetry classes do not match graph")
-
-
-def _rdkit_symmetry_classes(graph: dict[str, object]) -> dict[str,int]:
-    try:
-        editable=Chem.RWMol(); indices={}; chiral={"CHI_UNSPECIFIED":Chem.ChiralType.CHI_UNSPECIFIED,"CHI_TETRAHEDRAL_CW":Chem.ChiralType.CHI_TETRAHEDRAL_CW,"CHI_TETRAHEDRAL_CCW":Chem.ChiralType.CHI_TETRAHEDRAL_CCW}
-        for record in graph["atoms"]:
-            atom=Chem.Atom(record["atomic_number"]); atom.SetIsotope(record["isotope"]); atom.SetFormalCharge(record["formal_charge"]); atom.SetNumRadicalElectrons(record["radical_electrons"]); atom.SetChiralTag(chiral[record["chiral_tag"]]); atom.SetNumExplicitHs(record["explicit_h_count"]); atom.SetNoImplicit(record["no_implicit"]); atom.SetIsAromatic(record["aromatic"])
-            if record["atom_map"] is not None: atom.SetAtomMapNum(record["atom_map"])
-            indices[record["atom_id"]]=editable.AddAtom(atom)
-        bond_types={"SINGLE":Chem.BondType.SINGLE,"DOUBLE":Chem.BondType.DOUBLE,"TRIPLE":Chem.BondType.TRIPLE,"AROMATIC":Chem.BondType.AROMATIC}; stereos={name:getattr(Chem.BondStereo,name) for name in ("STEREONONE","STEREOANY","STEREOZ","STEREOE","STEREOCIS","STEREOTRANS")}; directions={name:getattr(Chem.BondDir,name) for name in ("NONE","BEGINWEDGE","BEGINDASH","ENDDOWNRIGHT","ENDUPRIGHT","EITHERDOUBLE","UNKNOWN")}
-        for record in graph["bonds"]: editable.AddBond(indices[record["begin_atom_id"]],indices[record["end_atom_id"]],bond_types[record["bond_type"]])
-        for record in graph["bonds"]:
-            bond=editable.GetBondBetweenAtoms(indices[record["begin_atom_id"]],indices[record["end_atom_id"]]); bond.SetIsAromatic(record["aromatic"]); bond.SetIsConjugated(record["conjugated"]); bond.SetStereo(stereos[record["stereo"]]); bond.SetBondDir(directions[record["bond_direction"]])
-            if record["stereo_atom_ids"]: bond.SetStereoAtoms(*(indices[value] for value in record["stereo_atom_ids"]))
-        molecule=editable.GetMol(); Chem.SanitizeMol(molecule); ranks=Chem.CanonicalRankAtoms(molecule,breakTies=False,includeChirality=True,includeIsotopes=True,includeAtomMaps=False)
-        return {identity:int(ranks[index]) for identity,index in indices.items()}
-    except Exception as error:
-        raise ValueError("ChemicalGraph could not be rebuilt for symmetry") from error
 
 
 def _validate_unready_geometry(data: dict[str, object], status: str) -> None:
@@ -555,8 +588,8 @@ class MoleculeEditorProvider:
                 if anchor not in {a.get("atom_id") for a in validated_fragment.get("atoms", ()) if isinstance(a, Mapping)}: raise ValueError("fragment anchor is invalid")
                 if op=="attach_fragment": topology_known=False
             if op in {"detach_fragment","substitute_fragment"}:
-                begin,end=endpoints[item["bond_id"]]; network=nx.Graph(); network.add_nodes_from(adjacency); network.add_edges_from((atom,neighbor) for atom,neighbors in adjacency.items() for neighbor in neighbors)
-                if not network.has_edge(begin,end) or frozenset((begin,end)) not in {frozenset(edge) for edge in nx.bridges(network)}: raise ValueError("fragment removal requires a bridge bond")
+                begin,end=endpoints[item["bond_id"]]
+                if end not in adjacency.get(begin,set()) or frozenset((begin,end)) not in _bridge_pairs(adjacency): raise ValueError("fragment removal requires a bridge bond")
                 adjacency[begin].discard(end); adjacency[end].discard(begin); endpoints.pop(item["bond_id"]); bond_refs.discard(item["bond_id"])
                 retained=item["retained_atom_id"]; component=set(); pending=[retained]
                 while pending:

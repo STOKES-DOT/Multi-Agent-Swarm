@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
@@ -260,12 +262,55 @@ def test_diagnostics_and_failed_artifact_attacks_are_rejected(mutation) -> None:
     with pytest.raises(ValueError): MoleculeEditorResult.from_process(exit_code=0,payload=data)
 
 
-def test_symmetry_classes_match_rdkit_canonical_ranks() -> None:
-    asymmetric=_real_payload(); assert MoleculeEditorResult.from_process(exit_code=0,payload=asymmetric).candidate
-    tampered=deepcopy(asymmetric); tampered["topology"]["symmetry_class_by_atom_id"]={"a0001":99,"a0002":42}
-    with pytest.raises(ValueError): MoleculeEditorResult.from_process(exit_code=0,payload=tampered)
-    symmetric=_real_payload(); symmetric["graph"]["atoms"][1]["atomic_number"]=6; symmetric["atom_table"]=deepcopy(symmetric["graph"]["atoms"]); symmetric["canonical_isomeric_smiles"]="CC"; symmetric["topology"]["symmetry_class_by_atom_id"]={"a0001":0,"a0002":0}
-    assert MoleculeEditorResult.from_process(exit_code=0,payload=symmetric).candidate
+def test_symmetry_classes_are_cli_owned_but_structurally_validated() -> None:
+    cli_ranked=_real_payload()
+    cli_ranked["topology"]["symmetry_class_by_atom_id"]={"a0001":99,"a0002":42}
+    assert MoleculeEditorResult.from_process(exit_code=0,payload=cli_ranked).candidate
+
+    for symmetry in ({"a0001":0}, {"a0001":0,"a0002":-1}, {"a0001":0,"a0002":True}):
+        invalid=deepcopy(cli_ranked)
+        invalid["topology"]["symmetry_class_by_atom_id"]=symmetry
+        with pytest.raises(ValueError):
+            MoleculeEditorResult.from_process(exit_code=0,payload=invalid)
+
+
+def test_tools_import_without_host_chemistry_packages() -> None:
+    code = """
+import builtins
+original_import = builtins.__import__
+def blocked_import(name, *args, **kwargs):
+    if name.split('.', 1)[0] in {'networkx', 'rdkit'}:
+        raise ImportError(f'blocked host chemistry dependency: {name}')
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = blocked_import
+from multi_agent_pso.tools import JsonCommandProvider
+import multi_agent_pso.tools.molecule_editor
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize(
+    "cycles",
+    [
+        [["a0002","a0003","a0004","a0005","a0006","a0001"]],
+        [["a0001","a0002"]],
+        [["a0001","a0002","a9999"]],
+        [["a0001","a0003","a0002"]],
+        [],
+    ],
+)
+def test_cycle_view_requires_canonical_closed_graph_cycles(cycles) -> None:
+    payload=_benzene_payload()
+    payload["topology"]["cycle_atom_ids"]=cycles
+    with pytest.raises(ValueError):
+        MoleculeEditorResult.from_process(exit_code=0,payload=payload)
 
 
 def test_disconnected_graph_is_rejected_even_with_consistent_topology_view() -> None:
