@@ -25,6 +25,7 @@ from .inputs import RedAbsorptionRunInputs
 from .preflight import (
     PreflightRecord,
     current_preflight_versions,
+    red_absorption_evaluation_budget,
     verify_current_parent,
     verify_red_absorption_preflight,
 )
@@ -147,11 +148,13 @@ async def run_red_absorption_search(
     verified = verify_red_absorption_preflight(
         task, loaded, runs_dir, versions=current_preflight_versions()
     )
-    if verified != preflight or preflight.max_new_evaluations != 25:
+    expected_evaluations = red_absorption_evaluation_budget(task)
+    if (
+        verified != preflight
+        or preflight.max_new_evaluations != expected_evaluations
+    ):
         raise ValueError("preflight record does not authorize this search")
     spec = task.spec
-    if spec.pso.population_size != 5 or spec.pso.iterations != 5:
-        raise ValueError("red-absorption v1 requires exactly 5 particles x 5 iterations")
     inputs = loaded.value
     editor = await verify_current_parent(
         inputs,
@@ -245,14 +248,16 @@ async def run_red_absorption_search(
                 store=store,
                 episode_factory=lambda target: make_loop("p0", target),
                 particle_episode_factory=make_loop,
-                particle_ids=tuple(f"p{index}" for index in range(5)),
+                particle_ids=tuple(
+                    f"p{index}" for index in range(spec.pso.population_size)
+                ),
                 resource_budget={
                     "max_new_evaluations": preflight.max_new_evaluations,
                     "preflight_identity": preflight.identity,
                 },
                 failure_threshold=spec.retry.consecutive_failures_before_resample,
             )
-            await runner.run(iterations=5)
+            await runner.run(iterations=spec.pso.iterations)
         report = build_run_report_from_store(store, run_id)
         reference = publish_run_report(report, artifacts, "json")
         return {

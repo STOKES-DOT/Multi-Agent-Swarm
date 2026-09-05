@@ -14,6 +14,7 @@ from multi_agent_pso.configuration.models import SnapshotConfig
 
 
 TASK = Path("examples/red_absorption/task.yaml")
+TASK_LUNA_15 = Path("examples/red_absorption/task-luna-15.yaml")
 
 
 def test_task_yaml_has_five_by_five_readonly_production_contract() -> None:
@@ -35,6 +36,17 @@ def test_task_yaml_has_five_by_five_readonly_production_contract() -> None:
         "schemas/tool-request.schema.json",
         "schemas/reflection.schema.json",
     } <= sources
+
+
+def test_luna_task_yaml_has_five_by_fifteen_bounded_contract() -> None:
+    raw = yaml.safe_load(TASK_LUNA_15.read_text(encoding="utf-8"))
+
+    assert raw["agent"]["model"] == "gpt-5.6-luna"
+    assert raw["pso"]["population_size"] == 5
+    assert raw["pso"]["iterations"] == 15
+    assert raw["pso"]["population_size"] * raw["pso"]["iterations"] == 75
+    assert raw["concurrency"] == {"agents": 5, "evaluations": 1}
+    assert raw["wiki"]["read_only"] is True
 
 
 def test_task_package_loads_real_maintained_wiki_without_raw_snapshot() -> None:

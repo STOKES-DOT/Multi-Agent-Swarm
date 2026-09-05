@@ -270,12 +270,12 @@ def fake_loaded_inputs(tmp_path):
     return LoadedRunInputs(tmp_path / "inputs.yaml", value, "a" * 64, "b" * 64, 10)
 
 
-def fake_task():
+def fake_task(*, iterations: int = 5, model: str = "gpt-5.6-terra"):
     return SimpleNamespace(
         snapshot_hash="c" * 64,
         spec=SimpleNamespace(
-            pso=SimpleNamespace(population_size=5, iterations=5),
-            agent=SimpleNamespace(model="gpt-5.6-terra"),
+            pso=SimpleNamespace(population_size=5, iterations=iterations),
+            agent=SimpleNamespace(model=model),
         ),
     )
 
@@ -334,6 +334,55 @@ async def test_preflight_writes_artifact_and_empty_validated_run_store(tmp_path)
         verify_red_absorption_preflight(
             fake_task(), loaded, tmp_path / "runs", versions=record.versions
         )
+
+
+@pytest.mark.asyncio
+async def test_preflight_authorizes_five_by_fifteen_luna_search(tmp_path):
+    loaded = fake_loaded_inputs(tmp_path)
+    task = fake_task(iterations=15, model="gpt-5.6-luna")
+    spectrum = FakeSpectrum()
+
+    record = await preflight_red_absorption(
+        tmp_path / "task.yaml",
+        tmp_path / "inputs.yaml",
+        tmp_path / "runs",
+        dependencies=PreflightDependencies(
+            task_loader=lambda path: task,
+            input_loader=lambda path: loaded,
+            auth_probe=lambda: {"authenticated": True, "method": "chatgpt"},
+            molecule_editor=FakeEditor([], parent_graph()),
+            spectrum=spectrum,
+            sdk_version="0.147.0",
+        ),
+    )
+
+    assert record.max_new_evaluations == 75
+    assert spectrum.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_preflight_rejects_more_than_seventy_five_evaluations(tmp_path):
+    loaded = fake_loaded_inputs(tmp_path)
+    spectrum = FakeSpectrum()
+    auth_calls = []
+
+    with pytest.raises(ValueError, match="75"):
+        await preflight_red_absorption(
+            tmp_path / "task.yaml",
+            tmp_path / "inputs.yaml",
+            tmp_path / "runs",
+            dependencies=PreflightDependencies(
+                task_loader=lambda path: fake_task(iterations=16),
+                input_loader=lambda path: loaded,
+                auth_probe=lambda: auth_calls.append(True),
+                molecule_editor=FakeEditor([], parent_graph()),
+                spectrum=spectrum,
+                sdk_version="0.147.0",
+            ),
+        )
+
+    assert auth_calls == []
+    assert spectrum.calls == 0
 
 
 @pytest.mark.asyncio
@@ -446,12 +495,13 @@ async def test_failed_spectrum_never_publishes_an_authorizing_preflight(tmp_path
 async def test_search_rechecks_current_parent_before_any_run_mutation(tmp_path):
     loaded = fake_loaded_inputs(tmp_path)
     runs = tmp_path / "runs"
+    task = fake_task(iterations=15, model="gpt-5.6-luna")
     record = await preflight_red_absorption(
         tmp_path / "task.yaml",
         tmp_path / "inputs.yaml",
         runs,
         dependencies=PreflightDependencies(
-            task_loader=lambda path: fake_task(),
+            task_loader=lambda path: task,
             input_loader=lambda path: loaded,
             auth_probe=lambda: {"authenticated": True, "method": "chatgpt"},
             molecule_editor=FakeEditor([], parent_graph()),
@@ -465,7 +515,7 @@ async def test_search_rechecks_current_parent_before_any_run_mutation(tmp_path):
     editor = ClosingEditor(changed_graph)
     with pytest.raises(ValueError, match="parent"):
         await run_red_absorption_search(
-            fake_task(), loaded, record, runs_dir=runs, molecule_editor=editor
+            task, loaded, record, runs_dir=runs, molecule_editor=editor
         )
     assert editor.calls == 1 and editor.close_calls == 1
     assert (runs / "runs.sqlite").read_bytes() == before_database

@@ -58,6 +58,7 @@ _AUTH_TERMINATE_GRACE_SECONDS = 0.25
 _AUTH_POLL_SECONDS = 0.01
 _AUTH_WORKERS: set[threading.Thread] = set()
 _AUTH_WORKERS_LOCK = threading.Lock()
+MAX_RED_ABSORPTION_EVALUATIONS = 75
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,7 +320,9 @@ class PreflightRecord(BaseModel):
     preflight_spectrum_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     preflight_evaluation_geometry_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     spectrum_evaluation_status: str
-    max_new_evaluations: int = Field(ge=1)
+    max_new_evaluations: int = Field(
+        ge=1, le=MAX_RED_ABSORPTION_EVALUATIONS
+    )
     passed: bool
 
     @field_validator("versions", mode="before")
@@ -745,6 +748,27 @@ def current_preflight_versions() -> Mapping[str, str]:
     return MappingProxyType(_versions(PreflightDependencies()))
 
 
+def red_absorption_evaluation_budget(task: object) -> int:
+    try:
+        population_size = task.spec.pso.population_size
+        iterations = task.spec.pso.iterations
+    except AttributeError as error:
+        raise ValueError("red-absorption search dimensions are missing") from error
+    if (
+        type(population_size) is not int
+        or type(iterations) is not int
+        or population_size <= 0
+        or iterations <= 0
+    ):
+        raise ValueError("red-absorption search dimensions must be positive integers")
+    maximum = population_size * iterations
+    if maximum > MAX_RED_ABSORPTION_EVALUATIONS:
+        raise ValueError(
+            "red-absorption search exceeds the 75 evaluation safety limit"
+        )
+    return maximum
+
+
 def _identity(task: object, loaded: LoadedRunInputs, versions: Mapping[str, str]) -> str:
     return _base_contract_identity(
         task.snapshot_hash,
@@ -768,9 +792,7 @@ async def preflight_red_absorption(
     task = dependencies.task_loader(task_path)
     loaded = dependencies.input_loader(inputs_path)
     inputs = loaded.value
-    maximum = task.spec.pso.population_size * task.spec.pso.iterations
-    if maximum != 25:
-        raise ValueError("red-absorption v1 preflight requires a 5 x 5 search")
+    maximum = red_absorption_evaluation_budget(task)
     if inputs.parent.protected_smarts:
         raise ValueError(
             "protected_smarts require CLI-authoritative AtomId enumeration before preflight"
@@ -1058,8 +1080,7 @@ def verify_red_absorption_preflight(
         "geometry_workflow": protocol.geometry_workflow,
         "spectrum_timeout_seconds": loaded.value.spectrum_timeout_seconds,
         "evaluation_concurrency": loaded.value.evaluation_concurrency,
-        "max_new_evaluations": task.spec.pso.population_size
-        * task.spec.pso.iterations,
+        "max_new_evaluations": red_absorption_evaluation_budget(task),
     }
     if (
         not record.passed
@@ -1090,6 +1111,7 @@ __all__ = [
     "PreflightDependencies",
     "PreflightRecord",
     "current_preflight_versions",
+    "red_absorption_evaluation_budget",
     "load_verified_red_absorption_preflight",
     "preflight_red_absorption",
     "verify_red_absorption_preflight",

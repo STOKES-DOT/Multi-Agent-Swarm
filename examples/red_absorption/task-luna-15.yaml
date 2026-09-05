@@ -1,0 +1,47 @@
+task:
+  name: red-absorption
+  version: v1
+  prompt: prompts/hypothesize.md
+  schemas: [schemas/hypothesis.schema.json, schemas/tool-request.schema.json, schemas/reflection.schema.json]
+agent:
+  model: gpt-5.6-luna
+  skills: [/Users/jiaoyuan/Documents/ChatGPT/MolToGraph/.agents/skills/molecule-editor]
+  stage_timeout_seconds: 600.0
+wiki:
+  path: /Users/jiaoyuan/Library/Mobile Documents/com~apple~CloudDocs/Documents/GitHub/ChemAgent/.worktrees/codex-opencode-runtime-base/.openchem/wiki
+  read_only: true
+  max_results: 10
+  snapshot_mode: maintained_markdown
+pso:
+  population_size: 5
+  iterations: 15
+  run_seed: 20260902
+  topology: {type: ring, neighborhood_radius: 1}
+concurrency: {agents: 5, evaluations: 1}
+retry: {agent_schema_corrections: 2, transient_resource_retries: 1, consecutive_failures_before_resample: 2}
+thread: {max_turns: 4, max_context_tokens: 8192}
+snapshot: {max_files: 10000, max_file_bytes: 67108864, max_total_bytes: 536870912}
+storage: {runs_directory: runs}
+plugins:
+  position_space: examples.red_absorption.adapter:create_position_space
+  task_adapter: examples.red_absorption.adapter:create_task_adapter
+  evaluator: examples.red_absorption.adapter:create_evaluator
+  tool_provider: examples.red_absorption.adapter:create_tool_provider
+  source_files:
+    - __init__.py
+    - inputs.py
+    - stage_context.py
+    - workflow.py
+    - preflight.py
+    - search.py
+    - models.py
+    - geometry.py
+    - evaluator.py
+    - backends/__init__.py
+    - backends/pyscf_spectrum.py
+    - prompts/hypothesize.md
+    - prompts/propose_action.md
+    - prompts/reflect.md
+    - schemas/hypothesis.schema.json
+    - schemas/tool-request.schema.json
+    - schemas/reflection.schema.json
