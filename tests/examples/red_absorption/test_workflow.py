@@ -74,6 +74,17 @@ class DelayedSpectrum(JsonCommandProvider):
         self.close_calls += 1
 
 
+class FailedSpectrum(DelayedSpectrum):
+    async def execute_json(self, payload, **kwargs):
+        self.calls += 1
+        return SimpleNamespace(
+            status=JsonCommandStatus.PROCESS_ERROR,
+            stdout_text=None,
+            exit_code=1,
+            elapsed_seconds=0.01,
+        )
+
+
 class ControlledCloseSpectrum(DelayedSpectrum):
     def __init__(self, fail_first: bool = False):
         super().__init__()
@@ -322,6 +333,35 @@ async def test_same_persistent_key_waits_for_completed_cache_across_instances(tm
     results = await asyncio.gather(*(tool.execute(*pair) for tool in tools))
     assert [result.status.value for result in results] == ["SUCCESS", "SUCCESS"]
     assert sum(spectrum.calls for spectrum in spectra) == 1
+    assert ledger.count("run-1") == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_spectrum_failure_is_persisted_not_left_pending(tmp_path):
+    inputs = inputs_with_concurrency(tmp_path, 2)
+    ledger = DurableBudgetLedger(tmp_path / "budget.jsonl")
+    spectra = [FailedSpectrum(), FailedSpectrum()]
+    pair = authorized_request_context(
+        [{"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}],
+        tmp_path.resolve(),
+    )
+    statuses = []
+    for spectrum in spectra:
+        resources = RedAbsorptionWorkflowResources.from_inputs(
+            inputs,
+            max_new_evaluations=25,
+            ledger=ledger,
+            run_id="run-1",
+        )
+        tool = RedAbsorptionWorkflowToolProvider.bind(
+            inputs,
+            VariableEditor([], parent_graph()),
+            resources,
+            spectrum=spectrum,
+        )
+        statuses.append((await tool.execute(*pair)).status.value)
+    assert statuses == ["FAILED", "FAILED"]
+    assert [spectrum.calls for spectrum in spectra] == [1, 0]
     assert ledger.count("run-1") == 1
 
 

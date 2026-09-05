@@ -5,17 +5,20 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import importlib.metadata
 import inspect
 import json
 import os
 from pathlib import Path
+from queue import Empty, Queue
 import re
 from secrets import token_hex
 import sqlite3
 import stat
 import sys
+import threading
 from types import MappingProxyType
 from typing import Any
 
@@ -31,9 +34,11 @@ from pydantic import (
 from multi_agent_pso import __version__
 from multi_agent_pso.configuration import LoadedRunInputs, load_run_inputs, load_task_package
 from multi_agent_pso.core import ArtifactRef
-from multi_agent_pso.storage import FileArtifactStore
+from multi_agent_pso.storage import FileArtifactStore, SQLiteRunStore
 from multi_agent_pso.resources import DurableBudgetLedger
+from multi_agent_pso.runtimes import LocalCodexRuntime
 from multi_agent_pso.tools import JsonCommandProvider, MoleculeEditorProvider
+from multi_agent_pso.tools import MOLECULE_EDITOR_SCRIPT
 
 from .evaluator import RedAbsorptionEvaluator
 from .inputs import RedAbsorptionRunInputs
@@ -44,9 +49,10 @@ _HASH = re.compile(r"^[0-9a-f]{64}$")
 _MAX_PREFLIGHT_BYTES = 256 * 1024
 _MAX_PREFLIGHT_TOTAL_BYTES = 4 * 1024 * 1024
 _AUTH_TIMEOUT_SECONDS = 10.0
-_AUTH_SPAWN_HANDOFF_SECONDS = 0.25
 _AUTH_TERMINATE_GRACE_SECONDS = 0.25
-_AUTH_GUARDIANS: set[asyncio.Task[None]] = set()
+_AUTH_POLL_SECONDS = 0.01
+_AUTH_WORKERS: set[threading.Thread] = set()
+_AUTH_WORKERS_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,43 +99,38 @@ def _validate_storage_target(runs_dir: Path) -> None:
                             raise ValueError(f"{name}{suffix} target is unsafe")
         run_database = runs_dir / "runs.sqlite"
         if run_database.exists():
+            descriptor = os.open(
+                run_database,
+                os.O_RDWR
+                | os.O_NOFOLLOW
+                | os.O_NONBLOCK
+                | getattr(os, "O_CLOEXEC", 0),
+            )
             try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ValueError("runs.sqlite must be a regular file")
                 connection = sqlite3.connect(
-                    f"{run_database.absolute().as_uri()}?mode=ro", uri=True, timeout=5
+                    f"file:/dev/fd/{descriptor}?mode=ro&immutable=1",
+                    uri=True,
+                    timeout=5,
                 )
                 try:
-                    integrity = connection.execute("PRAGMA quick_check").fetchone()
-                    tables = {
-                        row[0]
-                        for row in connection.execute(
-                            "SELECT name FROM sqlite_master WHERE type = 'table'"
-                        )
-                    }
-                    if integrity is None or integrity[0] != "ok" or not {
-                        "schema_metadata",
-                        "runs",
-                    } <= tables:
-                        raise ValueError("runs.sqlite schema or integrity is invalid")
-                    version = connection.execute(
-                        "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
-                    ).fetchone()
-                    if version != (1,):
-                        raise ValueError("runs.sqlite schema version is invalid")
+                    SQLiteRunStore.validate_read_only_connection(connection)
                 finally:
                     connection.close()
-            except sqlite3.Error as error:
+                namespace = os.stat(run_database, follow_symlinks=False)
+                if (namespace.st_dev, namespace.st_ino) != (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ):
+                    raise ValueError("runs.sqlite namespace changed during validation")
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except (sqlite3.Error, RuntimeError, BlockingIOError) as error:
                 raise ValueError("runs.sqlite is not a usable SQLite run store") from error
-            try:
-                connection = sqlite3.connect(
-                    f"{run_database.absolute().as_uri()}?mode=rw", uri=True, timeout=5
-                )
-                try:
-                    connection.execute("BEGIN IMMEDIATE")
-                    connection.rollback()
-                finally:
-                    connection.close()
-            except sqlite3.Error as error:
-                raise ValueError("runs.sqlite does not support required locking") from error
+            finally:
+                os.close(descriptor)
         budget_ledger = runs_dir / "evaluation_budget.jsonl"
         if budget_ledger.exists():
             ledger = DurableBudgetLedger(budget_ledger)
@@ -145,6 +146,8 @@ def _validate_storage_target(runs_dir: Path) -> None:
         | os.O_NOFOLLOW
         | getattr(os, "O_CLOEXEC", 0),
     )
+    descriptor = None
+    identity = None
     try:
         descriptor = os.open(
             probe_name,
@@ -156,31 +159,37 @@ def _validate_storage_target(runs_dir: Path) -> None:
             0o600,
             dir_fd=parent_fd,
         )
-        os.close(descriptor)
-    finally:
-        os.close(parent_fd)
-    probe = probe_parent / probe_name
-    try:
-        connection = sqlite3.connect(probe, timeout=5)
+        metadata = os.fstat(descriptor)
+        identity = (metadata.st_dev, metadata.st_ino)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.write(descriptor, b"\0")
+        os.fsync(descriptor)
+        os.ftruncate(descriptor, 0)
+        os.fsync(descriptor)
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        connection = sqlite3.connect(":memory:")
         try:
-            connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("BEGIN IMMEDIATE")
             connection.execute("CREATE TABLE probe(value INTEGER)")
             connection.rollback()
         finally:
             connection.close()
-    except sqlite3.Error as error:
-        raise ValueError("run storage does not support SQLite locking") from error
+    except (sqlite3.Error, BlockingIOError) as error:
+        raise ValueError("run storage does not support required locking") from error
     finally:
-        for candidate in (
-            probe,
-            probe.with_name(f"{probe.name}-wal"),
-            probe.with_name(f"{probe.name}-shm"),
-        ):
+        if descriptor is not None:
+            os.close(descriptor)
+        if identity is not None:
             try:
-                candidate.unlink()
+                namespace = os.stat(
+                    probe_name, dir_fd=parent_fd, follow_symlinks=False
+                )
             except FileNotFoundError:
-                pass
+                namespace = None
+            if namespace is not None and (namespace.st_dev, namespace.st_ino) == identity:
+                os.unlink(probe_name, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+        os.close(parent_fd)
 
 
 def _base_contract_identity(
@@ -515,78 +524,29 @@ async def _shutdown_auth_process(process, tasks=(), wait_task=None) -> None:
         raise primary
 
 
-async def _guard_late_auth_spawn(spawn_task) -> None:
-    try:
-        outcome = await asyncio.shield(spawn_task)
-        if not isinstance(outcome, _AuthSpawnFailure):
-            await _shutdown_auth_process(outcome)
-    except BaseException:
-        pass
-
-
-def _register_auth_guardian(spawn_task) -> None:
-    guardian = asyncio.create_task(_guard_late_auth_spawn(spawn_task))
-    _AUTH_GUARDIANS.add(guardian)
-
-    def done(task):
-        _AUTH_GUARDIANS.discard(task)
-        try:
-            task.exception()
-        except BaseException:
-            pass
-
-    guardian.add_done_callback(done)
-
-
-async def _handoff_auth_spawn(spawn_task, primary: BaseException) -> None:
-    try:
-        done, _ = await asyncio.wait(
-            (spawn_task,), timeout=_AUTH_SPAWN_HANDOFF_SECONDS
-        )
-    except BaseException as error:
-        primary.add_note(f"auth spawn handoff failed: {type(error).__name__}: {error}")
-        done = set()
-    if not done:
-        _register_auth_guardian(spawn_task)
-        return
-    outcome = spawn_task.result()
-    if not isinstance(outcome, _AuthSpawnFailure):
-        try:
-            await _shutdown_auth_process(outcome)
-        except BaseException as error:
-            primary.add_note(f"auth spawn cleanup failed: {type(error).__name__}: {error}")
-
-
-async def _default_auth_probe() -> Mapping[str, object]:
+async def _owned_auth_probe(cancelled: threading.Event) -> Mapping[str, object]:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _AUTH_TIMEOUT_SECONDS
-    spawn_task = asyncio.create_task(_capture_auth_spawn())
-    try:
-        done, _ = await asyncio.wait(
-            (spawn_task,), timeout=max(0.0, deadline - loop.time())
-        )
-    except BaseException as primary:
-        await _handoff_auth_spawn(spawn_task, primary)
-        raise
-    if not done:
-        primary = TimeoutError("Codex authentication process spawn timed out")
-        await _handoff_auth_spawn(spawn_task, primary)
-        raise primary
-    outcome = spawn_task.result()
+    outcome = await _capture_auth_spawn()
     if isinstance(outcome, _AuthSpawnFailure):
         raise outcome.error
     process = outcome
+    if cancelled.is_set() or loop.time() >= deadline:
+        await _shutdown_auth_process(process)
+        raise TimeoutError("Codex authentication process spawn timed out")
     stdout_task = asyncio.create_task(_read_auth_bounded(process.stdout))
     stderr_task = asyncio.create_task(_read_auth_bounded(process.stderr))
     wait_task = asyncio.create_task(process.wait())
     tasks = (stdout_task, stderr_task, wait_task)
     group = asyncio.gather(*tasks)
     try:
-        done, _ = await asyncio.wait(
-            (group,), timeout=max(0.0, deadline - loop.time())
-        )
-        if not done:
-            raise TimeoutError("Codex authentication status timed out")
+        while not group.done():
+            remaining = deadline - loop.time()
+            if cancelled.is_set() or remaining <= 0:
+                raise TimeoutError("Codex authentication status timed out")
+            await asyncio.wait(
+                (group,), timeout=min(_AUTH_POLL_SECONDS, remaining)
+            )
         stdout, stderr, returncode = group.result()
     except BaseException as primary:
         cleanup = asyncio.create_task(
@@ -612,6 +572,54 @@ async def _default_auth_probe() -> Mapping[str, object]:
         raise RuntimeError("Codex authentication output exceeded 64 KiB total")
     method = _parse_auth_status(text)
     return {"authenticated": True, "method": method}
+
+
+def _run_owned_auth_probe(
+    cancelled: threading.Event,
+    results: Queue[tuple[bool, object]],
+) -> None:
+    try:
+        results.put((True, asyncio.run(_owned_auth_probe(cancelled))))
+    except BaseException as error:
+        results.put((False, error))
+    finally:
+        current = threading.current_thread()
+        with _AUTH_WORKERS_LOCK:
+            _AUTH_WORKERS.discard(current)
+
+
+async def _default_auth_probe() -> Mapping[str, object]:
+    cancelled = threading.Event()
+    results: Queue[tuple[bool, object]] = Queue(maxsize=1)
+    worker = threading.Thread(
+        target=_run_owned_auth_probe,
+        args=(cancelled, results),
+        name="codex-auth-probe",
+        daemon=True,
+    )
+    with _AUTH_WORKERS_LOCK:
+        _AUTH_WORKERS.add(worker)
+    worker.start()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _AUTH_TIMEOUT_SECONDS
+    try:
+        while True:
+            try:
+                succeeded, value = results.get_nowait()
+            except Empty:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise TimeoutError("Codex authentication probe timed out")
+                await asyncio.sleep(min(_AUTH_POLL_SECONDS, remaining))
+                continue
+            if not succeeded:
+                assert isinstance(value, BaseException)
+                raise value
+            assert isinstance(value, Mapping)
+            return value
+    except BaseException:
+        cancelled.set()
+        raise
 
 
 def _parse_auth_status(text: str) -> str:
@@ -642,12 +650,50 @@ def _versions(dependencies: PreflightDependencies) -> dict[str, str]:
             sdk = importlib.metadata.version("openai-codex")
         except importlib.metadata.PackageNotFoundError as error:
             raise RuntimeError("preflight requires the openai-codex extra") from error
+    guarded_sources = tuple(
+        Path(source)
+        for source in (
+            __file__,
+            inspect.getsourcefile(DurableBudgetLedger),
+            inspect.getsourcefile(SQLiteRunStore),
+            inspect.getsourcefile(LocalCodexRuntime),
+            inspect.getsourcefile(JsonCommandProvider),
+            inspect.getsourcefile(MoleculeEditorProvider),
+        )
+        if source is not None
+    )
+    skill_root = MOLECULE_EDITOR_SCRIPT.parent
+    skill_sources = (MOLECULE_EDITOR_SCRIPT,) + tuple(
+        sorted((skill_root / "molgraph").glob("*.py"))
+    )
     return {
         "framework": __version__,
         "openai_codex_sdk": sdk,
         "local_codex_runtime": dependencies.runtime_version,
         "molecule_editor": dependencies.molecule_editor_version,
+        "live_guard_source_sha256": _source_identity(guarded_sources),
+        "molecule_editor_skill_sha256": _source_identity(skill_sources),
     }
+
+
+def _source_identity(paths: tuple[Path, ...]) -> str:
+    if not paths or len(paths) > 256:
+        raise RuntimeError("source identity file count is invalid")
+    digest = hashlib.sha256()
+    total = 0
+    for index, path in enumerate(paths):
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError("source identity requires regular files")
+        name = f"{index}:{path.name}".encode("utf-8")
+        digest.update(len(name).to_bytes(4, "big"))
+        digest.update(name)
+        with path.open("rb") as stream:
+            while chunk := stream.read(64 * 1024):
+                total += len(chunk)
+                if total > 64 * 1024 * 1024:
+                    raise RuntimeError("source identity exceeds 64 MiB")
+                digest.update(chunk)
+    return digest.hexdigest()
 
 
 def current_preflight_versions() -> Mapping[str, str]:

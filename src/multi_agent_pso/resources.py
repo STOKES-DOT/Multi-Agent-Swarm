@@ -59,6 +59,7 @@ class BudgetClaimStatus(StrEnum):
     RESERVED = "RESERVED"
     PENDING = "PENDING"
     COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
     EXHAUSTED = "EXHAUSTED"
 
 
@@ -280,7 +281,9 @@ class DurableBudgetLedger:
         if data and not data.endswith(b"\n"):
             raise ValueError("budget ledger has an incomplete final event")
         limits: dict[str, int] = {}
-        entries: dict[tuple[str, str], dict[str, object] | None] = {}
+        entries: dict[
+            tuple[str, str], tuple[BudgetClaimStatus, dict[str, object] | None]
+        ] = {}
         for raw_line in data.splitlines():
             if not raw_line or len(raw_line) > _LEDGER_EVENT_MAX_BYTES:
                 raise ValueError("budget ledger event is empty or too large")
@@ -310,7 +313,7 @@ class DurableBudgetLedger:
                 key = (run, item)
                 if event["version"] != 1 or run not in limits or key in entries:
                     raise ValueError("budget ledger reserve event is invalid")
-                entries[key] = None
+                entries[key] = (BudgetClaimStatus.PENDING, None)
             elif operation == "commit" and set(event) == {
                 "version",
                 "operation",
@@ -325,11 +328,33 @@ class DurableBudgetLedger:
                 if (
                     event["version"] != 1
                     or key not in entries
-                    or entries[key] is not None
+                    or entries[key][0] is not BudgetClaimStatus.PENDING
                     or not isinstance(payload, dict)
                 ):
                     raise ValueError("budget ledger commit event is invalid")
-                entries[key] = payload
+                entries[key] = (BudgetClaimStatus.COMPLETED, payload)
+            elif operation == "fail" and set(event) == {
+                "version",
+                "operation",
+                "run_id",
+                "item_key",
+                "failure",
+            }:
+                run = _ledger_identifier(event["run_id"], "run_id")
+                item = _ledger_identifier(event["item_key"], "item_key")
+                key = (run, item)
+                failure = _bounded_json_copy(event["failure"])
+                if (
+                    event["version"] != 1
+                    or key not in entries
+                    or entries[key][0] is not BudgetClaimStatus.PENDING
+                    or not isinstance(failure, dict)
+                    or set(failure) != {"status", "message"}
+                    or failure.get("status") not in {"FAILED", "TIMEOUT"}
+                    or not isinstance(failure.get("message"), str)
+                ):
+                    raise ValueError("budget ledger failure event is invalid")
+                entries[key] = (BudgetClaimStatus.FAILED, failure)
             else:
                 raise ValueError("budget ledger event schema is invalid")
         return limits, entries
@@ -377,11 +402,7 @@ class DurableBudgetLedger:
                 raise ValueError("budget limit is immutable for a run")
             key = (run, item)
             if key in entries:
-                return (
-                    BudgetClaimStatus.PENDING
-                    if entries[key] is None
-                    else BudgetClaimStatus.COMPLETED
-                )
+                return entries[key][0]
             count = sum(1 for entry_run, _ in entries if entry_run == run)
             if count >= limit:
                 return BudgetClaimStatus.EXHAUSTED
@@ -414,7 +435,8 @@ class DurableBudgetLedger:
             key = (run, item)
             if key not in entries:
                 raise ValueError("budget item was not reserved")
-            if entries[key] is None:
+            state, existing = entries[key]
+            if state is BudgetClaimStatus.PENDING:
                 self._append_event(
                     {
                         "version": 1,
@@ -424,15 +446,60 @@ class DurableBudgetLedger:
                         "payload": copied,
                     }
                 )
-            elif entries[key] != copied:
+            elif state is not BudgetClaimStatus.COMPLETED or existing != copied:
                 raise ValueError("budget item is already committed with different payload")
+
+    def fail(
+        self,
+        run_id: str,
+        item_key: str,
+        status: str,
+        message: str,
+    ) -> None:
+        run = _ledger_identifier(run_id, "run_id")
+        item = _ledger_identifier(item_key, "item_key")
+        if status not in {"FAILED", "TIMEOUT"}:
+            raise ValueError("failure status must be FAILED or TIMEOUT")
+        failure_message = _ledger_identifier(message, "failure message")
+        failure = {"status": status, "message": failure_message}
+        with self._locked():
+            _, entries = self._load_state()
+            key = (run, item)
+            if key not in entries:
+                raise ValueError("budget item was not reserved")
+            state, existing = entries[key]
+            if state is BudgetClaimStatus.PENDING:
+                self._append_event(
+                    {
+                        "version": 1,
+                        "operation": "fail",
+                        "run_id": run,
+                        "item_key": item,
+                        "failure": failure,
+                    }
+                )
+            elif state is not BudgetClaimStatus.FAILED or existing != failure:
+                raise ValueError("budget item already has a different terminal result")
 
     def get(self, run_id: str, item_key: str) -> object | None:
         run = _ledger_identifier(run_id, "run_id")
         item = _ledger_identifier(item_key, "item_key")
         with self._locked():
             _, entries = self._load_state()
-            return entries.get((run, item))
+            entry = entries.get((run, item))
+            if entry is None or entry[0] is not BudgetClaimStatus.COMPLETED:
+                return None
+            return entry[1]
+
+    def get_failure(self, run_id: str, item_key: str) -> object | None:
+        run = _ledger_identifier(run_id, "run_id")
+        item = _ledger_identifier(item_key, "item_key")
+        with self._locked():
+            _, entries = self._load_state()
+            entry = entries.get((run, item))
+            if entry is None or entry[0] is not BudgetClaimStatus.FAILED:
+                return None
+            return entry[1]
 
     def count(self, run_id: str) -> int:
         run = _ledger_identifier(run_id, "run_id")

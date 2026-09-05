@@ -145,17 +145,46 @@ class RedAbsorptionWorkflowResources:
         payload = self._ledger.get(self._run_id, self._ledger_key(key))
         return None if payload is None else SpectrumResult.model_validate(payload)
 
-    def _commit_result(self, key: CacheKey, result: SpectrumResult) -> None:
+    async def _recover_async(self, key: CacheKey) -> SpectrumResult | None:
+        return await asyncio.to_thread(self._recover, key)
+
+    async def _commit_result(self, key: CacheKey, result: SpectrumResult) -> None:
         if self._ledger is not None:
-            self._ledger.commit(
-                self._run_id, self._ledger_key(key), result.model_dump(mode="json")
+            await asyncio.to_thread(
+                self._ledger.commit,
+                self._run_id,
+                self._ledger_key(key),
+                result.model_dump(mode="json"),
             )
+
+    async def _commit_failure(
+        self, key: CacheKey, status: str, message: str
+    ) -> None:
+        if self._ledger is not None:
+            await asyncio.to_thread(
+                self._ledger.fail,
+                self._run_id,
+                self._ledger_key(key),
+                status,
+                message,
+            )
+
+    async def _failure(self, key: CacheKey) -> Mapping[str, object] | None:
+        if self._ledger is None:
+            return None
+        failure = await asyncio.to_thread(
+            self._ledger.get_failure, self._run_id, self._ledger_key(key)
+        )
+        return failure if isinstance(failure, Mapping) else None
 
     async def _claim_execution(self, key: CacheKey) -> BudgetClaimStatus:
         async with self._budget_lock:
             if self._ledger is not None:
-                return self._ledger.claim(
-                    self._run_id, self._ledger_key(key), self._max_new_evaluations
+                return await asyncio.to_thread(
+                    self._ledger.claim,
+                    self._run_id,
+                    self._ledger_key(key),
+                    self._max_new_evaluations,
                 )
             if self._execution_count >= self._max_new_evaluations:
                 return BudgetClaimStatus.EXHAUSTED
@@ -168,7 +197,7 @@ class RedAbsorptionWorkflowResources:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._timeout_seconds
         while True:
-            recovered = self._recover(key)
+            recovered = await self._recover_async(key)
             if recovered is not None:
                 return recovered
             remaining = deadline - loop.time()
@@ -513,18 +542,22 @@ class RedAbsorptionWorkflowToolProvider:
         )
         lock = await resources._lock_for(key)
         async with lock:
-            spectrum_result = resources._cache.get(key) or resources._recover(key)
+            spectrum_result = resources._cache.get(key)
+            if spectrum_result is None:
+                spectrum_result = await resources._recover_async(key)
             spectrum_process = None
             if spectrum_result is None:
                 async with resources._spectrum_slots:
-                    spectrum_result = resources._cache.get(key) or resources._recover(key)
+                    spectrum_result = resources._cache.get(key)
+                    if spectrum_result is None:
+                        spectrum_result = await resources._recover_async(key)
                     if spectrum_result is not None:
                         resources._cache_hit_count += 1
                         cache_hit = True
                     else:
                         claim = await resources._claim_execution(key)
                         if claim is BudgetClaimStatus.COMPLETED:
-                            spectrum_result = resources._recover(key)
+                            spectrum_result = await resources._recover_async(key)
                             if spectrum_result is None:
                                 return ToolResult(
                                     ToolStatus.FAILED,
@@ -533,6 +566,24 @@ class RedAbsorptionWorkflowToolProvider:
                                 )
                             resources._cache_hit_count += 1
                             cache_hit = True
+                        elif claim is BudgetClaimStatus.FAILED:
+                            failure = await resources._failure(key)
+                            status = (
+                                ToolStatus.TIMEOUT
+                                if isinstance(failure, Mapping)
+                                and failure.get("status") == "TIMEOUT"
+                                else ToolStatus.FAILED
+                            )
+                            message = (
+                                failure.get("message")
+                                if isinstance(failure, Mapping)
+                                else "previous evaluation failed"
+                            )
+                            return ToolResult(
+                                status,
+                                {"cache_key": list(key), "cache_hit": False},
+                                error=str(message),
+                            )
                         elif claim is BudgetClaimStatus.PENDING:
                             spectrum_result = await resources._wait_for_recovery(key)
                             if spectrum_result is None:
@@ -550,19 +601,40 @@ class RedAbsorptionWorkflowToolProvider:
                                 error="maximum new evaluation budget exhausted",
                             )
                         if claim is BudgetClaimStatus.RESERVED:
-                            command_result = await self._spectrum.execute_json(
-                                {
-                                    "candidate": payload,
-                                    "chemical_identity_hash": chemical_hash,
-                                    "state_hash": state_hash,
-                                    "geometry_hash": geometry_hash,
-                                    "protocol": inputs.calculation_protocol.model_dump(
-                                        mode="json"
-                                    ),
-                                },
-                                cwd=context.workspace,
-                                timeout_seconds=inputs.spectrum_timeout_seconds,
-                            )
+                            try:
+                                command_result = await self._spectrum.execute_json(
+                                    {
+                                        "candidate": payload,
+                                        "chemical_identity_hash": chemical_hash,
+                                        "state_hash": state_hash,
+                                        "geometry_hash": geometry_hash,
+                                        "protocol": inputs.calculation_protocol.model_dump(
+                                            mode="json"
+                                        ),
+                                    },
+                                    cwd=context.workspace,
+                                    timeout_seconds=inputs.spectrum_timeout_seconds,
+                                )
+                            except TimeoutError:
+                                await resources._commit_failure(
+                                    key, "TIMEOUT", "spectrum command timed out"
+                                )
+                                return ToolResult(
+                                    ToolStatus.TIMEOUT,
+                                    {"cache_key": list(key), "cache_hit": False},
+                                    error="spectrum command timed out",
+                                )
+                            except Exception as error:
+                                await resources._commit_failure(
+                                    key,
+                                    "FAILED",
+                                    f"spectrum command raised {type(error).__name__}",
+                                )
+                                return ToolResult(
+                                    ToolStatus.FAILED,
+                                    {"cache_key": list(key), "cache_hit": False},
+                                    error=f"spectrum command failed: {type(error).__name__}",
+                                )
                             spectrum_process = {
                                 "status": command_result.status.value,
                                 "exit_code": getattr(command_result, "exit_code", None),
@@ -576,6 +648,9 @@ class RedAbsorptionWorkflowToolProvider:
                                 "spectrum_process": spectrum_process,
                             }
                             if command_result.status is JsonCommandStatus.TIMEOUT:
+                                await resources._commit_failure(
+                                    key, "TIMEOUT", "spectrum command timed out"
+                                )
                                 return ToolResult(
                                     ToolStatus.TIMEOUT,
                                     failed_process_payload,
@@ -585,6 +660,11 @@ class RedAbsorptionWorkflowToolProvider:
                                 command_result.status is not JsonCommandStatus.SUCCESS
                                 or command_result.stdout_text is None
                             ):
+                                await resources._commit_failure(
+                                    key,
+                                    "FAILED",
+                                    f"spectrum command failed: {command_result.status.value}",
+                                )
                                 return ToolResult(
                                     ToolStatus.FAILED,
                                     failed_process_payload,
@@ -595,6 +675,11 @@ class RedAbsorptionWorkflowToolProvider:
                                     command_result.stdout_text
                                 )
                             except (TypeError, ValueError) as error:
+                                await resources._commit_failure(
+                                    key,
+                                    "FAILED",
+                                    f"invalid spectrum result: {type(error).__name__}",
+                                )
                                 return ToolResult(
                                     ToolStatus.FAILED,
                                     failed_process_payload,
@@ -605,12 +690,15 @@ class RedAbsorptionWorkflowToolProvider:
                                 != inputs.calculation_protocol
                                 or spectrum_result.provenance.geometry_hash != geometry_hash
                             ):
+                                await resources._commit_failure(
+                                    key, "FAILED", "spectrum provenance mismatch"
+                                )
                                 return ToolResult(
                                     ToolStatus.FAILED,
                                     failed_process_payload,
                                     error="spectrum provenance mismatch",
                                 )
-                            resources._commit_result(key, spectrum_result)
+                            await resources._commit_result(key, spectrum_result)
                             resources._cache[key] = spectrum_result
                             cache_hit = False
             else:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -91,25 +93,41 @@ def test_auth_status_requires_explicit_positive_and_reports_chatgpt():
 
 
 @pytest.mark.asyncio
-async def test_auth_spawn_has_bounded_handoff_guardian(monkeypatch):
-    release = preflight_module.asyncio.Event()
-
+async def test_auth_spawn_has_persistent_thread_owner_after_timeout(monkeypatch):
     async def delayed_spawn():
-        await release.wait()
+        await preflight_module.asyncio.sleep(0.05)
         return preflight_module._AuthSpawnFailure(RuntimeError("late spawn"))
 
     monkeypatch.setattr(preflight_module, "_capture_auth_spawn", delayed_spawn)
     monkeypatch.setattr(preflight_module, "_AUTH_TIMEOUT_SECONDS", 0.01)
-    monkeypatch.setattr(preflight_module, "_AUTH_SPAWN_HANDOFF_SECONDS", 0.01)
-    with pytest.raises(TimeoutError, match="spawn"):
+    with pytest.raises(TimeoutError, match="probe"):
         await preflight_module._default_auth_probe()
-    assert preflight_module._AUTH_GUARDIANS
-    release.set()
-    await preflight_module.asyncio.gather(
-        *tuple(preflight_module._AUTH_GUARDIANS)
-    )
-    await preflight_module.asyncio.sleep(0)
-    assert not preflight_module._AUTH_GUARDIANS
+    with preflight_module._AUTH_WORKERS_LOCK:
+        assert preflight_module._AUTH_WORKERS
+    await preflight_module.asyncio.sleep(0.1)
+    with preflight_module._AUTH_WORKERS_LOCK:
+        assert not preflight_module._AUTH_WORKERS
+
+
+def test_auth_spawn_owner_survives_caller_asyncio_run_shutdown(monkeypatch):
+    spawn_cancelled = threading.Event()
+
+    async def delayed_spawn():
+        try:
+            await preflight_module.asyncio.sleep(0.05)
+        except preflight_module.asyncio.CancelledError:
+            spawn_cancelled.set()
+            raise
+        return preflight_module._AuthSpawnFailure(RuntimeError("late spawn"))
+
+    monkeypatch.setattr(preflight_module, "_capture_auth_spawn", delayed_spawn)
+    monkeypatch.setattr(preflight_module, "_AUTH_TIMEOUT_SECONDS", 0.01)
+    with pytest.raises(TimeoutError, match="probe"):
+        preflight_module.asyncio.run(preflight_module._default_auth_probe())
+    time.sleep(0.1)
+    assert not spawn_cancelled.is_set()
+    with preflight_module._AUTH_WORKERS_LOCK:
+        assert not preflight_module._AUTH_WORKERS
 
 
 def test_storage_preflight_rejects_corrupt_run_database(tmp_path):
@@ -117,6 +135,21 @@ def test_storage_preflight_rejects_corrupt_run_database(tmp_path):
     runs.mkdir()
     (runs / "runs.sqlite").write_bytes(b"not sqlite")
     with pytest.raises(ValueError, match="SQLite|sqlite"):
+        _validate_storage_target(runs)
+
+
+def test_storage_preflight_rejects_incomplete_run_store_schema(tmp_path):
+    import sqlite3
+
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    with sqlite3.connect(runs / "runs.sqlite") as connection:
+        connection.execute(
+            "CREATE TABLE schema_metadata(singleton INTEGER PRIMARY KEY, schema_version INTEGER)"
+        )
+        connection.execute("INSERT INTO schema_metadata VALUES (1, 1)")
+        connection.execute("CREATE TABLE runs(run_id TEXT PRIMARY KEY, snapshot_hash TEXT)")
+    with pytest.raises((ValueError, RuntimeError), match="SQLite|sqlite|schema"):
         _validate_storage_target(runs)
 
 

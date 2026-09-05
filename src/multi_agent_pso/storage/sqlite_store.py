@@ -276,6 +276,18 @@ class SQLiteRunStore:
             connection.close()
             self._secure_database_files(suppress_errors=True)
 
+    @classmethod
+    def validate_read_only_connection(cls, connection: sqlite3.Connection) -> None:
+        """Validate a caller-owned read-only connection against the full v1 schema."""
+        if not isinstance(connection, sqlite3.Connection):
+            raise TypeError("connection must be a sqlite3.Connection")
+        connection.row_factory = sqlite3.Row
+        integrity = connection.execute("PRAGMA quick_check").fetchone()
+        if integrity is None or integrity[0] != "ok":
+            raise RuntimeError("database integrity check failed")
+        validator = object.__new__(cls)
+        validator._validate_schema(connection)
+
     def list_run_ids(self) -> tuple[str, ...]:
         connection = self._connect()
         try:
