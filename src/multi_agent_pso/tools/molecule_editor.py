@@ -24,6 +24,12 @@ MAX_EDIT_ATTEMPTS = 3
 _HASH = re.compile(r"^[0-9a-f]{64}$")
 _LOCAL = re.compile(r"^@[A-Za-z0-9][A-Za-z0-9_-]*$")
 _ELEMENTS = {1,5,6,7,8,9,14,15,16,17,34,35,53}
+_DIRECTION_BY_BOND = {
+    "SINGLE":{"NONE","BEGINWEDGE","BEGINDASH","ENDDOWNRIGHT","ENDUPRIGHT","UNKNOWN"},
+    "DOUBLE":{"NONE","EITHERDOUBLE","UNKNOWN"},
+    "TRIPLE":{"NONE","UNKNOWN"},
+    "AROMATIC":{"NONE","UNKNOWN"},
+}
 _OPERATIONS = {
     "add_atom", "remove_atom", "replace_atom", "add_bond", "remove_bond",
     "change_bond", "attach_fragment", "detach_fragment", "substitute_fragment",
@@ -100,9 +106,11 @@ def _validate_graph(value: object) -> dict[str, object]:
     atoms=value["atoms"]
     if not isinstance(atoms,list): raise ValueError("graph atoms invalid")
     atom_ids=set()
+    atom_serials=[]
     for atom in atoms:
         if not isinstance(atom,dict) or set(atom)!=atom_fields or not isinstance(atom["atom_id"],str) or not re.fullmatch(r"a[0-9]{4,}",atom["atom_id"]) or atom["atom_id"] in atom_ids: raise ValueError("atom record invalid")
         atom_ids.add(atom["atom_id"])
+        atom_serials.append(int(atom["atom_id"][1:]))
         if type(atom["atomic_number"]) is not int or atom["atomic_number"] not in _ELEMENTS: raise ValueError("atom element invalid")
         for key in ("isotope","formal_charge","radical_electrons","explicit_h_count"):
             if type(atom[key]) is not int: raise ValueError("atom integer invalid")
@@ -110,14 +118,20 @@ def _validate_graph(value: object) -> dict[str, object]:
         if atom["chiral_tag"] not in {"CHI_UNSPECIFIED","CHI_TETRAHEDRAL_CW","CHI_TETRAHEDRAL_CCW"} or not isinstance(atom["chiral_neighbor_atom_ids"],list) or (atom["atom_map"] is not None and type(atom["atom_map"]) is not int): raise ValueError("atom stereo/map invalid")
     for atom in atoms:
         if any(value not in atom_ids for value in atom["chiral_neighbor_atom_ids"]): raise ValueError("chiral neighbor is unknown")
-    bond_fields={"bond_id","begin_atom_id","end_atom_id","bond_type","aromatic","conjugated","stereo","stereo_atom_ids","bond_direction"}; bond_ids=set(); bonds=value["bonds"]
+    if value["next_atom_serial"] <= max(atom_serials,default=0): raise ValueError("next_atom_serial is stale")
+    bond_fields={"bond_id","begin_atom_id","end_atom_id","bond_type","aromatic","conjugated","stereo","stereo_atom_ids","bond_direction"}; bond_ids=set(); bond_serials=[]; endpoint_pairs=set(); bonds=value["bonds"]
     if not isinstance(bonds,list): raise ValueError("graph bonds invalid")
     directions={"NONE","BEGINWEDGE","BEGINDASH","ENDDOWNRIGHT","ENDUPRIGHT","EITHERDOUBLE","UNKNOWN"}
     for bond in bonds:
         if not isinstance(bond,dict) or set(bond)!=bond_fields or not isinstance(bond["bond_id"],str) or not re.fullmatch(r"b[0-9]{4,}",bond["bond_id"]) or bond["bond_id"] in bond_ids: raise ValueError("bond record invalid")
         bond_ids.add(bond["bond_id"])
-        if bond["begin_atom_id"] not in atom_ids or bond["end_atom_id"] not in atom_ids or bond["bond_type"] not in {"SINGLE","DOUBLE","TRIPLE","AROMATIC"} or bond["bond_direction"] not in directions: raise ValueError("bond domain invalid")
+        bond_serials.append(int(bond["bond_id"][1:])); pair=frozenset((bond["begin_atom_id"],bond["end_atom_id"]))
+        if len(pair)!=2 or pair in endpoint_pairs: raise ValueError("bond self-loop or duplicate endpoints")
+        endpoint_pairs.add(pair)
+        if bond["begin_atom_id"] not in atom_ids or bond["end_atom_id"] not in atom_ids or bond["bond_type"] not in _DIRECTION_BY_BOND or bond["bond_direction"] not in _DIRECTION_BY_BOND[bond["bond_type"]]: raise ValueError("bond domain invalid")
         if type(bond["aromatic"]) is not bool or type(bond["conjugated"]) is not bool or bond["stereo"] not in {"STEREONONE","STEREOANY","STEREOZ","STEREOE","STEREOCIS","STEREOTRANS"} or not isinstance(bond["stereo_atom_ids"],list) or any(v not in atom_ids for v in bond["stereo_atom_ids"]): raise ValueError("bond stereo invalid")
+        if bond["bond_type"]!="DOUBLE" and bond["stereo"]!="STEREONONE": raise ValueError("bond stereo incompatible with bond type")
+    if value["next_bond_serial"] <= max(bond_serials,default=0): raise ValueError("next_bond_serial is stale")
     return value
 
 
@@ -132,7 +146,7 @@ def _validate_unready_geometry(data: dict[str, object], status: str) -> None:
     if compact["errors"]!=full["errors"] or compact["warnings"]!=full["warnings"]: raise ValueError("compact diagnostics mismatch")
 
 
-def _validate_ready_geometry(data: dict[str, object]) -> None:
+def _validate_ready_geometry(data: dict[str, object], graph: dict[str, object]) -> None:
     gh = _digest(data.get("geometry_hash"), "geometry_hash")
     order = data.get("coordinate_order"); result = data.get("geometry_result"); compact = data.get("geometry")
     if not isinstance(order, list) or not order or any(not isinstance(v, str) or not v for v in order) or len(set(order)) != len(order): raise ValueError("coordinate_order is invalid")
@@ -143,6 +157,14 @@ def _validate_ready_geometry(data: dict[str, object]) -> None:
     conformers = result["conformers"]
     if not isinstance(conformers, list) or not conformers: raise ValueError("READY geometry requires conformers")
     ids = set()
+    graph_atoms={atom["atom_id"]:atom["atomic_number"] for atom in graph["atoms"]}
+    if not set(graph_atoms) <= set(order): raise ValueError("coordinate order misses graph atom")
+    geometry_hydrogens=set()
+    for identity in order:
+        if identity in graph_atoms: continue
+        match=re.fullmatch(r"h:(a[0-9]{4,}):([1-9][0-9]*)",identity)
+        if match is None or match.group(1) not in graph_atoms or (match.group(1),int(match.group(2))) in geometry_hydrogens: raise ValueError("geometry-only hydrogen identity invalid")
+        geometry_hydrogens.add((match.group(1),int(match.group(2))))
     for conformer in conformers:
         if not isinstance(conformer, dict) or set(conformer) != {"conformer_id","energy_kcal_mol","coordinates"}: raise ValueError("conformer is invalid")
         cid = conformer["conformer_id"]
@@ -152,6 +174,7 @@ def _validate_ready_geometry(data: dict[str, object]) -> None:
         if not isinstance(coords, list) or len(coords) != len(order): raise ValueError("coordinates/order mismatch")
         for expected, coordinate in zip(order, coords, strict=True):
             if not isinstance(coordinate, dict) or set(coordinate) != {"atom_id","atomic_number","x_angstrom","y_angstrom","z_angstrom"} or coordinate["atom_id"] != expected or type(coordinate["atomic_number"]) is not int or coordinate["atomic_number"] not in _ELEMENTS: raise ValueError("coordinate is invalid")
+            if (expected in graph_atoms and coordinate["atomic_number"]!=graph_atoms[expected]) or (expected not in graph_atoms and coordinate["atomic_number"]!=1): raise ValueError("coordinate element mismatches identity")
             for axis in ("x_angstrom","y_angstrom","z_angstrom"): _finite(coordinate[axis], axis)
     if selected not in ids: raise ValueError("selected conformer is missing")
     if not isinstance(result["protocol"], dict) or result["errors"] != []: raise ValueError("READY geometry errors/protocol invalid")
@@ -252,7 +275,7 @@ class MoleculeEditorResult:
             elif data.get("mode") == "edit":
                 raise ValueError("invalid edit must be ROLLED_BACK")
         if geometry == "READY":
-            _validate_ready_geometry(data)
+            _validate_ready_geometry(data, graph)
         elif "geometry_result" in data or "geometry" in data or data.get("mode") is not None:
             _validate_unready_geometry(data, geometry)
         _validate_artifacts(data, chemical, geometry, artifact)
@@ -414,6 +437,9 @@ class MoleculeEditorProvider:
             if "chiral_tag" in item and item["chiral_tag"] not in {"CHI_UNSPECIFIED","CHI_TETRAHEDRAL_CW","CHI_TETRAHEDRAL_CCW"}: raise ValueError("chiral_tag is invalid")
             if "stereo" in item and item["stereo"] not in {"STEREONONE","STEREOANY","STEREOZ","STEREOE","STEREOCIS","STEREOTRANS"}: raise ValueError("stereo is invalid")
             if "bond_direction" in item and item["bond_direction"] not in {"NONE","BEGINWEDGE","BEGINDASH","ENDDOWNRIGHT","ENDUPRIGHT","EITHERDOUBLE","UNKNOWN"}: raise ValueError("bond_direction is invalid")
+            if "bond_type" in item:
+                direction=item.get("bond_direction","NONE"); stereo=item.get("stereo","STEREONONE")
+                if direction not in _DIRECTION_BY_BOND[item["bond_type"]] or (item["bond_type"]!="DOUBLE" and stereo!="STEREONONE"): raise ValueError("bond direction/stereo incompatible with type")
             for key in ("atom_id", "anchor_atom_id", "retained_atom_id", "begin", "end"):
                 if key in item and item[key] not in atom_refs: raise ValueError(f"unknown or forward atom reference: {item[key]}")
             if "bond_id" in item and item["bond_id"] not in bond_refs: raise ValueError(f"unknown or forward bond reference: {item['bond_id']}")

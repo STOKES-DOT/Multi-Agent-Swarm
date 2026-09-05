@@ -211,6 +211,52 @@ def test_graph_schema_attack_cases_are_rejected(mutation) -> None:
     with pytest.raises(ValueError): MoleculeEditorResult.from_process(exit_code=0,payload=data)
 
 
+@pytest.mark.parametrize("mutation",["self_loop","duplicate_pair","atom_serial","bond_serial","direction"])
+def test_graph_topology_serial_and_direction_attacks_are_rejected(mutation) -> None:
+    data=_real_payload(); graph=data["graph"]
+    if mutation=="self_loop": graph["bonds"][0]["end_atom_id"]="a0001"
+    elif mutation=="duplicate_pair":
+        duplicate=deepcopy(graph["bonds"][0]); duplicate.update({"bond_id":"b0002","begin_atom_id":"a0002","end_atom_id":"a0001"}); graph["bonds"].append(duplicate); graph["next_bond_serial"]=3
+    elif mutation=="atom_serial": graph["next_atom_serial"]=2
+    elif mutation=="bond_serial": graph["next_bond_serial"]=1
+    else: graph["bonds"][0]["bond_direction"]="EITHERDOUBLE"
+    with pytest.raises(ValueError): MoleculeEditorResult.from_process(exit_code=0,payload=data)
+
+
+@pytest.mark.parametrize("command",[
+    {"operation":"add_bond","begin":"a0001","end":"a0002","bond_type":"SINGLE","bond_direction":"EITHERDOUBLE"},
+    {"operation":"add_bond","begin":"a0001","end":"a0002","bond_type":"TRIPLE","bond_direction":"BEGINWEDGE"},
+    {"operation":"add_bond","begin":"a0001","end":"a0002","bond_type":"SINGLE","stereo":"STEREOE"},
+    {"operation":"change_bond","bond_id":"b0001","bond_type":"AROMATIC","stereo":"STEREOZ"},
+])
+def test_command_bond_direction_and_stereo_compatibility_rejects_before_spawn(command) -> None:
+    with pytest.raises(ValueError): MoleculeEditorProvider._commands([command],_real_graph())
+
+
+@pytest.mark.parametrize("mutation",["unknown","bad_h_parent","duplicate_h","missing_graph","wrong_element"])
+def test_ready_coordinates_are_bound_to_graph_identity(mutation) -> None:
+    data=_ready_payload(); full=data["geometry_result"]; order=data["coordinate_order"]
+    coordinates=full["conformers"][0]["coordinates"]
+    if mutation=="unknown": order.append("x9999"); coordinates.append({"atom_id":"x9999","atomic_number":1,"x_angstrom":0.0,"y_angstrom":0.0,"z_angstrom":0.0})
+    elif mutation=="bad_h_parent": order.append("h:a9999:1"); coordinates.append({"atom_id":"h:a9999:1","atomic_number":1,"x_angstrom":0.0,"y_angstrom":0.0,"z_angstrom":0.0})
+    elif mutation=="duplicate_h":
+        order.extend(["h:a0001:1","h:a0001:01"]); coordinates.extend([{"atom_id":value,"atomic_number":1,"x_angstrom":0.0,"y_angstrom":0.0,"z_angstrom":0.0} for value in order[-2:]])
+    elif mutation=="missing_graph": order.pop(); coordinates.pop()
+    else: coordinates[0]["atomic_number"]=8
+    full["coordinate_order"]=order
+    with pytest.raises(ValueError): MoleculeEditorResult.from_process(exit_code=0,payload=data)
+
+
+def test_ready_coordinates_accept_explicit_graph_hydrogens_and_geometry_hydrogens() -> None:
+    data=_ready_payload(); graph=data["graph"]
+    hydrogen={"atom_id":"a0003","atomic_number":1,"isotope":0,"formal_charge":0,"radical_electrons":0,"chiral_tag":"CHI_UNSPECIFIED","chiral_neighbor_atom_ids":[],"explicit_h_count":0,"no_implicit":False,"aromatic":False,"atom_map":None}
+    graph["atoms"].append(hydrogen); graph["next_atom_serial"]=4
+    order=data["coordinate_order"]; order.extend(["a0003","h:a0001:1"])
+    coords=data["geometry_result"]["conformers"][0]["coordinates"]; coords.extend([{"atom_id":value,"atomic_number":1,"x_angstrom":0.0,"y_angstrom":1.0,"z_angstrom":0.0} for value in order[-2:]])
+    data["geometry_result"]["coordinate_order"]=order
+    assert MoleculeEditorResult.from_process(exit_code=0,payload=data).ready_for_evaluator
+
+
 @pytest.mark.parametrize(
     "commands",
     [
