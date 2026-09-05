@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from multi_agent_pso.tools import JsonCommandStatus
+import multi_agent_pso.tools.molecule_editor as molecule_editor_module
 
 from multi_agent_pso.tools.molecule_editor import (
     MAX_EDIT_ATTEMPTS,
@@ -299,6 +300,40 @@ def test_fragment_removal_prunes_old_ids_and_preserves_retained_component(operat
     assert MoleculeEditorProvider._commands(valid,graph)==valid
 
 
+@pytest.mark.parametrize("mutation",["unspecified_refs","tetra_missing","tetra_extra","tetra_duplicate"])
+def test_graph_chiral_neighbor_ids_match_real_adjacency(mutation) -> None:
+    graph=_real_graph(); atom=graph["atoms"][0]
+    if mutation=="unspecified_refs": atom["chiral_neighbor_atom_ids"]=["a0002"]
+    else:
+        atom["chiral_tag"]="CHI_TETRAHEDRAL_CW"
+        if mutation=="tetra_missing": atom["chiral_neighbor_atom_ids"]=[]
+        elif mutation=="tetra_duplicate": atom["chiral_neighbor_atom_ids"]=["a0002","a0002"]
+        else:
+            extra=deepcopy(graph["atoms"][0]); extra["atom_id"]="a0003"; graph["atoms"].append(extra); graph["next_atom_serial"]=4; bond=deepcopy(graph["bonds"][0]); bond.update({"bond_id":"b0002","begin_atom_id":"a0002","end_atom_id":"a0003"}); graph["bonds"].append(bond); graph["next_bond_serial"]=3; atom["chiral_neighbor_atom_ids"]=["a0002","a0003"]
+    with pytest.raises(ValueError): molecule_editor_module._validate_graph(graph)
+
+
+def test_graph_accepts_ordered_tetrahedral_real_neighbors() -> None:
+    graph=_real_graph(); graph["atoms"][0].update({"chiral_tag":"CHI_TETRAHEDRAL_CCW","chiral_neighbor_atom_ids":["a0002"]})
+    assert molecule_editor_module._validate_graph(graph) is graph
+
+
+@pytest.mark.parametrize("kind",["self_loop","existing_pair","prior_add_pair"])
+def test_add_bond_rejects_self_loop_and_duplicate_current_adjacency(kind) -> None:
+    graph=_real_graph()
+    if kind=="self_loop": commands=[{"operation":"add_bond","begin":"a0001","end":"a0001","bond_type":"SINGLE"}]
+    elif kind=="existing_pair": commands=[{"operation":"add_bond","begin":"a0002","end":"a0001","bond_type":"SINGLE"}]
+    else: commands=[{"operation":"add_atom","client_ref":"@x","atomic_number":6},{"operation":"add_bond","begin":"a0001","end":"@x","bond_type":"SINGLE"},{"operation":"add_bond","begin":"@x","end":"a0001","bond_type":"SINGLE"}]
+    with pytest.raises(ValueError): MoleculeEditorProvider._commands(commands,graph)
+
+
+@pytest.mark.parametrize("operation",["detach_fragment","substitute_fragment"])
+def test_fragment_removal_requires_current_bridge(operation) -> None:
+    graph=_benzene_payload()["graph"]; command={"operation":operation,"bond_id":"b0001","retained_atom_id":"a0001"}
+    if operation=="substitute_fragment": command.update({"fragment_graph":_real_graph(),"fragment_anchor_atom_id":"a0001","bond_type":"SINGLE"})
+    with pytest.raises(ValueError): MoleculeEditorProvider._commands([command],graph)
+
+
 @pytest.mark.parametrize("mutation",["duplicate_atom","bad_element","missing_endpoint","bad_direction","serial_bool"])
 def test_graph_schema_attack_cases_are_rejected(mutation) -> None:
     data=_real_payload(); graph=data["graph"]
@@ -381,7 +416,8 @@ def test_non_double_command_requires_empty_stereo_atom_ids(operation,bond_type) 
     command.update({"begin":"a0001","end":"a0002"} if operation=="add_bond" else {"bond_id":"b0001"})
     with pytest.raises(ValueError): MoleculeEditorProvider._commands([command],_real_graph())
     command["stereo_atom_ids"]=[]
-    assert MoleculeEditorProvider._commands([command],_real_graph())==[command]
+    control_graph=_stereo_graph(False) if operation=="add_bond" else _real_graph()
+    assert MoleculeEditorProvider._commands([command],control_graph)==[command]
 
 
 @pytest.mark.parametrize("operation",["add_bond","change_bond"])

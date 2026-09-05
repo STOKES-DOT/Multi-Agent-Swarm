@@ -138,6 +138,12 @@ def _validate_graph(value: object) -> dict[str, object]:
     adjacency={atom:set() for atom in atom_ids}
     for bond in bonds:
         adjacency[bond["begin_atom_id"]].add(bond["end_atom_id"]); adjacency[bond["end_atom_id"]].add(bond["begin_atom_id"])
+    for atom in atoms:
+        declared=atom["chiral_neighbor_atom_ids"]; actual=adjacency[atom["atom_id"]]
+        if atom["chiral_tag"]=="CHI_UNSPECIFIED":
+            if declared: raise ValueError("unspecified chirality has neighbor order")
+        elif len(declared)!=len(set(declared)) or set(declared)!=actual:
+            raise ValueError("tetrahedral neighbor order mismatches adjacency")
     connectivity=nx.Graph(); connectivity.add_nodes_from(atom_ids); connectivity.add_edges_from((bond["begin_atom_id"],bond["end_atom_id"]) for bond in bonds)
     if not atom_ids or not nx.is_connected(connectivity): raise ValueError("ChemicalGraph must be nonempty and connected")
     for bond in bonds:
@@ -536,6 +542,7 @@ class MoleculeEditorProvider:
                 if not isinstance(stereo_ids, list) or any(value not in atom_refs for value in stereo_ids): raise ValueError("stereo_atom_ids are invalid")
             if op in {"add_bond","change_bond"}:
                 begin,end=(item["begin"],item["end"]) if op=="add_bond" else endpoints[item["bond_id"]]
+                if op=="add_bond" and (begin==end or end in adjacency.get(begin,set())): raise ValueError("add_bond self-loop or duplicate pair")
                 _validate_bond_stereo_refs(item["bond_type"],item.get("stereo","STEREONONE"),item.get("stereo_atom_ids",[]),begin,end,adjacency,topology_known=topology_known)
             ref = item.get("client_ref")
             if ref is not None:
@@ -548,12 +555,15 @@ class MoleculeEditorProvider:
                 if anchor not in {a.get("atom_id") for a in validated_fragment.get("atoms", ()) if isinstance(a, Mapping)}: raise ValueError("fragment anchor is invalid")
                 if op=="attach_fragment": topology_known=False
             if op in {"detach_fragment","substitute_fragment"}:
-                begin,end=endpoints[item["bond_id"]]; adjacency[begin].discard(end); adjacency[end].discard(begin); endpoints.pop(item["bond_id"]); bond_refs.discard(item["bond_id"])
+                begin,end=endpoints[item["bond_id"]]; network=nx.Graph(); network.add_nodes_from(adjacency); network.add_edges_from((atom,neighbor) for atom,neighbors in adjacency.items() for neighbor in neighbors)
+                if not network.has_edge(begin,end) or frozenset((begin,end)) not in {frozenset(edge) for edge in nx.bridges(network)}: raise ValueError("fragment removal requires a bridge bond")
+                adjacency[begin].discard(end); adjacency[end].discard(begin); endpoints.pop(item["bond_id"]); bond_refs.discard(item["bond_id"])
                 retained=item["retained_atom_id"]; component=set(); pending=[retained]
                 while pending:
                     atom=pending.pop()
                     if atom in component: continue
                     component.add(atom); pending.extend(adjacency.get(atom,set())-component)
+                if not ({begin,end} & component): raise ValueError("retained atom is outside target bond components")
                 removed=set(atom_refs)-component
                 for atom in removed:
                     for neighbor in adjacency.get(atom,set()): adjacency.get(neighbor,set()).discard(atom)
