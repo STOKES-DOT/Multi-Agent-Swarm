@@ -525,13 +525,36 @@ class JsonCommandProvider:
             asyncio.create_task(ownership.wait())
             for ownership in tuple(self._ownerships)
         )
-        done, pending = await asyncio.wait(
-            waiters,
-            timeout=_CLOSE_HANDOFF_GRACE_SECONDS,
-        )
-        for waiter in pending:
-            waiter.cancel()
-        await asyncio.gather(*done, *pending, return_exceptions=True)
+        primary: asyncio.CancelledError | None = None
+        try:
+            await asyncio.wait(
+                waiters,
+                timeout=_CLOSE_HANDOFF_GRACE_SECONDS,
+            )
+        except asyncio.CancelledError as cancellation:
+            primary = cancellation
+        finally:
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.cancel()
+            drain = asyncio.ensure_future(
+                asyncio.gather(*waiters, return_exceptions=True)
+            )
+            while not drain.done():
+                try:
+                    await asyncio.shield(drain)
+                except asyncio.CancelledError as cancellation:
+                    if primary is None:
+                        primary = cancellation
+                    else:
+                        _add_secondary(
+                            primary,
+                            cancellation,
+                            "JSON command close waiter drain was cancelled",
+                        )
+            drain.result()
+        if primary is not None:
+            raise primary
 
     def _release_ownership(self, ownership: asyncio.Event) -> None:
         self._ownerships.discard(ownership)

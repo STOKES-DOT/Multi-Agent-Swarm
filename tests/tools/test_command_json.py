@@ -508,6 +508,44 @@ async def test_aclose_reports_foreground_spawn_ownership_until_reaped(
     assert not _pid_exists(children[0].pid)
 
 
+async def test_cancelled_aclose_drains_all_internal_event_waiters(
+    tmp_path: Path, monkeypatch
+) -> None:
+    release = asyncio.Event()
+
+    async def delayed_failure(*args, **kwargs):
+        await release.wait()
+        raise RuntimeError("released after cancelled close")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_failure)
+    provider = _provider()
+    result = await provider.execute_json(
+        {}, cwd=tmp_path.resolve(), timeout_seconds=0.01
+    )
+    assert result.status is JsonCommandStatus.TIMEOUT
+    assert provider.pending_cleanup_count == 1
+
+    for attempt in range(3):
+        closing = asyncio.create_task(provider.aclose())
+        await asyncio.sleep(0)
+        closing.cancel(f"close-{attempt}")
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await closing
+        assert raised.value.args == (f"close-{attempt}",)
+        leaked_waiters = [
+            task
+            for task in asyncio.all_tasks()
+            if task is not asyncio.current_task()
+            and not task.done()
+            and getattr(task.get_coro(), "__qualname__", "")
+            == "Event.wait"
+        ]
+        assert leaked_waiters == []
+
+    release.set()
+    await _wait_for_pending_count(provider, 0)
+
+
 async def test_async_context_manager_closes_provider(tmp_path: Path) -> None:
     provider = _provider()
     async with provider as entered:
