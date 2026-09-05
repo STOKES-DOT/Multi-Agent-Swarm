@@ -14,6 +14,7 @@ from multi_agent_pso.tools import JsonCommandProvider, JsonCommandStatus
 from multi_agent_pso.resources import BudgetClaimStatus, DurableBudgetLedger
 
 from .evaluator import EVALUATOR_VERSION
+from .geometry import EvaluatedGeometry, GeometryAtom
 from .inputs import RedAbsorptionRunInputs
 from .models import SpectrumResult
 
@@ -239,6 +240,66 @@ def _parent_source(inputs: RedAbsorptionRunInputs) -> dict[str, object]:
     if parent.kind == "chemical_graph":
         return {"kind": "chemical_graph", "value": parent.value}
     return {"kind": "path", "path": parent.path, "format": parent.format}
+
+
+def _evaluated_geometry_from_payload(
+    payload: Mapping[str, object], *, charge: int, multiplicity: int
+) -> EvaluatedGeometry:
+    order = payload.get("coordinate_order")
+    result = payload.get("geometry_result")
+    if not isinstance(order, (list, tuple)) or not isinstance(result, Mapping):
+        raise ValueError("MoleculeEditor geometry payload is missing")
+    selected = result.get("selected_conformer_id")
+    conformers = result.get("conformers")
+    if type(selected) is not int or not isinstance(conformers, (list, tuple)):
+        raise ValueError("MoleculeEditor selected conformer is missing")
+    match = next(
+        (
+            conformer
+            for conformer in conformers
+            if isinstance(conformer, Mapping)
+            and conformer.get("conformer_id") == selected
+        ),
+        None,
+    )
+    coordinates = match.get("coordinates") if isinstance(match, Mapping) else None
+    if not isinstance(coordinates, (list, tuple)):
+        raise ValueError("MoleculeEditor coordinates are missing")
+    return EvaluatedGeometry(
+        coordinate_order=tuple(order),
+        coordinates=tuple(
+            GeometryAtom(
+                atom_id=coordinate["atom_id"],
+                atomic_number=coordinate["atomic_number"],
+                x_angstrom=coordinate["x_angstrom"],
+                y_angstrom=coordinate["y_angstrom"],
+                z_angstrom=coordinate["z_angstrom"],
+            )
+            for coordinate in coordinates
+            if isinstance(coordinate, Mapping)
+        ),
+        charge=charge,
+        multiplicity=multiplicity,
+    )
+
+
+def _spectrum_matches_source_geometry(
+    spectrum: SpectrumResult, source_geometry_hash: str
+) -> bool:
+    provenance = spectrum.provenance
+    if provenance.protocol.geometry_workflow == "b3lyp_sto3g_optimized":
+        geometry = spectrum.evaluated_geometry
+        return (
+            provenance.source_geometry_hash == source_geometry_hash
+            and geometry is not None
+            and provenance.evaluation_geometry_hash == geometry.geometry_hash
+            and provenance.geometry_hash == geometry.geometry_hash
+        )
+    return (
+        provenance.geometry_hash == source_geometry_hash
+        and provenance.source_geometry_hash in {None, source_geometry_hash}
+        and provenance.evaluation_geometry_hash in {None, source_geometry_hash}
+    )
 
 
 def _violates_protection_policy(
@@ -638,16 +699,34 @@ class RedAbsorptionWorkflowToolProvider:
                             )
                         if claim is BudgetClaimStatus.RESERVED:
                             try:
+                                command_payload = {
+                                    "candidate": payload,
+                                    "chemical_identity_hash": chemical_hash,
+                                    "state_hash": state_hash,
+                                    "geometry_hash": geometry_hash,
+                                    "protocol": inputs.calculation_protocol.model_dump(
+                                        mode="json"
+                                    ),
+                                }
+                                if (
+                                    inputs.calculation_protocol.geometry_workflow
+                                    == "b3lyp_sto3g_optimized"
+                                ):
+                                    source_geometry = _evaluated_geometry_from_payload(
+                                        payload,
+                                        charge=inputs.calculation_protocol.charge,
+                                        multiplicity=inputs.calculation_protocol.multiplicity,
+                                    )
+                                    command_payload.update(
+                                        {
+                                            "source_geometry": source_geometry.model_dump(
+                                                mode="json"
+                                            ),
+                                            "source_geometry_hash": geometry_hash,
+                                        }
+                                    )
                                 command_result = await self._spectrum.execute_json(
-                                    {
-                                        "candidate": payload,
-                                        "chemical_identity_hash": chemical_hash,
-                                        "state_hash": state_hash,
-                                        "geometry_hash": geometry_hash,
-                                        "protocol": inputs.calculation_protocol.model_dump(
-                                            mode="json"
-                                        ),
-                                    },
+                                    command_payload,
                                     cwd=context.workspace,
                                     timeout_seconds=inputs.spectrum_timeout_seconds,
                                 )
@@ -732,7 +811,9 @@ class RedAbsorptionWorkflowToolProvider:
                             if (
                                 spectrum_result.provenance.protocol
                                 != inputs.calculation_protocol
-                                or spectrum_result.provenance.geometry_hash != geometry_hash
+                                or not _spectrum_matches_source_geometry(
+                                    spectrum_result, geometry_hash
+                                )
                             ):
                                 await resources._commit_failure(
                                     key, "FAILED", "spectrum provenance mismatch"
@@ -750,7 +831,9 @@ class RedAbsorptionWorkflowToolProvider:
                     not isinstance(spectrum_result, SpectrumResult)
                     or spectrum_result.provenance.protocol
                     != inputs.calculation_protocol
-                    or spectrum_result.provenance.geometry_hash != geometry_hash
+                    or not _spectrum_matches_source_geometry(
+                        spectrum_result, geometry_hash
+                    )
                 ):
                     return ToolResult(
                         ToolStatus.FAILED, error="cached spectrum provenance mismatch"

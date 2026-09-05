@@ -174,6 +174,9 @@ def main(argv: list[str] | None = None) -> int:
                             "chemical": record.parent_chemical_hash,
                             "geometry": record.parent_geometry_hash,
                         },
+                        "evaluation_geometry_hash": (
+                            record.preflight_evaluation_geometry_hash
+                        ),
                         "protocol": {
                             "functional": record.protocol_functional,
                             "basis": record.protocol_basis,

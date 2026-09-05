@@ -526,7 +526,7 @@ async def test_workflow_maps_spectrum_process_boundaries(
     assert result.status is expected and tool.execution_count == 1
     assert result.payload["spectrum_process"]["status"] == spectrum.status.value
     assert result.payload["cache_hit"] is False
-    assert tuple(result.payload["cache_key"])[-1] == "red-absorption-evaluator:v1"
+    assert tuple(result.payload["cache_key"])[-1] == "red-absorption-evaluator:v2"
 
 
 @pytest.mark.asyncio

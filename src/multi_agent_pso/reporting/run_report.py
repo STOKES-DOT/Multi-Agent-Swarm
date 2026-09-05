@@ -200,7 +200,20 @@ def _spectrum(value: object) -> Mapping[str, object] | None:
     result = _mapping(value)
     if (
         result is None
-        or set(result) != {"status", "states", "provenance", "error"}
+        or not {"status", "states", "provenance", "error"} <= set(result)
+        or set(result)
+        - {
+            "schema_version",
+            "status",
+            "states",
+            "provenance",
+            "evaluated_geometry",
+            "error",
+        }
+        or (
+            "schema_version" in result
+            and result["schema_version"] != "red-absorption:spectrum:v2"
+        )
         or result.get("status") not in {"SUCCESS", "FAILED"}
         or not isinstance(result.get("states"), (list, tuple))
         or not isinstance(result.get("provenance"), Mapping)
@@ -273,7 +286,15 @@ def _spectrum(value: object) -> Mapping[str, object] | None:
     if (
         protocol is None
         or set(provenance)
-        - {"protocol", "geometry_hash", "command_metadata", "backend_metadata"}
+        - {
+            "protocol",
+            "geometry_hash",
+            "source_geometry_hash",
+            "evaluation_geometry_hash",
+            "geometry_optimization",
+            "command_metadata",
+            "backend_metadata",
+        }
         or protocol.get("functional") != "B3LYP"
         or protocol.get("basis") != "STO-3G"
         or protocol.get("excited_state_method") != "TDDFT"
@@ -294,6 +315,17 @@ def _spectrum(value: object) -> Mapping[str, object] | None:
         or protocol.get("oscillator_strength_unit") != "dimensionless"
         or not isinstance(provenance.get("geometry_hash"), str)
         or re.fullmatch(r"[0-9a-f]{64}", provenance["geometry_hash"]) is None
+        or any(
+            value is not None
+            and (
+                not isinstance(value, str)
+                or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            )
+            for value in (
+                provenance.get("source_geometry_hash"),
+                provenance.get("evaluation_geometry_hash"),
+            )
+        )
         or len(indices) != len(set(indices))
         or len(indices) > protocol["n_states"]
         or any(index > protocol["n_states"] for index in indices)

@@ -50,6 +50,19 @@ def test_run_inputs_validate_through_generic_loader(tmp_path: Path) -> None:
     assert loaded.value.spectrum_argv[0] == "/usr/bin/true"
 
 
+def test_dikta_gas_pyscf_input_is_explicit_and_bounded() -> None:
+    path = (
+        Path(__file__).parents[3]
+        / "examples/red_absorption/inputs/dikta-gas-b3lyp-sto3g.yaml"
+    )
+    loaded = load_run_inputs(path, RedAbsorptionRunInputs)
+    assert loaded.value.parent.value == "O=c1c2ccccc2n2c3ccccc3c(=O)c3cccc1c32"
+    assert loaded.value.calculation_protocol.geometry_workflow == "b3lyp_sto3g_optimized"
+    assert loaded.value.calculation_protocol.environment == "gas_phase"
+    assert loaded.value.calculation_protocol.n_states == 20
+    assert loaded.value.evaluation_concurrency == 1
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

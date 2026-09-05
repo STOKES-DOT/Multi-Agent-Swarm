@@ -380,6 +380,7 @@ async def test_verifier_cross_checks_recomputed_record_fields_against_inputs(tmp
         forged["parent_chemical_hash"],
         forged["parent_geometry_hash"],
         forged["preflight_spectrum_hash"],
+        forged["preflight_evaluation_geometry_hash"],
         forged["spectrum_evaluation_status"],
         forged["passed"],
         forged["authentication_method"],

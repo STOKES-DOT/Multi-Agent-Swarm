@@ -20,6 +20,8 @@ from pydantic import (
     model_validator,
 )
 
+from .geometry import EvaluatedGeometry, GeometryOptimizationRecord
+
 
 HC_EV_NM = 1239.841984
 _INT64_MIN = -(2**63)
@@ -203,6 +205,7 @@ class CalculationProtocol(_StrictFrozenModel):
     geometry_workflow: Literal[
         "vertical_from_molecule_editor", "b3lyp_sto3g_optimized"
     ]
+    environment: Literal["gas_phase"] = "gas_phase"
     backend: str
     backend_version: str
     n_states: int = Field(ge=1, le=512)
@@ -271,6 +274,13 @@ class SpectrumError(_StrictFrozenModel):
 class SpectrumProvenance(_StrictFrozenModel):
     protocol: CalculationProtocol
     geometry_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_geometry_hash: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    evaluation_geometry_hash: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    geometry_optimization: GeometryOptimizationRecord | None = None
     command_metadata: Mapping[str, JsonValue] | None = None
     backend_metadata: Mapping[str, JsonValue] | None = None
 
@@ -299,9 +309,13 @@ class SpectrumProvenance(_StrictFrozenModel):
 
 
 class SpectrumResult(_StrictFrozenModel):
+    schema_version: Literal["red-absorption:spectrum:v2"] = (
+        "red-absorption:spectrum:v2"
+    )
     status: Literal["SUCCESS", "FAILED"]
     states: tuple[ExcitedState, ...]
     provenance: SpectrumProvenance
+    evaluated_geometry: EvaluatedGeometry | None = None
     error: SpectrumError | None = None
 
     @field_validator("states", mode="before")
@@ -322,6 +336,32 @@ class SpectrumResult(_StrictFrozenModel):
         if self.status == "SUCCESS":
             if not self.states or self.error is not None:
                 raise ValueError("successful spectra require states and no error")
+            workflow = self.provenance.protocol.geometry_workflow
+            if workflow == "b3lyp_sto3g_optimized":
+                geometry = self.evaluated_geometry
+                optimization = self.provenance.geometry_optimization
+                if (
+                    geometry is None
+                    or self.provenance.source_geometry_hash is None
+                    or self.provenance.evaluation_geometry_hash
+                    != geometry.geometry_hash
+                    or self.provenance.geometry_hash != geometry.geometry_hash
+                    or optimization is None
+                    or optimization.status != "SUCCESS"
+                ):
+                    raise ValueError(
+                        "optimized spectra require validated evaluation geometry"
+                    )
+            elif (
+                self.provenance.source_geometry_hash is not None
+                and self.provenance.source_geometry_hash
+                != self.provenance.geometry_hash
+            ) or (
+                self.provenance.evaluation_geometry_hash is not None
+                and self.provenance.evaluation_geometry_hash
+                != self.provenance.geometry_hash
+            ):
+                raise ValueError("vertical spectrum geometry hashes must match")
         elif self.states or self.error is None:
             raise ValueError("failed spectra require no states and a structured error")
         return self

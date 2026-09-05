@@ -8,6 +8,12 @@ conda run -n multi-agent-pso python -m pip install -e '.[dev]'
 conda run -n multi-agent-pso pytest -q
 ```
 
+本地 PySCF 量化后端另外需要固定的 quantum extra：
+
+```bash
+conda run -n multi-agent-pso python -m pip install -e '.[dev,quantum]'
+```
+
 > 状态：Stage A 通用 core 已实现；Stage B 已加入带显式 preflight/预算确认的本地 red-absorption 集成。
 > 默认测试与 benchmark 仍不执行 Codex、MoleculeEditor 或量化计算；这些生产集成只有在提供真实 run-input、通过 preflight 并显式确认最大新 evaluation 数后才会启动。
 
@@ -39,6 +45,12 @@ v1 固定为 5 particles × 5 iterations，因此搜索阶段最多新增 25 次
 evaluation；preflight 的一次计算单独记录，不占这 25 次。run-input 必须显式提供母体、
 backend/version，以及 `vertical_from_molecule_editor` 或
 `b3lyp_sto3g_optimized` geometry workflow，不存在隐式默认母体或计算后端。
+
+首个已验证输入为
+[`examples/red_absorption/inputs/dikta-gas-b3lyp-sto3g.yaml`](examples/red_absorption/inputs/dikta-gas-b3lyp-sto3g.yaml)。
+它使用 34 原子的 DiKTa、气相 B3LYP/STO-3G 基态优化和 20-root
+TD-B3LYP/STO-3G。PySCF backend 在优化后重新计算 geometry hash；
+`frequency_check=not_performed`，因此不能把结果描述为经过频率确认的极小值。
 
 本提交只运行 deterministic/non-live tests；未运行真实 Codex、MoleculeEditor、
 spectrum command 或 5×5 搜索。真实 preflight 仍需用户提供输入并显式执行上述命令。

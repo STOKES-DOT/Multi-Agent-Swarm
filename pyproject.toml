@@ -21,6 +21,7 @@ dev = [
 ]
 codex = ["openai-codex>=0.147"]
 molecule = ["networkx>=3.0"]
+quantum = ["pyscf==2.9.0", "geometric==1.1.1"]
 
 [project.scripts]
 multi-agent-pso = "multi_agent_pso.cli:main"

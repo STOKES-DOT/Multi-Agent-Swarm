@@ -13,6 +13,11 @@ from examples.red_absorption.models import (
     SpectrumProvenance,
     SpectrumResult,
 )
+from examples.red_absorption.geometry import (
+    EvaluatedGeometry,
+    GeometryAtom,
+    GeometryOptimizationRecord,
+)
 
 
 HASH = "a" * 64
@@ -47,6 +52,76 @@ def provenance(**updates: object) -> SpectrumProvenance:
     values = {"protocol": protocol(), "geometry_hash": HASH}
     values.update(updates)
     return SpectrumProvenance(**values)
+
+
+def evaluated_geometry() -> EvaluatedGeometry:
+    return EvaluatedGeometry(
+        coordinate_order=("a0001",),
+        coordinates=(
+            GeometryAtom(
+                atom_id="a0001",
+                atomic_number=6,
+                x_angstrom=0.0,
+                y_angstrom=0.0,
+                z_angstrom=0.0,
+            ),
+        ),
+        charge=0,
+        multiplicity=1,
+    )
+
+
+def optimization() -> GeometryOptimizationRecord:
+    return GeometryOptimizationRecord(
+        status="SUCCESS",
+        backend="pyscf-geometric",
+        backend_version="pyscf-2.9.0+geometric-1.1.1",
+        functional="B3LYP",
+        basis="STO-3G",
+        environment="gas_phase",
+        initial_energy_hartree=-10.0,
+        final_energy_hartree=-10.1,
+        optimization_steps=2,
+        convergence_energy_hartree=1.0e-6,
+        convergence_grms_hartree_per_bohr=3.0e-4,
+        convergence_gmax_hartree_per_bohr=4.5e-4,
+        convergence_drms_angstrom=1.2e-3,
+        convergence_dmax_angstrom=1.8e-3,
+        final_gradient_rms_hartree_per_bohr=1.0e-5,
+        final_gradient_max_hartree_per_bohr=2.0e-5,
+        frequency_check="not_performed",
+    )
+
+
+def test_optimized_success_requires_recomputable_evaluation_geometry() -> None:
+    geometry = evaluated_geometry()
+    optimized_protocol = protocol(geometry_workflow="b3lyp_sto3g_optimized")
+    result = SpectrumResult(
+        status="SUCCESS",
+        states=(state(),),
+        evaluated_geometry=geometry,
+        provenance=SpectrumProvenance(
+            protocol=optimized_protocol,
+            geometry_hash=geometry.geometry_hash,
+            source_geometry_hash="b" * 64,
+            evaluation_geometry_hash=geometry.geometry_hash,
+            geometry_optimization=optimization(),
+        ),
+    )
+    assert result.provenance.source_geometry_hash == "b" * 64
+    assert result.provenance.evaluation_geometry_hash == geometry.geometry_hash
+    with pytest.raises(ValidationError, match="geometry"):
+        SpectrumResult(
+            status="SUCCESS",
+            states=(state(),),
+            provenance=SpectrumProvenance(
+                protocol=optimized_protocol,
+                geometry_hash="c" * 64,
+                source_geometry_hash="b" * 64,
+                evaluation_geometry_hash="c" * 64,
+                geometry_optimization=optimization(),
+            ),
+        )
 
 
 @pytest.mark.parametrize(

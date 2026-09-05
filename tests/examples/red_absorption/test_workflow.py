@@ -10,8 +10,14 @@ import pytest
 from examples.red_absorption.workflow import (
     RedAbsorptionWorkflowResources,
     RedAbsorptionWorkflowToolProvider,
+    _spectrum_matches_source_geometry,
     _violates_protection_policy,
 )
+from tests.examples.red_absorption.test_pyscf_backend import (
+    FakeEngine,
+    request as optimized_request,
+)
+from examples.red_absorption.backends.pyscf_spectrum import run_calculation
 from multi_agent_pso.resources import DurableBudgetLedger
 from multi_agent_pso.tools import JsonCommandProvider, JsonCommandStatus
 from tests.fixtures.red_absorption import load_valid_inputs
@@ -115,6 +121,13 @@ class ControlledCloseSpectrum(DelayedSpectrum):
         await self.release.wait()
         if self.fail_first and self.close_calls == 1:
             raise RuntimeError("close failed")
+
+
+def test_optimized_spectrum_matches_source_hash_not_evaluation_hash() -> None:
+    result = run_calculation(optimized_request(), engine=FakeEngine())
+    assert result.provenance.geometry_hash != "a" * 64
+    assert _spectrum_matches_source_geometry(result, "a" * 64)
+    assert not _spectrum_matches_source_geometry(result, "b" * 64)
 
 
 def inputs_with_concurrency(tmp_path, value: int):

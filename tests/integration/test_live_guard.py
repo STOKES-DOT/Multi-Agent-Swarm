@@ -288,6 +288,7 @@ def test_preflight_cli_invokes_preflight_once_and_prints_sanitized_summary(
             parent_state_hash="b" * 64,
             parent_chemical_hash="c" * 64,
             parent_geometry_hash="d" * 64,
+            preflight_evaluation_geometry_hash="e" * 64,
             protocol_functional="B3LYP",
             protocol_basis="STO-3G",
             protocol_method="TDDFT",

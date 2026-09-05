@@ -1,6 +1,6 @@
 # PySCF Red-Absorption Backend Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Add a local PySCF + geomeTRIC backend that optimizes gas-phase B3LYP/STO-3G geometries and computes 20 singlet TD-B3LYP/STO-3G roots with validated dual-geometry provenance.
 
@@ -20,7 +20,7 @@
 - Test: `tests/examples/red_absorption/test_geometry_contract.py`
 - Test: `tests/examples/red_absorption/test_spectrum_contract.py`
 
-- [ ] **Step 1: Write failing contract tests**
+- [x] **Step 1: Write failing contract tests**
 
 ```python
 def test_geometry_hash_is_atom_ordered_and_normalizes_negative_zero():
@@ -38,12 +38,12 @@ def test_optimized_spectrum_requires_source_and_evaluation_geometry():
                        provenance=optimized_provenance_without_geometry())
 ```
 
-- [ ] **Step 2: Run RED tests**
+- [x] **Step 2: Run RED tests**
 
 Run: `pytest -q tests/examples/red_absorption/test_geometry_contract.py tests/examples/red_absorption/test_spectrum_contract.py`
 Expected: fail because geometry v2 models do not exist.
 
-- [ ] **Step 3: Implement bounded geometry models**
+- [x] **Step 3: Implement bounded geometry models**
 
 ```python
 class GeometryAtom(_StrictFrozenModel):
@@ -75,12 +75,12 @@ class GeometryOptimizationRecord(_StrictFrozenModel):
 
 Use fixed `1e-8 Å` Decimal quantization, normalize negative zero, validate finite coordinates, unique exact coordinate order, and cap geometry at 256 atoms. Upgrade `SpectrumProvenance` to `source_geometry_hash` plus `evaluation_geometry_hash`; accept legacy `geometry_hash` only as validation input for vertical fixtures. Require the complete evaluated geometry and successful optimization record for `b3lyp_sto3g_optimized` success.
 
-- [ ] **Step 4: Pin compatible packages after import probe**
+- [x] **Step 4: Pin compatible packages after import probe**
 
-Run: `python -m pip install pyscf==2.14.0 geometric==1.1.1`
+Run: `python -m pip install pyscf==2.9.0 geometric==1.1.1`
 Record the same exact pins in `pyproject.toml` optional group `quantum` and the pip subsection of `environment.yml`; rerun imports with the conda interpreter.
 
-- [ ] **Step 5: Run GREEN tests and commit**
+- [x] **Step 5: Run GREEN tests and commit**
 
 Run: `pytest -q tests/examples/red_absorption/test_geometry_contract.py tests/examples/red_absorption/test_spectrum_contract.py`
 Expected: pass.
@@ -94,7 +94,7 @@ Commit: `feat: add optimized geometry spectrum contracts`
 - Create: `examples/red_absorption/backends/pyscf_spectrum.py`
 - Test: `tests/examples/red_absorption/test_pyscf_backend.py`
 
-- [ ] **Step 1: Write failing fake-engine tests**
+- [x] **Step 1: Write failing fake-engine tests**
 
 ```python
 def test_backend_optimizes_before_tddft_and_preserves_atom_ids(fake_engine):
@@ -113,12 +113,12 @@ def test_backend_failures_are_structured_not_rewards(fake_engine, failure):
     }
 ```
 
-- [ ] **Step 2: Run RED tests**
+- [x] **Step 2: Run RED tests**
 
 Run: `pytest -q tests/examples/red_absorption/test_pyscf_backend.py`
 Expected: fail because backend package is missing.
 
-- [ ] **Step 3: Implement strict stdin/stdout CLI and PySCF engine**
+- [x] **Step 3: Implement strict stdin/stdout CLI and PySCF engine**
 
 ```python
 def run_calculation(request: BackendRequest, engine: QuantumEngine | None = None) -> SpectrumResult:
@@ -141,7 +141,7 @@ def run_calculation(request: BackendRequest, engine: QuantumEngine | None = None
 
 Use `RKS.xc="B3LYP"`, STO-3G, grid level 3, `conv_tol=1e-9`, 100 SCF cycles, geomeTRIC explicit convergence thresholds/maxsteps, one thread, 4096 MB, 20 singlet TDDFT roots, and length-gauge oscillator strengths. Stdout contains only canonical JSON.
 
-- [ ] **Step 4: Run GREEN tests and commit**
+- [x] **Step 4: Run GREEN tests and commit**
 
 Run: `pytest -q tests/examples/red_absorption/test_pyscf_backend.py`
 Expected: pass without performing real quantum calculations.
@@ -160,7 +160,7 @@ Commit: `feat: add PySCF absorption backend`
 - Test: `tests/examples/red_absorption/test_preflight.py`
 - Test: `tests/reporting/test_run_report.py`
 
-- [ ] **Step 1: Write failing optimized-workflow tests**
+- [x] **Step 1: Write failing optimized-workflow tests**
 
 ```python
 def test_optimized_workflow_accepts_source_hash_but_scores_evaluation_hash():
@@ -173,16 +173,16 @@ def test_optimized_workflow_rejects_source_or_recomputed_geometry_mismatch():
     assert execute_with_forged_optimized_geometry().status is ToolStatus.FAILED
 ```
 
-- [ ] **Step 2: Run RED tests**
+- [x] **Step 2: Run RED tests**
 
 Run: `pytest -q tests/examples/red_absorption/test_workflow.py tests/examples/red_absorption/test_preflight.py tests/reporting/test_run_report.py`
 Expected: fail on v1 single-geometry assumptions.
 
-- [ ] **Step 3: Update validation, cache and reports**
+- [x] **Step 3: Update validation, cache and reports**
 
 For vertical workflow require source and evaluation hashes equal. For optimized workflow require source hash equal MoleculeEditor payload, recompute evaluated geometry hash, and bind evaluation hash into Evaluation/report. Keep request cache key on source geometry plus protocol plus evaluator v2. Bump `EVALUATOR_VERSION` to `red-absorption-evaluator:v2` so v1 cache cannot replay.
 
-- [ ] **Step 4: Run GREEN tests and commit**
+- [x] **Step 4: Run GREEN tests and commit**
 
 Run: `pytest -q tests/examples/red_absorption/test_workflow.py tests/examples/red_absorption/test_preflight.py tests/reporting/test_run_report.py`
 Expected: pass.
@@ -196,7 +196,7 @@ Commit: `feat: validate optimized absorption provenance`
 - Create: `tests/live/test_pyscf_spectrum.py`
 - Modify: `README.md`
 
-- [ ] **Step 1: Add exact DiKTa run input**
+- [x] **Step 1: Add exact DiKTa run input**
 
 ```yaml
 parent:
@@ -210,7 +210,7 @@ calculation_protocol:
   geometry_workflow: b3lyp_sto3g_optimized
   environment: gas_phase
   backend: pyscf-geometric
-  backend_version: pyscf-2.14.0+geometric-1.1.1
+  backend_version: pyscf-2.9.0+geometric-1.1.1
   n_states: 20
 spectrum_argv:
   - /opt/anaconda3/envs/multi-agent-pso/bin/python
@@ -219,7 +219,7 @@ spectrum_timeout_seconds: 3600
 evaluation_concurrency: 1
 ```
 
-- [ ] **Step 2: Add ethylene live smoke**
+- [x] **Step 2: Add ethylene live smoke**
 
 ```python
 @pytest.mark.live
@@ -232,11 +232,11 @@ def test_pyscf_ethylene_optimized_tddft_contract():
     assert len(result.states) == 20
 ```
 
-- [ ] **Step 3: Run gates**
+- [x] **Step 3: Run gates**
 
 Run focused non-live tests, then `pytest -q`, `python -m compileall -q src examples`, `python -m pip check`, and `git diff --check`. Run only `tests/live/test_pyscf_spectrum.py`; do not run DiKTa preflight or 5 × 5.
 
-- [ ] **Step 4: Document and commit**
+- [x] **Step 4: Document and commit**
 
 Document exact dependencies, command, hardware/backend, elapsed time, and the fact that no frequency analysis or real DiKTa search was run.
 

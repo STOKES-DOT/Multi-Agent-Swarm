@@ -43,6 +43,10 @@ from multi_agent_pso.tools import MOLECULE_EDITOR_SCRIPT
 from .evaluator import RedAbsorptionEvaluator
 from .inputs import RedAbsorptionRunInputs
 from .models import SpectrumResult
+from .workflow import (
+    _evaluated_geometry_from_payload,
+    _spectrum_matches_source_geometry,
+)
 
 
 _HASH = re.compile(r"^[0-9a-f]{64}$")
@@ -257,6 +261,7 @@ def _contract_identity(
     parent_chemical_hash: str,
     parent_geometry_hash: str,
     spectrum_hash: str,
+    evaluation_geometry_hash: str,
     evaluation_status: str,
     passed: bool,
     authentication_method: str,
@@ -271,6 +276,7 @@ def _contract_identity(
                 "parent_chemical_hash": parent_chemical_hash,
                 "parent_geometry_hash": parent_geometry_hash,
                 "preflight_spectrum_hash": spectrum_hash,
+                "preflight_evaluation_geometry_hash": evaluation_geometry_hash,
                 "spectrum_evaluation_status": evaluation_status,
                 "passed": passed,
                 "authentication_method": authentication_method,
@@ -310,6 +316,7 @@ class PreflightRecord(BaseModel):
     spectrum_timeout_seconds: float
     evaluation_concurrency: int
     preflight_spectrum_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    preflight_evaluation_geometry_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     spectrum_evaluation_status: str
     max_new_evaluations: int = Field(ge=1)
     passed: bool
@@ -370,6 +377,7 @@ class PreflightRecord(BaseModel):
             self.parent_chemical_hash,
             self.parent_geometry_hash,
             self.preflight_spectrum_hash,
+            self.preflight_evaluation_geometry_hash,
             self.spectrum_evaluation_status,
             self.passed,
             self.authentication_method,
@@ -810,28 +818,44 @@ async def preflight_red_absorption(
         geometry_hash = inspection.payload["geometry_hash"]
         if not all(isinstance(value, str) and _HASH.fullmatch(value) for value in (state_hash, chemical_hash, geometry_hash)):
             raise ValueError("preflight parent hashes are invalid")
+        protocol = inputs.calculation_protocol
+        command_payload = {
+            "candidate": inspection.payload,
+            "chemical_identity_hash": chemical_hash,
+            "state_hash": state_hash,
+            "geometry_hash": geometry_hash,
+            "protocol": protocol.model_dump(mode="json"),
+        }
+        if protocol.geometry_workflow == "b3lyp_sto3g_optimized":
+            source_geometry = _evaluated_geometry_from_payload(
+                inspection.payload,
+                charge=protocol.charge,
+                multiplicity=protocol.multiplicity,
+            )
+            command_payload.update(
+                {
+                    "source_geometry": source_geometry.model_dump(mode="json"),
+                    "source_geometry_hash": geometry_hash,
+                }
+            )
         command = await spectrum.execute_json(
-            {
-                "candidate": inspection.payload,
-                "chemical_identity_hash": chemical_hash,
-                "state_hash": state_hash,
-                "geometry_hash": geometry_hash,
-                "protocol": inputs.calculation_protocol.model_dump(mode="json"),
-            },
+            command_payload,
             cwd=runs_dir.parent.resolve(),
             timeout_seconds=inputs.spectrum_timeout_seconds,
         )
         if getattr(getattr(command, "status", None), "value", None) != "SUCCESS" or not isinstance(getattr(command, "stdout_text", None), str):
             raise ValueError("preflight spectrum command failed")
         result = SpectrumResult.model_validate_json(command.stdout_text)
-        if result.provenance.protocol != inputs.calculation_protocol or result.provenance.geometry_hash != geometry_hash:
+        if (
+            result.provenance.protocol != inputs.calculation_protocol
+            or not _spectrum_matches_source_geometry(result, geometry_hash)
+        ):
             raise ValueError("preflight spectrum provenance mismatch")
         evaluation = RedAbsorptionEvaluator().evaluate_spectrum(result)
         if result.status != "SUCCESS" or evaluation.status.value != "SUCCESS":
             raise ValueError(
                 "preflight requires SUCCESS spectrum and evaluation status"
             )
-        protocol = inputs.calculation_protocol
         backend_metadata = result.provenance.backend_metadata
         hardware = (
             backend_metadata.get("hardware", "not-recorded")
@@ -865,6 +889,7 @@ async def preflight_red_absorption(
             chemical_hash,
             geometry_hash,
             result.spectrum_hash,
+            result.provenance.geometry_hash,
             evaluation.status.value,
             True,
             method,
@@ -896,6 +921,7 @@ async def preflight_red_absorption(
             spectrum_timeout_seconds=inputs.spectrum_timeout_seconds,
             evaluation_concurrency=inputs.evaluation_concurrency,
             preflight_spectrum_hash=result.spectrum_hash,
+            preflight_evaluation_geometry_hash=result.provenance.geometry_hash,
             spectrum_evaluation_status=evaluation.status.value,
             max_new_evaluations=maximum,
             passed=True,

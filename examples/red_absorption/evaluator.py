@@ -10,7 +10,7 @@ from .models import ExcitedState, SpectrumResult
 
 SIGNIFICANT_OSCILLATOR_STRENGTH = 0.05
 RED_BAND_NM = (620.0, 750.0)
-EVALUATOR_VERSION = "red-absorption-evaluator:v1"
+EVALUATOR_VERSION = "red-absorption-evaluator:v2"
 
 
 class RedAbsorptionEvaluator:
@@ -39,6 +39,14 @@ class RedAbsorptionEvaluator:
             "protocol": spectrum.provenance.protocol.model_dump(mode="json"),
             "protocol_hash": spectrum.provenance.protocol.protocol_hash,
             "geometry_hash": spectrum.provenance.geometry_hash,
+            "source_geometry_hash": (
+                spectrum.provenance.source_geometry_hash
+                or spectrum.provenance.geometry_hash
+            ),
+            "evaluation_geometry_hash": (
+                spectrum.provenance.evaluation_geometry_hash
+                or spectrum.provenance.geometry_hash
+            ),
         }
         selected = self._selected_state(spectrum)
         metrics = self._metrics(selected)

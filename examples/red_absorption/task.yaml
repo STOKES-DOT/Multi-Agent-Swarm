@@ -35,7 +35,10 @@ plugins:
     - preflight.py
     - search.py
     - models.py
+    - geometry.py
     - evaluator.py
+    - backends/__init__.py
+    - backends/pyscf_spectrum.py
     - prompts/hypothesize.md
     - prompts/propose_action.md
     - prompts/reflect.md

@@ -589,7 +589,8 @@ class RedAbsorptionTaskAdapter:
         decoded = self.decode_position(target)
         expected_cache_key = (
             candidate_hash,
-            spectrum.provenance.geometry_hash,
+            spectrum.provenance.source_geometry_hash
+            or spectrum.provenance.geometry_hash,
             spectrum.provenance.protocol.protocol_hash,
             EVALUATOR_VERSION,
         )

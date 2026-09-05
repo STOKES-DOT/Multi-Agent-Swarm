@@ -2,6 +2,7 @@
 
 from .adapter import DIMENSION_NAMES, RedAbsorptionTaskAdapter
 from .evaluator import RedAbsorptionEvaluator
+from .geometry import EvaluatedGeometry, GeometryAtom, GeometryOptimizationRecord
 from .inputs import MoleculeEditorGeometryConfig, ParentSource, RedAbsorptionRunInputs
 from .stage_context import RedAbsorptionStageContextProvider
 from .workflow import RedAbsorptionWorkflowResources, RedAbsorptionWorkflowToolProvider
@@ -19,6 +20,9 @@ __all__ = [
     "CalculationProtocol",
     "DIMENSION_NAMES",
     "ExcitedState",
+    "EvaluatedGeometry",
+    "GeometryAtom",
+    "GeometryOptimizationRecord",
     "MoleculeEditorGeometryConfig",
     "ParentSource",
     "PreflightRecord",

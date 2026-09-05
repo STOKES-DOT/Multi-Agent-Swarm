@@ -1,0 +1,25 @@
+parent:
+  kind: smiles
+  value: O=c1c2ccccc2n2c3ccccc3c(=O)c3cccc1c32
+  charge: 0
+  multiplicity: 1
+  protected_atom_ids: []
+  protected_smarts: []
+spectrum_argv:
+  - /opt/anaconda3/envs/multi-agent-pso/bin/python
+  - /Users/jiaoyuan/Documents/GitHub/Multi-Agent-PSO/.worktrees/stage-b-red-absorption/examples/red_absorption/backends/pyscf_spectrum.py
+calculation_protocol:
+  geometry_workflow: b3lyp_sto3g_optimized
+  environment: gas_phase
+  backend: pyscf-geometric
+  backend_version: pyscf-2.9.0+geometric-1.1.1
+  n_states: 20
+  charge: 0
+  multiplicity: 1
+geometry:
+  num_conformers: 4
+  random_seed: 42
+  max_iterations: 200
+  rmsd_threshold_angstrom: 0.2
+spectrum_timeout_seconds: 3600.0
+evaluation_concurrency: 1

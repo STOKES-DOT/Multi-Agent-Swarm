@@ -6,5 +6,8 @@ dependencies:
   - pip>=24
   - networkx>=3
   - rdkit
+  - pip:
+      - pyscf==2.9.0
+      - geometric==1.1.1
 variables:
   PYTHONNOUSERSITE: "1"
