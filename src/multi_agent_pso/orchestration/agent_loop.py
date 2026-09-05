@@ -33,6 +33,7 @@ from multi_agent_pso.protocols import (
     Evaluator,
     ResourceManager,
     RunStore,
+    StageContextProvider,
     StageRequest,
     TaskAdapter,
     ThreadRef,
@@ -282,13 +283,39 @@ class AgentLoop:
         target_position: JsonValue,
         workspace: Path,
         protocol_snapshot_hash: str,
+        stage_context_provider: StageContextProvider | None = None,
     ) -> None:
-        if not all((isinstance(runtime, AgentRuntime), isinstance(task_adapter, TaskAdapter), isinstance(evaluator, Evaluator), isinstance(tool_provider, ToolProvider), isinstance(artifact_store, ArtifactStore), isinstance(resource_manager, ResourceManager), isinstance(run_store, RunStore))):
+        if not all(
+            (
+                isinstance(runtime, AgentRuntime),
+                isinstance(task_adapter, TaskAdapter),
+                isinstance(evaluator, Evaluator),
+                isinstance(tool_provider, ToolProvider),
+                isinstance(artifact_store, ArtifactStore),
+                isinstance(resource_manager, ResourceManager),
+                isinstance(run_store, RunStore),
+            )
+        ):
             raise TypeError("AgentLoop dependencies must implement their protocols")
         if not isinstance(workspace, Path) or not workspace.is_absolute():
             raise ValueError("workspace must be an absolute Path")
-        if not isinstance(protocol_snapshot_hash, str) or len(protocol_snapshot_hash) != 64 or any(character not in "0123456789abcdef" for character in protocol_snapshot_hash):
-            raise ValueError("protocol_snapshot_hash must be a lowercase SHA-256 digest")
+        if (
+            not isinstance(protocol_snapshot_hash, str)
+            or len(protocol_snapshot_hash) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in protocol_snapshot_hash
+            )
+        ):
+            raise ValueError(
+                "protocol_snapshot_hash must be a lowercase SHA-256 digest"
+            )
+        if stage_context_provider is not None and not isinstance(
+            stage_context_provider, StageContextProvider
+        ):
+            raise TypeError(
+                "stage_context_provider must implement StageContextProvider"
+            )
         self._runtime = runtime
         self._adapter = task_adapter
         self._evaluator = evaluator
@@ -299,6 +326,7 @@ class AgentLoop:
         self._target = self._copy_json(target_position)
         self._workspace = workspace
         self._protocol_hash = protocol_snapshot_hash
+        self._stage_context_provider = stage_context_provider
 
     async def run_particle(
         self,
@@ -374,7 +402,9 @@ class AgentLoop:
                 if close_error is not None:
                     if primary_error is None:
                         raise close_error
-                    self._add_secondary(primary_error, "thread close failed", close_error)
+                    self._add_secondary(
+                        primary_error, "thread close failed", close_error
+                    )
 
     async def _run_particle(
         self,
@@ -388,9 +418,7 @@ class AgentLoop:
         resume_events: list[StageEvent],
     ) -> AgentEpisode:
         events = list(resume_events)
-        current_stage = (
-            AgentStage.PENDING if resume is None else resume.next_stage
-        )
+        current_stage = AgentStage.PENDING if resume is None else resume.next_stage
         if current_stage is None:
             raise AssertionError("terminal checkpoints are rebuilt before execution")
         evaluation: Evaluation | None = None
@@ -706,9 +734,7 @@ class AgentLoop:
                     evaluation = await self._evaluator.evaluate(
                         candidate, evaluation_context
                     )
-                evaluation_json = self._copy_json(
-                    evaluation.model_dump(mode="json")
-                )
+                evaluation_json = self._copy_json(evaluation.model_dump(mode="json"))
                 context["evaluation"] = evaluation_json
                 status = episode_status_for_evaluation(evaluation.status)
                 if status is not EpisodeStatus.COMPLETED:
@@ -819,7 +845,9 @@ class AgentLoop:
         except _RecordedStageFailure as error:
             self._clear_stage_boundary(context)
             if error.audit_error is not None:
-                self._add_secondary(error.primary, "stage failure audit failed", error.audit_error)
+                self._add_secondary(
+                    error.primary, "stage failure audit failed", error.audit_error
+                )
                 raise error.primary from error.audit_error
             return await self._finish_episode(
                 owner,
@@ -978,9 +1006,9 @@ class AgentLoop:
                     "checkpoint is not present in the run store"
                 )
             latest = EpisodeCheckpoint.model_validate(latest_json)
-            if self._canonical_json(latest.model_dump(mode="json")) != self._canonical_json(
-                resume.model_dump(mode="json")
-            ):
+            if self._canonical_json(
+                latest.model_dump(mode="json")
+            ) != self._canonical_json(resume.model_dump(mode="json")):
                 raise IncompatibleCheckpointError(
                     "checkpoint is stale or does not match persisted state"
                 )
@@ -1006,8 +1034,7 @@ class AgentLoop:
             event
             for event in events
             if not (
-                event.stage is AgentStage.PENDING
-                and event.event_type == "completed"
+                event.stage is AgentStage.PENDING and event.event_type == "completed"
             )
         ]
         return latest, context_value, episode_events
@@ -1061,9 +1088,7 @@ class AgentLoop:
                 )
             key = (event.stage, event.attempt)
             classification = (
-                "interrupted"
-                if event.event_type == "interrupted"
-                else "resolution"
+                "interrupted" if event.event_type == "interrupted" else "resolution"
             )
             classified = terminals.setdefault(key, {})
             if classification in classified:
@@ -1079,7 +1104,10 @@ class AgentLoop:
             if sequence == checkpoint.terminal_event_sequence:
                 selected = event
             restored.append(event)
-        if selected is None or latest_terminal_sequence != checkpoint.terminal_event_sequence:
+        if (
+            selected is None
+            or latest_terminal_sequence != checkpoint.terminal_event_sequence
+        ):
             raise IncompatibleCheckpointError(
                 "checkpoint does not identify the latest terminal event"
             )
@@ -1116,20 +1144,20 @@ class AgentLoop:
             "protocol_snapshot_hash": self._protocol_hash,
         }
         if any(context.get(key) != value for key, value in required_identity.items()):
-            raise IncompatibleCheckpointError("checkpoint context identity is incompatible")
-        if self._canonical_json(self._require_json(context, "target_position")) != self._canonical_json(
-            self._target
-        ):
+            raise IncompatibleCheckpointError(
+                "checkpoint context identity is incompatible"
+            )
+        if self._canonical_json(
+            self._require_json(context, "target_position")
+        ) != self._canonical_json(self._target):
             raise IncompatibleCheckpointError(
                 "checkpoint target position is incompatible"
             )
         requires_tool_result = any(
-            event.stage is AgentStage.EXECUTING
-            and event.event_type == "completed"
+            event.stage is AgentStage.EXECUTING and event.event_type == "completed"
             for event in events
         ) or any(
-            event.stage is AgentStage.EXECUTING
-            and "tool_result" in event.payload
+            event.stage is AgentStage.EXECUTING and "tool_result" in event.payload
             for event in events
         )
         if checkpoint.next_stage is not None:
@@ -1242,9 +1270,7 @@ class AgentLoop:
                 "stage evidence does not form an ordered completed prefix"
             )
 
-        non_success_finalization = self._is_non_success_finalization(
-            checkpoint, events
-        )
+        non_success_finalization = self._is_non_success_finalization(checkpoint, events)
         if checkpoint.next_stage is not None and not non_success_finalization:
             cursor_index = _STAGE_ORDER.index(checkpoint.next_stage)
             required = set(_STAGE_ORDER[:cursor_index])
@@ -1320,9 +1346,7 @@ class AgentLoop:
                     "checkpoint episode references are incomplete"
                 )
             references = tuple(context[key] for key in reference_keys)
-            final_status = (
-                None if authority is None else authority[1]
-            )
+            final_status = None if authority is None else authority[1]
             completed_episode = final_status is EpisodeStatus.COMPLETED
             if completed_episode and not all(
                 isinstance(value, str) and value for value in references
@@ -1330,9 +1354,7 @@ class AgentLoop:
                 raise IncompatibleCheckpointError(
                     "completed checkpoint episode references are missing"
                 )
-            if not completed_episode and any(
-                value is not None for value in references
-            ):
+            if not completed_episode and any(value is not None for value in references):
                 raise IncompatibleCheckpointError(
                     "non-success checkpoint must not contain best references"
                 )
@@ -1459,8 +1481,7 @@ class AgentLoop:
                 effective_failure = (index, event)
         if effective_failure is None:
             if not any(
-                event.stage is AgentStage.REFLECTING
-                and event.event_type == "completed"
+                event.stage is AgentStage.REFLECTING and event.event_type == "completed"
                 for event in business_events
             ):
                 raise IncompatibleCheckpointError(
@@ -1545,9 +1566,7 @@ class AgentLoop:
             and checkpoint.next_stage is AgentStage.COMPLETED
         ):
             return False
-        primary_status, _, _ = self._derive_terminal_authority(
-            checkpoint, events
-        )
+        primary_status, _, _ = self._derive_terminal_authority(checkpoint, events)
         return primary_status is not EpisodeStatus.COMPLETED
 
     def _matches_terminal_default(
@@ -1621,9 +1640,7 @@ class AgentLoop:
                 "terminal checkpoint contains invalid episode state"
             ) from error
 
-    def _terminal_fields_from_context(
-        self, context: Mapping[str, JsonValue]
-    ) -> tuple[
+    def _terminal_fields_from_context(self, context: Mapping[str, JsonValue]) -> tuple[
         EpisodeStatus,
         Evaluation | None,
         JsonValue,
@@ -1654,7 +1671,10 @@ class AgentLoop:
                     "evaluation_reference",
                 )
             )
-            if any(value is not None and not isinstance(value, str) for value in raw_references):
+            if any(
+                value is not None and not isinstance(value, str)
+                for value in raw_references
+            ):
                 raise TypeError("episode references must be strings or null")
             references = raw_references
         except (KeyError, TypeError, ValueError) as error:
@@ -1671,9 +1691,7 @@ class AgentLoop:
             references,  # type: ignore[return-value]
         )
 
-    def _tool_result_from_context(
-        self, context: Mapping[str, JsonValue]
-    ) -> ToolResult:
+    def _tool_result_from_context(self, context: Mapping[str, JsonValue]) -> ToolResult:
         try:
             value = self._require_mapping(context, "tool_result")
             artifacts = value["artifacts"]
@@ -1690,9 +1708,7 @@ class AgentLoop:
                 "checkpoint tool result is invalid"
             ) from error
 
-    def _candidate_from_context(
-        self, context: Mapping[str, JsonValue]
-    ) -> CandidateRef:
+    def _candidate_from_context(self, context: Mapping[str, JsonValue]) -> CandidateRef:
         try:
             value = self._require_mapping(context, "candidate")
             artifacts = value["artifacts"]
@@ -1709,9 +1725,7 @@ class AgentLoop:
                 "checkpoint candidate is invalid"
             ) from error
 
-    def _evaluation_from_context(
-        self, context: Mapping[str, JsonValue]
-    ) -> Evaluation:
+    def _evaluation_from_context(self, context: Mapping[str, JsonValue]) -> Evaluation:
         try:
             return Evaluation.model_validate(context["evaluation"])
         except (KeyError, TypeError, ValueError) as error:
@@ -1729,9 +1743,7 @@ class AgentLoop:
             raise IncompatibleCheckpointError(
                 "runtime restored an invalid thread reference"
             )
-        expected = self._hydrate_checkpoint_thread(
-            checkpoint.thread_json, particle_id
-        )
+        expected = self._hydrate_checkpoint_thread(checkpoint.thread_json, particle_id)
         if thread == expected:
             return
         provider_replacement = (
@@ -1747,9 +1759,7 @@ class AgentLoop:
                 "runtime restored a mismatched thread reference"
             )
 
-    def _hydrate_checkpoint_thread(
-        self, value: object, particle_id: str
-    ) -> ThreadRef:
+    def _hydrate_checkpoint_thread(self, value: object, particle_id: str) -> ThreadRef:
         if not isinstance(value, Mapping):
             raise IncompatibleCheckpointError("checkpoint thread identity is invalid")
         expected_keys = {
@@ -1784,13 +1794,9 @@ class AgentLoop:
             )
         return thread
 
-    def _require_json(
-        self, context: Mapping[str, JsonValue], key: str
-    ) -> JsonValue:
+    def _require_json(self, context: Mapping[str, JsonValue], key: str) -> JsonValue:
         if key not in context:
-            raise IncompatibleCheckpointError(
-                f"checkpoint context is missing {key}"
-            )
+            raise IncompatibleCheckpointError(f"checkpoint context is missing {key}")
         return self._copy_json(context[key])
 
     def _require_mapping(
@@ -1910,7 +1916,9 @@ class AgentLoop:
                     status,
                 )
             except BaseException as audit_error:
-                self._add_secondary(close_error, "interruption audit failed", audit_error)
+                self._add_secondary(
+                    close_error, "interruption audit failed", audit_error
+                )
                 raise close_error from audit_error
             raise close_error
         if close_error is not None and status is EpisodeStatus.COMPLETED:
@@ -1951,20 +1959,31 @@ class AgentLoop:
                 self._add_secondary(close_error, "cleanup audit failed", audit_error)
                 raise close_error from audit_error
             raise
-        if (
-            close_error is not None
-            and not isinstance(close_error, (Exception, asyncio.CancelledError))
+        if close_error is not None and not isinstance(
+            close_error, (Exception, asyncio.CancelledError)
         ):
             raise close_error
         references = (
-            candidate_reference,
-            candidate_hash,
-            hypothesis_reference,
-            evaluation_reference,
-        ) if status is EpisodeStatus.COMPLETED else (None, None, None, None)
+            (
+                candidate_reference,
+                candidate_hash,
+                hypothesis_reference,
+                evaluation_reference,
+            )
+            if status is EpisodeStatus.COMPLETED
+            else (None, None, None, None)
+        )
         return self._terminal_episode(
-            run_id, particle_id, iteration_id, events, status, evaluation,
-            evaluated, realized, adherence, *references,
+            run_id,
+            particle_id,
+            iteration_id,
+            events,
+            status,
+            evaluation,
+            evaluated,
+            realized,
+            adherence,
+            *references,
         )
 
     def _record_finalization_terminal(
@@ -1979,9 +1998,7 @@ class AgentLoop:
         context: Mapping[str, JsonValue],
         episode_status: EpisodeStatus,
     ) -> None:
-        next_stage = (
-            AgentStage.COMPLETED if event_type == "interrupted" else None
-        )
+        next_stage = AgentStage.COMPLETED if event_type == "interrupted" else None
         self._terminal_event(
             run_id,
             particle_id,
@@ -2055,6 +2072,91 @@ class AgentLoop:
                     thread,
                     owner,
                 )
+            if self._stage_context_provider is not None:
+                try:
+                    additions = await self._stage_context_provider.prepare(
+                        stage,
+                        self._copy_json(stage_context),
+                        ToolContext(
+                            str(context["run_id"]),
+                            str(context["particle_id"]),
+                            int(context["iteration_id"]),
+                            stage,
+                            attempt,
+                            self._workspace,
+                        ),
+                    )
+                    if not isinstance(additions, Mapping):
+                        raise TypeError("stage context additions must be a mapping")
+                    additions = self._copy_json(additions)
+                    if not isinstance(additions, Mapping):
+                        raise TypeError("stage context additions must be a mapping")
+                    protected = {
+                        "run_id",
+                        "particle_id",
+                        "iteration_id",
+                        "protocol_snapshot_hash",
+                        "target_position",
+                        "hypothesis",
+                        "proposal",
+                        "tool_request",
+                        "tool_result",
+                        "candidate",
+                        "realized_position",
+                        "evaluated_position",
+                        "adherence",
+                        "evaluation",
+                        "reflection",
+                        _ACTIVE_STAGE_CONTEXT,
+                        _ACTIVE_STAGE_REQUEST,
+                        _ACTIVE_STAGE_ATTEMPT,
+                    }
+                    pending_additions: dict[str, JsonValue] = {}
+                    for key, value in additions.items():
+                        if key in protected:
+                            raise ValueError(
+                                "stage context provider cannot overwrite authority"
+                            )
+                        if key in stage_context:
+                            if self._canonical_json(
+                                stage_context[key]
+                            ) != self._canonical_json(value):
+                                raise ValueError(
+                                    "stage context provider returned conflicting data"
+                                )
+                            continue
+                        pending_additions[key] = value
+                    stage_context.update(pending_additions)
+                    context.update(pending_additions)
+                except asyncio.CancelledError as error:
+                    self._record_cancelled_build(stage, attempt, stage_context, error)
+                    raise
+                except TimeoutError as error:
+                    self._raise_recorded_build_failure(
+                        stage,
+                        attempt,
+                        stage_context,
+                        events,
+                        error,
+                        EpisodeStatus.TIMEOUT,
+                        EvaluationStatus.TIMEOUT,
+                        "timeout",
+                        thread,
+                        owner,
+                    )
+                except Exception as error:
+                    self._raise_recorded_build_failure(
+                        stage,
+                        attempt,
+                        stage_context,
+                        events,
+                        error,
+                        EpisodeStatus.FAILED,
+                        EvaluationStatus.FAILED,
+                        "failed",
+                        thread,
+                        owner,
+                    )
             context[_ACTIVE_STAGE_CONTEXT] = stage_context
             context[_ACTIVE_STAGE_ATTEMPT] = attempt
             try:
@@ -2062,9 +2164,7 @@ class AgentLoop:
                     stage, self._copy_json(stage_context)
                 )
             except asyncio.CancelledError as error:
-                self._record_cancelled_build(
-                    stage, attempt, stage_context, error
-                )
+                self._record_cancelled_build(stage, attempt, stage_context, error)
                 raise
             except TimeoutError as error:
                 self._raise_recorded_build_failure(
@@ -2123,7 +2223,11 @@ class AgentLoop:
                 int(context["iteration_id"]),
                 stage,
                 attempt,
-                {"attempt": attempt, "context": stage_context, "request": request_payload},
+                {
+                    "attempt": attempt,
+                    "context": stage_context,
+                    "request": request_payload,
+                },
             )
             context[_ACTIVE_STAGE_REQUEST] = request_payload
             if not isinstance(request, StageRequest):
@@ -2186,32 +2290,54 @@ class AgentLoop:
                 context["correction"] = diagnostic
                 if attempt == 2:
                     self._terminal_event(
-                        str(context["run_id"]), str(context["particle_id"]),
-                        int(context["iteration_id"]), stage, "invalid", events,
-                        attempt=attempt, payload=diagnostic, context=context,
-                        thread=thread, owner=owner,
-                        next_stage=None, next_attempt=0,
+                        str(context["run_id"]),
+                        str(context["particle_id"]),
+                        int(context["iteration_id"]),
+                        stage,
+                        "invalid",
+                        events,
+                        attempt=attempt,
+                        payload=diagnostic,
+                        context=context,
+                        thread=thread,
+                        owner=owner,
+                        next_stage=None,
+                        next_attempt=0,
                         episode_status=EpisodeStatus.INVALID,
                     )
                     self._clear_stage_boundary(context)
                     return None
                 self._terminal_event(
-                    str(context["run_id"]), str(context["particle_id"]),
-                    int(context["iteration_id"]), stage, "failed", events,
-                    attempt=attempt, payload=diagnostic, context=context,
-                    thread=thread, owner=owner,
-                    next_stage=stage, next_attempt=attempt + 1,
+                    str(context["run_id"]),
+                    str(context["particle_id"]),
+                    int(context["iteration_id"]),
+                    stage,
+                    "failed",
+                    events,
+                    attempt=attempt,
+                    payload=diagnostic,
+                    context=context,
+                    thread=thread,
+                    owner=owner,
+                    next_stage=stage,
+                    next_attempt=attempt + 1,
                 )
                 self._clear_stage_boundary(context)
                 continue
             context.pop("correction", None)
             context[output_key] = parsed
             self._terminal_event(
-                str(context["run_id"]), str(context["particle_id"]),
-                int(context["iteration_id"]), stage, "completed", events,
+                str(context["run_id"]),
+                str(context["particle_id"]),
+                int(context["iteration_id"]),
+                stage,
+                "completed",
+                events,
                 attempt=attempt,
                 payload=completed_payload,
-                context=context, thread=thread, owner=owner,
+                context=context,
+                thread=thread,
+                owner=owner,
                 next_stage=next_stage,
                 next_attempt=0,
             )
@@ -2305,7 +2431,13 @@ class AgentLoop:
             "message": _safe_utf8_text(error, 512),
         }
 
-    async def _execute_tool(self, run_id: str, particle_id: str, iteration_id: int, proposal: Mapping[str, JsonValue]) -> tuple[ToolResult, ToolRequest, bool]:
+    async def _execute_tool(
+        self,
+        run_id: str,
+        particle_id: str,
+        iteration_id: int,
+        proposal: Mapping[str, JsonValue],
+    ) -> tuple[ToolResult, ToolRequest, bool]:
         bounded_proposal = self._copy_json(proposal)
         if not isinstance(bounded_proposal, Mapping):
             raise _JsonBoundaryError(
@@ -2316,13 +2448,51 @@ class AgentLoop:
         if cached is not None:
             self._copy_json(cached.to_json())
             self._verify_tool_result_artifacts(cached)
-            return cached, ToolRequest(self._identity("request", run_id, particle_id, iteration_id, "cached"), "cache", "reuse", {}, key), True
+            return (
+                cached,
+                ToolRequest(
+                    self._identity(
+                        "request", run_id, particle_id, iteration_id, "cached"
+                    ),
+                    "cache",
+                    "reuse",
+                    {},
+                    key,
+                ),
+                True,
+            )
         provider = bounded_proposal.get("provider")
         operation = bounded_proposal.get("operation")
         payload = bounded_proposal.get("tool_payload")
-        if not isinstance(provider, str) or not provider or not isinstance(operation, str) or not operation or not isinstance(payload, Mapping):
-            return ToolResult(ToolStatus.REJECTED, error="invalid tool proposal"), ToolRequest(self._identity("request", run_id, particle_id, iteration_id, "invalid"), "task", "invalid", {}, key), False
-        request = ToolRequest(self._identity("request", run_id, particle_id, iteration_id, provider, operation), provider, operation, payload, key)
+        if (
+            not isinstance(provider, str)
+            or not provider
+            or not isinstance(operation, str)
+            or not operation
+            or not isinstance(payload, Mapping)
+        ):
+            return (
+                ToolResult(ToolStatus.REJECTED, error="invalid tool proposal"),
+                ToolRequest(
+                    self._identity(
+                        "request", run_id, particle_id, iteration_id, "invalid"
+                    ),
+                    "task",
+                    "invalid",
+                    {},
+                    key,
+                ),
+                False,
+            )
+        request = ToolRequest(
+            self._identity(
+                "request", run_id, particle_id, iteration_id, provider, operation
+            ),
+            provider,
+            operation,
+            payload,
+            key,
+        )
         self._copy_json(request.to_json())
         result = await self._tool.execute(
             request,
@@ -2345,8 +2515,16 @@ class AgentLoop:
         for reference in result.artifacts:
             self._artifacts.verify(reference)
 
-    def _context(self, run_id: str, particle_id: str, iteration_id: int) -> Mapping[str, JsonValue]:
-        return {"run_id": run_id, "particle_id": particle_id, "iteration_id": iteration_id, "target_position": self._copy_json(self._target), "protocol_snapshot_hash": self._protocol_hash}
+    def _context(
+        self, run_id: str, particle_id: str, iteration_id: int
+    ) -> Mapping[str, JsonValue]:
+        return {
+            "run_id": run_id,
+            "particle_id": particle_id,
+            "iteration_id": iteration_id,
+            "target_position": self._copy_json(self._target),
+            "protocol_snapshot_hash": self._protocol_hash,
+        }
 
     @staticmethod
     def _copy_json(value: JsonValue) -> JsonValue:
@@ -2406,7 +2584,9 @@ class AgentLoop:
         try:
             self._store.commit_stage_transition(event, checkpoint)
         except Exception as error:
-            raise AuditPersistenceError(stage=stage.value, attempt=attempt, event_type=event_type) from error
+            raise AuditPersistenceError(
+                stage=stage.value, attempt=attempt, event_type=event_type
+            ) from error
         checkpoint_json = checkpoint.model_dump(mode="json")
         checkpoint_context = checkpoint_json["context"]
         if not isinstance(checkpoint_context, dict):
@@ -2617,7 +2797,8 @@ class AgentLoop:
         return {
             key: value
             for key, value in context.items()
-            if key not in {
+            if key
+            not in {
                 _ACTIVE_STAGE_CONTEXT,
                 _ACTIVE_STAGE_REQUEST,
                 _ACTIVE_STAGE_ATTEMPT,
@@ -2625,7 +2806,9 @@ class AgentLoop:
         }
 
     @staticmethod
-    def _add_secondary(primary: BaseException, label: str, secondary: BaseException) -> None:
+    def _add_secondary(
+        primary: BaseException, label: str, secondary: BaseException
+    ) -> None:
         primary.add_note(
             _safe_utf8_text(
                 f"{label}: {type(secondary).__name__}: {_safe_utf8_text(secondary, 512)}",
@@ -2669,7 +2852,9 @@ class AgentLoop:
 
     @staticmethod
     def _identity(domain: str, *parts: object) -> str:
-        encoded = json.dumps([domain, *parts], ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        encoded = json.dumps(
+            [domain, *parts], ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
     @staticmethod

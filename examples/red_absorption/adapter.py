@@ -26,7 +26,6 @@ from multi_agent_pso.core import (
 )
 from multi_agent_pso.protocols import (
     CandidateRef,
-    EvaluationContext,
     StageRequest,
     StageResponse,
     ToolContext,
@@ -35,6 +34,9 @@ from multi_agent_pso.protocols import (
     ToolStatus,
 )
 from multi_agent_pso.tools import validate_commands, validate_source
+
+from .evaluator import EVALUATOR_VERSION, RedAbsorptionEvaluator
+from .models import SpectrumResult
 
 
 DIMENSION_NAMES = (
@@ -263,6 +265,7 @@ class RedAbsorptionTaskAdapter:
             "evidence": allowed,
             "inspection": inspection,
             "graph": inspected_graph,
+            "wiki_query": copied.get("wiki_query"),
         }
         schema["properties"]["authorization_id"] = {
             "type": "string",
@@ -390,6 +393,8 @@ class RedAbsorptionTaskAdapter:
             or not 64 <= query["snippet_max_chars"] <= 8192
         ):
             raise ValueError("WikiQuery rejected")
+        if _plain(query) != _plain(entry["wiki_query"]):
+            raise ValueError("WikiQuery differs from authoritative stage context")
         refs = value["evidence_references"]
         if not isinstance(refs, list):
             raise ValueError("evidence references rejected")
@@ -547,6 +552,10 @@ class RedAbsorptionTaskAdapter:
         state_hash = payload.get("state_hash")
         candidate_hash = payload.get("chemical_identity_hash")
         commands = payload.get("committed_commands")
+        try:
+            spectrum = SpectrumResult.model_validate(payload.get("spectrum_result"))
+        except (TypeError, ValueError) as error:
+            raise ValueError("candidate spectrum_result is invalid") from error
         if (
             not isinstance(state_hash, str)
             or not _HASH.fullmatch(state_hash)
@@ -572,6 +581,19 @@ class RedAbsorptionTaskAdapter:
         inspection = authorized.get("inspected_source_hash")
         authorized_commands = authorized.get("commands")
         decoded = self.decode_position(target)
+        expected_cache_key = (
+            candidate_hash,
+            spectrum.provenance.geometry_hash,
+            spectrum.provenance.protocol.protocol_hash,
+            EVALUATOR_VERSION,
+        )
+        cache_key = payload.get("cache_key")
+        if (
+            not isinstance(cache_key, (list, tuple))
+            or tuple(cache_key) != expected_cache_key
+            or type(payload.get("cache_hit")) is not bool
+        ):
+            raise ValueError("candidate spectrum cache identity is invalid")
         if (
             set(authorized)
             != {
@@ -595,6 +617,9 @@ class RedAbsorptionTaskAdapter:
             "state_hash": state_hash,
             "committed_commands": commands,
             "target_position": target,
+            "spectrum_result": spectrum.model_dump(mode="json"),
+            "cache_key": list(expected_cache_key),
+            "cache_hit": payload["cache_hit"],
         }
         return CandidateRef(state_hash, candidate_hash, result.artifacts, metadata)
 
@@ -700,19 +725,6 @@ class _UnboundToolProvider:
         )
 
 
-class _UnboundEvaluator:
-    async def evaluate(
-        self, candidate: CandidateRef, context: EvaluationContext
-    ) -> Evaluation:
-        return Evaluation(
-            status=EvaluationStatus.FAILED,
-            feasible=False,
-            provenance={
-                "error": "red-absorption evaluator requires validated run inputs"
-            },
-        )
-
-
 def create_position_space() -> ContinuousBoxPositionSpace:
     return ContinuousBoxPositionSpace(np.zeros(8), np.ones(8))
 
@@ -725,8 +737,8 @@ def create_tool_provider() -> _UnboundToolProvider:
     return _UnboundToolProvider()
 
 
-def create_evaluator() -> _UnboundEvaluator:
-    return _UnboundEvaluator()
+def create_evaluator() -> RedAbsorptionEvaluator:
+    return RedAbsorptionEvaluator()
 
 
 __all__ = [

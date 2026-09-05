@@ -6,6 +6,7 @@ from typing import Protocol
 from .agent_runtime import AgentRuntime, StageRequest, StageResponse, ThreadRef, TokenUsage
 from .evaluator import EvaluationContext, Evaluator
 from .resources import ResourceManager, WikiHit, WikiQuery, WikiRetriever
+from .stage_context import StageContextProvider
 from .storage import (
     ArtifactIntegrityError,
     ArtifactStore,
@@ -56,6 +57,7 @@ __all__ = [
     "RunStore",
     "StageRequest",
     "StageResponse",
+    "StageContextProvider",
     "TaskAdapter",
     "ThreadRef",
     "TokenUsage",

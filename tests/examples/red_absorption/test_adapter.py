@@ -11,6 +11,13 @@ from examples.red_absorption.adapter import (
     RedAbsorptionTaskAdapter,
     create_position_space,
 )
+from examples.red_absorption.evaluator import EVALUATOR_VERSION
+from examples.red_absorption.models import (
+    CalculationProtocol,
+    ExcitedState,
+    SpectrumProvenance,
+    SpectrumResult,
+)
 from multi_agent_pso.core import AgentStage, Evaluation, EvaluationStatus
 from multi_agent_pso.protocols import (
     StageResponse,
@@ -23,6 +30,36 @@ from multi_agent_pso.protocols import (
 
 HASH = "a" * 64
 HASH2 = "b" * 64
+GEOMETRY_HASH = "c" * 64
+
+
+def spectrum_fields() -> dict[str, object]:
+    protocol = CalculationProtocol(
+        geometry_workflow="vertical_from_molecule_editor",
+        backend="fixture",
+        backend_version="1",
+        n_states=3,
+        charge=0,
+        multiplicity=1,
+    )
+    state = ExcitedState(
+        state_index=1,
+        energy_ev=1239.841984 / 650,
+        wavelength_nm=650,
+        oscillator_strength=0.2,
+        converged=True,
+    )
+    spectrum = SpectrumResult(
+        status="SUCCESS",
+        states=(state,),
+        provenance=SpectrumProvenance(protocol=protocol, geometry_hash=GEOMETRY_HASH),
+    )
+    key = [HASH2, GEOMETRY_HASH, protocol.protocol_hash, EVALUATOR_VERSION]
+    return {
+        "spectrum_result": spectrum.model_dump(mode="json"),
+        "cache_key": key,
+        "cache_hit": False,
+    }
 
 
 def graph() -> dict[str, object]:
@@ -88,6 +125,12 @@ def context(**updates: object) -> dict[str, object]:
         "iteration_id": 0,
         "protocol_snapshot_hash": HASH,
         "target_position": [0.0] * 8,
+        "wiki_query": {
+            "text": "conjugation red shift",
+            "max_results": 5,
+            "score_threshold": 0.1,
+            "snippet_max_chars": 512,
+        },
         "wiki_hits": [
             {
                 "relative_path": "sources/paper.md",
@@ -272,6 +315,7 @@ def test_candidate_realized_adherence_and_compare() -> None:
         "parent_state_hash": HASH,
         "committed_commands": commands,
     }
+    payload.update(spectrum_fields())
     result = ToolResult(ToolStatus.SUCCESS, payload)
     tool_context = ToolContext(
         "r",
@@ -429,6 +473,7 @@ def test_candidate_uses_authorized_target_and_rejects_self_report() -> None:
         "parent_state_hash": HASH,
         "committed_commands": commands,
     }
+    base.update(spectrum_fields())
     forged = {**base, "target_position": [1] * 8}
     with pytest.raises(ValueError):
         adapter.candidate_from_tool_result(
@@ -520,6 +565,7 @@ def test_adapter_preloads_assets_and_fresh_adapter_resumes_from_proposal(
         "parent_state_hash": HASH,
         "committed_commands": commands,
     }
+    payload.update(spectrum_fields())
     tool_context = ToolContext(
         "r",
         "p0",
@@ -587,6 +633,7 @@ def test_realized_fragment_dimension_uses_transaction_total_heavy_atoms() -> Non
         "parent_state_hash": HASH,
         "committed_commands": commands,
     }
+    payload.update(spectrum_fields())
     candidate = adapter.candidate_from_tool_result(
         ToolResult(ToolStatus.SUCCESS, payload), tool_context
     )

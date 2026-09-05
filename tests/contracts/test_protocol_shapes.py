@@ -33,6 +33,7 @@ from multi_agent_pso.protocols import (
     RunStore,
     StageRequest,
     StageResponse,
+    StageContextProvider,
     TaskAdapter,
     ThreadRef,
     TokenUsage,
@@ -67,14 +68,18 @@ def _protocol_methods(protocol: type[object]) -> set[str]:
     }
 
 
-def _expected_parameters(*names: str) -> tuple[tuple[str, inspect._ParameterKind, object], ...]:
+def _expected_parameters(
+    *names: str,
+) -> tuple[tuple[str, inspect._ParameterKind, object], ...]:
     return tuple(
         (name, inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.empty)
         for name in names
     )
 
 
-def _signature_parameters(callable_: object) -> tuple[tuple[str, inspect._ParameterKind, object], ...]:
+def _signature_parameters(
+    callable_: object,
+) -> tuple[tuple[str, inspect._ParameterKind, object], ...]:
     return tuple(
         (parameter.name, parameter.kind, parameter.default)
         for parameter in inspect.signature(callable_).parameters.values()
@@ -115,6 +120,7 @@ def test_public_protocols_are_runtime_checkable() -> None:
         Evaluator,
         IterationTransaction,
         ResourceManager,
+        StageContextProvider,
         RunStore,
         TaskAdapter,
         ToolProvider,
@@ -134,6 +140,7 @@ def test_protocol_method_names_and_async_boundaries_are_exact() -> None:
     assert _protocol_methods(Evaluator) == {"evaluate"}
     assert _protocol_methods(ToolProvider) == {"execute"}
     assert _protocol_methods(ResourceManager) == {"agent_slot", "evaluation_slot"}
+    assert _protocol_methods(StageContextProvider) == {"prepare"}
     assert _protocol_methods(IterationTransaction) == {
         "put_particle_json",
         "put_pbest_json",
@@ -175,15 +182,35 @@ def test_protocol_method_names_and_async_boundaries_are_exact() -> None:
     assert _protocol_methods(WikiRetriever) == {"search"}
 
     for protocol, methods in (
-        (AgentRuntime, ("start_thread", "restore_thread", "run_stage", "rotate_thread", "close_thread")),
+        (
+            AgentRuntime,
+            (
+                "start_thread",
+                "restore_thread",
+                "run_stage",
+                "rotate_thread",
+                "close_thread",
+            ),
+        ),
         (Evaluator, ("evaluate",)),
         (ToolProvider, ("execute",)),
+        (StageContextProvider, ("prepare",)),
     ):
         for method in methods:
             assert inspect.iscoroutinefunction(getattr(protocol, method))
     for protocol, methods in (
         (ResourceManager, ("agent_slot", "evaluation_slot")),
-        (IterationTransaction, ("put_particle_json", "put_pbest_json", "put_gbest_json", "put_snapshot_json", "commit", "rollback")),
+        (
+            IterationTransaction,
+            (
+                "put_particle_json",
+                "put_pbest_json",
+                "put_gbest_json",
+                "put_snapshot_json",
+                "commit",
+                "rollback",
+            ),
+        ),
         (RunStore, tuple(_protocol_methods(RunStore))),
         (ArtifactStore, ("publish_bytes", "publish_text", "publish_json", "verify")),
         (TaskAdapter, tuple(_protocol_methods(TaskAdapter))),
@@ -198,10 +225,14 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
         async def start_thread(self, particle_id: str, workspace: Path) -> ThreadRef:
             return ThreadRef("thread", particle_id, 0, workspace)
 
-        async def restore_thread(self, particle_id: str, workspace: Path, checkpoint: Mapping[str, JsonValue]) -> ThreadRef:
+        async def restore_thread(
+            self, particle_id: str, workspace: Path, checkpoint: Mapping[str, JsonValue]
+        ) -> ThreadRef:
             return ThreadRef("thread", particle_id, 0, workspace)
 
-        async def run_stage(self, thread: ThreadRef, request: StageRequest) -> StageResponse:
+        async def run_stage(
+            self, thread: ThreadRef, request: StageRequest
+        ) -> StageResponse:
             return StageResponse("{}", TokenUsage(0, 0))
 
         async def rotate_thread(
@@ -223,7 +254,9 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
             )
 
     class ToolFake:
-        async def execute(self, request: ToolRequest, context: ToolContext) -> ToolResult:
+        async def execute(
+            self, request: ToolRequest, context: ToolContext
+        ) -> ToolResult:
             return ToolResult(ToolStatus.SUCCESS, {})
 
     class ResourceFake:
@@ -234,10 +267,14 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
             raise NotImplementedError
 
     class TransactionFake:
-        def put_particle_json(self, particle_id: str, payload: Mapping[str, JsonValue]) -> None:
+        def put_particle_json(
+            self, particle_id: str, payload: Mapping[str, JsonValue]
+        ) -> None:
             return None
 
-        def put_pbest_json(self, particle_id: str, payload: Mapping[str, JsonValue]) -> None:
+        def put_pbest_json(
+            self, particle_id: str, payload: Mapping[str, JsonValue]
+        ) -> None:
             return None
 
         def put_gbest_json(self, payload: Mapping[str, JsonValue]) -> None:
@@ -307,13 +344,19 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
             raise NotImplementedError
 
     class ArtifactStoreFake:
-        def publish_bytes(self, relative_path: str, data: bytes, media_type: str) -> ArtifactRef:
+        def publish_bytes(
+            self, relative_path: str, data: bytes, media_type: str
+        ) -> ArtifactRef:
             return ARTIFACT
 
-        def publish_text(self, relative_path: str, text: str, media_type: str) -> ArtifactRef:
+        def publish_text(
+            self, relative_path: str, text: str, media_type: str
+        ) -> ArtifactRef:
             return ARTIFACT
 
-        def publish_json(self, relative_path: str, payload: Mapping[str, JsonValue]) -> ArtifactRef:
+        def publish_json(
+            self, relative_path: str, payload: Mapping[str, JsonValue]
+        ) -> ArtifactRef:
             return ARTIFACT
 
         def verify(self, reference: ArtifactRef) -> None:
@@ -359,29 +402,79 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
     # runtime_checkable validates member presence only; these explicit checks
     # protect names, kinds, defaults, and resolved hints for implementers.
     contracts: tuple[
-        tuple[type[object], object, Mapping[str, tuple[tuple[str, ...], Mapping[str, object]]]],
+        tuple[
+            type[object],
+            object,
+            Mapping[str, tuple[tuple[str, ...], Mapping[str, object]]],
+        ],
         ...,
     ] = (
         (
             AgentRuntime,
             RuntimeFake(),
             {
-                    "start_thread": (("self", "particle_id", "workspace"), {"particle_id": str, "workspace": Path, "return": ThreadRef}),
-                    "restore_thread": (("self", "particle_id", "workspace", "checkpoint"), {"particle_id": str, "workspace": Path, "checkpoint": Mapping[str, JsonValue], "return": ThreadRef}),
-                "run_stage": (("self", "thread", "request"), {"thread": ThreadRef, "request": StageRequest, "return": StageResponse}),
-                "rotate_thread": (("self", "thread", "checkpoint"), {"thread": ThreadRef, "checkpoint": Mapping[str, JsonValue], "return": ThreadRef}),
-                "close_thread": (("self", "thread"), {"thread": ThreadRef, "return": type(None)}),
+                "start_thread": (
+                    ("self", "particle_id", "workspace"),
+                    {"particle_id": str, "workspace": Path, "return": ThreadRef},
+                ),
+                "restore_thread": (
+                    ("self", "particle_id", "workspace", "checkpoint"),
+                    {
+                        "particle_id": str,
+                        "workspace": Path,
+                        "checkpoint": Mapping[str, JsonValue],
+                        "return": ThreadRef,
+                    },
+                ),
+                "run_stage": (
+                    ("self", "thread", "request"),
+                    {
+                        "thread": ThreadRef,
+                        "request": StageRequest,
+                        "return": StageResponse,
+                    },
+                ),
+                "rotate_thread": (
+                    ("self", "thread", "checkpoint"),
+                    {
+                        "thread": ThreadRef,
+                        "checkpoint": Mapping[str, JsonValue],
+                        "return": ThreadRef,
+                    },
+                ),
+                "close_thread": (
+                    ("self", "thread"),
+                    {"thread": ThreadRef, "return": type(None)},
+                ),
             },
         ),
         (
             Evaluator,
             EvaluatorFake(),
-            {"evaluate": (("self", "candidate", "context"), {"candidate": CandidateRef, "context": EvaluationContext, "return": Evaluation})},
+            {
+                "evaluate": (
+                    ("self", "candidate", "context"),
+                    {
+                        "candidate": CandidateRef,
+                        "context": EvaluationContext,
+                        "return": Evaluation,
+                    },
+                )
+            },
         ),
         (
             ToolProvider,
             ToolFake(),
-            {"execute": (("self", "request", "context"), {"request": ToolRequest, "context": ToolContext, "return": ToolResult})},
+            {
+                "execute": (
+                    ("self", "request", "context"),
+                    {
+                        "request": ToolRequest,
+                        "context": ToolContext,
+                        "return": ToolResult,
+                    },
+                )
+            },
         ),
         (
             ResourceManager,
@@ -395,10 +488,30 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
             IterationTransaction,
             TransactionFake(),
             {
-                "put_particle_json": (("self", "particle_id", "payload"), {"particle_id": str, "payload": Mapping[str, JsonValue], "return": type(None)}),
-                "put_pbest_json": (("self", "particle_id", "payload"), {"particle_id": str, "payload": Mapping[str, JsonValue], "return": type(None)}),
-                "put_gbest_json": (("self", "payload"), {"payload": Mapping[str, JsonValue], "return": type(None)}),
-                "put_snapshot_json": (("self", "payload"), {"payload": Mapping[str, JsonValue], "return": type(None)}),
+                "put_particle_json": (
+                    ("self", "particle_id", "payload"),
+                    {
+                        "particle_id": str,
+                        "payload": Mapping[str, JsonValue],
+                        "return": type(None),
+                    },
+                ),
+                "put_pbest_json": (
+                    ("self", "particle_id", "payload"),
+                    {
+                        "particle_id": str,
+                        "payload": Mapping[str, JsonValue],
+                        "return": type(None),
+                    },
+                ),
+                "put_gbest_json": (
+                    ("self", "payload"),
+                    {"payload": Mapping[str, JsonValue], "return": type(None)},
+                ),
+                "put_snapshot_json": (
+                    ("self", "payload"),
+                    {"payload": Mapping[str, JsonValue], "return": type(None)},
+                ),
                 "commit": (("self",), {"return": type(None)}),
                 "rollback": (("self",), {"return": type(None)}),
             },
@@ -407,40 +520,140 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
             RunStore,
             RunStoreFake(),
             {
-                "create_run": (("self", "run_id", "snapshot_hash"), {"run_id": str, "snapshot_hash": str, "return": type(None)}),
-                "episode_claim": (("self", "run_id", "particle_id", "iteration_id"), {"run_id": str, "particle_id": str, "iteration_id": int, "return": ContextManager[None]}),
-                "get_run_snapshot_hash": (("self", "run_id"), {"run_id": str, "return": str | None}),
-                "append_stage_event": (("self", "event"), {"event": StageEvent, "return": type(None)}),
-                "list_stage_events": (("self", "run_id", "particle_id", "iteration_id"), {"run_id": str, "particle_id": str, "iteration_id": int, "return": tuple[StoredStageEvent, ...]}),
-                "commit_stage_transition": (("self", "event", "checkpoint"), {"event": StageEvent, "checkpoint": EpisodeCheckpoint, "return": type(None)}),
-                "get_latest_stage_checkpoint_json": (("self", "run_id", "particle_id", "iteration_id"), {"run_id": str, "particle_id": str, "iteration_id": int, "return": Mapping[str, JsonValue] | None}),
-                "get_iteration_snapshot_json": (("self", "run_id", "iteration_id"), {"run_id": str, "iteration_id": int, "return": Mapping[str, JsonValue] | None}),
-                "get_latest_committed_snapshot_json": (("self", "run_id"), {"run_id": str, "return": Mapping[str, JsonValue] | None}),
-                "get_committed_tool_result": (("self", "idempotency_key"), {"idempotency_key": str, "return": ToolResult | None}),
-                "record_tool_result": (("self", "idempotency_key", "result"), {"idempotency_key": str, "result": ToolResult, "return": type(None)}),
-                "iteration_transaction": (("self", "run_id", "iteration_id"), {"run_id": str, "iteration_id": int, "return": ContextManager[IterationTransaction]}),
+                "create_run": (
+                    ("self", "run_id", "snapshot_hash"),
+                    {"run_id": str, "snapshot_hash": str, "return": type(None)},
+                ),
+                "episode_claim": (
+                    ("self", "run_id", "particle_id", "iteration_id"),
+                    {
+                        "run_id": str,
+                        "particle_id": str,
+                        "iteration_id": int,
+                        "return": ContextManager[None],
+                    },
+                ),
+                "get_run_snapshot_hash": (
+                    ("self", "run_id"),
+                    {"run_id": str, "return": str | None},
+                ),
+                "append_stage_event": (
+                    ("self", "event"),
+                    {"event": StageEvent, "return": type(None)},
+                ),
+                "list_stage_events": (
+                    ("self", "run_id", "particle_id", "iteration_id"),
+                    {
+                        "run_id": str,
+                        "particle_id": str,
+                        "iteration_id": int,
+                        "return": tuple[StoredStageEvent, ...],
+                    },
+                ),
+                "commit_stage_transition": (
+                    ("self", "event", "checkpoint"),
+                    {
+                        "event": StageEvent,
+                        "checkpoint": EpisodeCheckpoint,
+                        "return": type(None),
+                    },
+                ),
+                "get_latest_stage_checkpoint_json": (
+                    ("self", "run_id", "particle_id", "iteration_id"),
+                    {
+                        "run_id": str,
+                        "particle_id": str,
+                        "iteration_id": int,
+                        "return": Mapping[str, JsonValue] | None,
+                    },
+                ),
+                "get_iteration_snapshot_json": (
+                    ("self", "run_id", "iteration_id"),
+                    {
+                        "run_id": str,
+                        "iteration_id": int,
+                        "return": Mapping[str, JsonValue] | None,
+                    },
+                ),
+                "get_latest_committed_snapshot_json": (
+                    ("self", "run_id"),
+                    {"run_id": str, "return": Mapping[str, JsonValue] | None},
+                ),
+                "get_committed_tool_result": (
+                    ("self", "idempotency_key"),
+                    {"idempotency_key": str, "return": ToolResult | None},
+                ),
+                "record_tool_result": (
+                    ("self", "idempotency_key", "result"),
+                    {
+                        "idempotency_key": str,
+                        "result": ToolResult,
+                        "return": type(None),
+                    },
+                ),
+                "iteration_transaction": (
+                    ("self", "run_id", "iteration_id"),
+                    {
+                        "run_id": str,
+                        "iteration_id": int,
+                        "return": ContextManager[IterationTransaction],
+                    },
+                ),
             },
         ),
         (
             ArtifactStore,
             ArtifactStoreFake(),
             {
-                "publish_bytes": (("self", "relative_path", "data", "media_type"), {"relative_path": str, "data": bytes, "media_type": str, "return": ArtifactRef}),
-                "publish_text": (("self", "relative_path", "text", "media_type"), {"relative_path": str, "text": str, "media_type": str, "return": ArtifactRef}),
-                "publish_json": (("self", "relative_path", "payload"), {"relative_path": str, "payload": Mapping[str, JsonValue], "return": ArtifactRef}),
-                "verify": (("self", "reference"), {"reference": ArtifactRef, "return": type(None)}),
+                "publish_bytes": (
+                    ("self", "relative_path", "data", "media_type"),
+                    {
+                        "relative_path": str,
+                        "data": bytes,
+                        "media_type": str,
+                        "return": ArtifactRef,
+                    },
+                ),
+                "publish_text": (
+                    ("self", "relative_path", "text", "media_type"),
+                    {
+                        "relative_path": str,
+                        "text": str,
+                        "media_type": str,
+                        "return": ArtifactRef,
+                    },
+                ),
+                "publish_json": (
+                    ("self", "relative_path", "payload"),
+                    {
+                        "relative_path": str,
+                        "payload": Mapping[str, JsonValue],
+                        "return": ArtifactRef,
+                    },
+                ),
+                "verify": (
+                    ("self", "reference"),
+                    {"reference": ArtifactRef, "return": type(None)},
+                ),
             },
         ),
         (
             WikiRetriever,
             WikiFake(),
-            {"search": (("self", "query"), {"query": WikiQuery, "return": tuple[WikiHit, ...]})},
+            {
+                "search": (
+                    ("self", "query"),
+                    {"query": WikiQuery, "return": tuple[WikiHit, ...]},
+                )
+            },
         ),
     )
     for protocol, fake, methods in contracts:
         assert isinstance(fake, protocol)
         for method, (parameter_names, expected_hints) in methods.items():
-            _assert_signature_and_hints(getattr(protocol, method), parameter_names, expected_hints)
+            _assert_signature_and_hints(
+                getattr(protocol, method), parameter_names, expected_hints
+            )
             _assert_signature_and_hints(
                 getattr(type(fake), method), parameter_names, expected_hints
             )
@@ -449,12 +662,20 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
     _assert_signature_and_hints(
         TaskAdapter.build_stage_request,
         ("self", "stage", "context"),
-        {"stage": AgentStage, "context": Mapping[str, JsonValue], "return": StageRequest},
+        {
+            "stage": AgentStage,
+            "context": Mapping[str, JsonValue],
+            "return": StageRequest,
+        },
     )
     _assert_signature_and_hints(
         TaskAdapter.parse_stage_response,
         ("self", "stage", "response"),
-        {"stage": AgentStage, "response": StageResponse, "return": Mapping[str, JsonValue]},
+        {
+            "stage": AgentStage,
+            "response": StageResponse,
+            "return": Mapping[str, JsonValue],
+        },
     )
     _assert_signature_and_hints(
         TaskAdapter.candidate_from_tool_result,
@@ -469,12 +690,20 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
     _assert_signature_and_hints(
         TaskAdapter.evaluated_position,
         ("self", "target", "realized"),
-        {"target": position_type, "realized": position_type | None, "return": position_type},
+        {
+            "target": position_type,
+            "realized": position_type | None,
+            "return": position_type,
+        },
     )
     _assert_signature_and_hints(
         TaskAdapter.position_adherence,
         ("self", "target", "realized"),
-        {"target": position_type, "realized": position_type | None, "return": Mapping[str, JsonValue]},
+        {
+            "target": position_type,
+            "realized": position_type | None,
+            "return": Mapping[str, JsonValue],
+        },
     )
     _assert_signature_and_hints(
         TaskAdapter.compare,
@@ -487,14 +716,46 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
         {"best": PersonalBest | None, "return": Mapping[str, JsonValue]},
     )
     adapter_contracts = {
-        "build_stage_request": (("self", "stage", "context"), {"stage": AgentStage, "context": Mapping[str, JsonValue], "return": StageRequest}),
-        "parse_stage_response": (("self", "stage", "response"), {"stage": AgentStage, "response": StageResponse, "return": Mapping[str, JsonValue]}),
-        "candidate_from_tool_result": (("self", "result", "context"), {"result": ToolResult, "context": ToolContext, "return": CandidateRef}),
-        "realized_position": (("self", "candidate"), {"candidate": CandidateRef, "return": str | None}),
-        "evaluated_position": (("self", "target", "realized"), {"target": str, "realized": str | None, "return": str}),
-        "position_adherence": (("self", "target", "realized"), {"target": str, "realized": str | None, "return": Mapping[str, JsonValue]}),
-        "compare": (("self", "left", "right"), {"left": Evaluation, "right": Evaluation, "return": int}),
-        "summarize_best": (("self", "best"), {"best": PersonalBest | None, "return": Mapping[str, JsonValue]}),
+        "build_stage_request": (
+            ("self", "stage", "context"),
+            {
+                "stage": AgentStage,
+                "context": Mapping[str, JsonValue],
+                "return": StageRequest,
+            },
+        ),
+        "parse_stage_response": (
+            ("self", "stage", "response"),
+            {
+                "stage": AgentStage,
+                "response": StageResponse,
+                "return": Mapping[str, JsonValue],
+            },
+        ),
+        "candidate_from_tool_result": (
+            ("self", "result", "context"),
+            {"result": ToolResult, "context": ToolContext, "return": CandidateRef},
+        ),
+        "realized_position": (
+            ("self", "candidate"),
+            {"candidate": CandidateRef, "return": str | None},
+        ),
+        "evaluated_position": (
+            ("self", "target", "realized"),
+            {"target": str, "realized": str | None, "return": str},
+        ),
+        "position_adherence": (
+            ("self", "target", "realized"),
+            {"target": str, "realized": str | None, "return": Mapping[str, JsonValue]},
+        ),
+        "compare": (
+            ("self", "left", "right"),
+            {"left": Evaluation, "right": Evaluation, "return": int},
+        ),
+        "summarize_best": (
+            ("self", "best"),
+            {"best": PersonalBest | None, "return": Mapping[str, JsonValue]},
+        ),
     }
     for method, (parameter_names, expected_hints) in adapter_contracts.items():
         _assert_signature_and_hints(
@@ -504,8 +765,18 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
     assert isinstance(adapter, TaskAdapter)
 
     context = ToolContext("run", "particle", 0, AgentStage.EXECUTING, 0, WORKSPACE)
-    metadata_context = ToolContext("run", "particle", 0, AgentStage.EXECUTING, 0, WORKSPACE, metadata={"proposal":{"provider":"fixture"}})
-    assert metadata_context.to_json()["metadata"] == {"proposal":{"provider":"fixture"}}
+    metadata_context = ToolContext(
+        "run",
+        "particle",
+        0,
+        AgentStage.EXECUTING,
+        0,
+        WORKSPACE,
+        metadata={"proposal": {"provider": "fixture"}},
+    )
+    assert metadata_context.to_json()["metadata"] == {
+        "proposal": {"provider": "fixture"}
+    }
     with pytest.raises(TypeError):
         metadata_context.metadata["proposal"] = {}  # type: ignore[index]
     result = ToolResult(ToolStatus.SUCCESS, {"position": "realized"})
@@ -523,7 +794,9 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
         validate_protocol_implementation(instance, protocol)
 
 
-def test_protocol_implementation_validator_rejects_bad_signatures_and_async_mismatch() -> None:
+def test_protocol_implementation_validator_rejects_bad_signatures_and_async_mismatch() -> (
+    None
+):
     class BadRuntime:
         async def start_thread(self) -> ThreadRef:
             raise NotImplementedError
@@ -554,7 +827,9 @@ def test_protocol_implementation_validator_rejects_bad_signatures_and_async_mism
             validate_protocol_implementation(instance, protocol)
 
 
-def test_protocol_implementation_validator_rejects_noncallable_and_exact_shape_errors() -> None:
+def test_protocol_implementation_validator_rejects_noncallable_and_exact_shape_errors() -> (
+    None
+):
     class NonCallableWikiRetriever:
         search = None
 
@@ -637,24 +912,60 @@ def test_records_are_frozen_deeply_immutable_and_json_serializable() -> None:
         (lambda: ToolRequest("", "provider", "operation", {}, "key"), "request_id"),
         (lambda: ToolRequest("request", "", "operation", {}, "key"), "provider"),
         (lambda: ToolRequest("request", "provider", "", {}, "key"), "operation"),
-        (lambda: ToolRequest("request", "provider", "operation", {}, ""), "idempotency_key"),
+        (
+            lambda: ToolRequest("request", "provider", "operation", {}, ""),
+            "idempotency_key",
+        ),
         (lambda: ToolResult(ToolStatus.FAILED, {}, (), ""), "error"),
-        (lambda: ToolContext("run", "particle", -1, AgentStage.EXECUTING, 0, WORKSPACE), "iteration_id"),
-        (lambda: ToolContext("run", "particle", 0, AgentStage.EXECUTING, -1, WORKSPACE), "attempt"),
-        (lambda: ToolContext("", "particle", 0, AgentStage.EXECUTING, 0, WORKSPACE), "run_id"),
-        (lambda: ToolContext("run", "", 0, AgentStage.EXECUTING, 0, WORKSPACE), "particle_id"),
-        (lambda: ToolContext("run", "particle", 0, AgentStage.EXECUTING, 0, Path("relative")), "workspace"),
+        (
+            lambda: ToolContext(
+                "run", "particle", -1, AgentStage.EXECUTING, 0, WORKSPACE
+            ),
+            "iteration_id",
+        ),
+        (
+            lambda: ToolContext(
+                "run", "particle", 0, AgentStage.EXECUTING, -1, WORKSPACE
+            ),
+            "attempt",
+        ),
+        (
+            lambda: ToolContext("", "particle", 0, AgentStage.EXECUTING, 0, WORKSPACE),
+            "run_id",
+        ),
+        (
+            lambda: ToolContext("run", "", 0, AgentStage.EXECUTING, 0, WORKSPACE),
+            "particle_id",
+        ),
+        (
+            lambda: ToolContext(
+                "run", "particle", 0, AgentStage.EXECUTING, 0, Path("relative")
+            ),
+            "workspace",
+        ),
         (lambda: CandidateRef("", HASH), "reference"),
         (lambda: CandidateRef("candidate", "A" * 64), "candidate_hash"),
-        (lambda: EvaluationContext("run", "particle", -1, WORKSPACE, HASH), "iteration_id"),
-        (lambda: EvaluationContext("run", "particle", 0, WORKSPACE, "g" * 64), "protocol_snapshot_hash"),
+        (
+            lambda: EvaluationContext("run", "particle", -1, WORKSPACE, HASH),
+            "iteration_id",
+        ),
+        (
+            lambda: EvaluationContext("run", "particle", 0, WORKSPACE, "g" * 64),
+            "protocol_snapshot_hash",
+        ),
         (lambda: EvaluationContext("", "particle", 0, WORKSPACE, HASH), "run_id"),
         (lambda: EvaluationContext("run", "", 0, WORKSPACE, HASH), "particle_id"),
-        (lambda: EvaluationContext("run", "particle", 0, Path("relative"), HASH), "workspace"),
+        (
+            lambda: EvaluationContext("run", "particle", 0, Path("relative"), HASH),
+            "workspace",
+        ),
         (lambda: WikiQuery("", 1), "text"),
         (lambda: WikiQuery("   ", 1), "text"),
         (lambda: WikiQuery("x" * (1024 * 1024), 1), "text"),
-        (lambda: WikiQuery(" ".join(f"token{index}" for index in range(300)), 1), "text"),
+        (
+            lambda: WikiQuery(" ".join(f"token{index}" for index in range(300)), 1),
+            "text",
+        ),
         (lambda: WikiQuery("query", 0), "max_results"),
         (lambda: WikiQuery("query", 101), "max_results"),
         (lambda: WikiQuery("query", 1, score_threshold=-0.1), "score_threshold"),
@@ -662,13 +973,24 @@ def test_records_are_frozen_deeply_immutable_and_json_serializable() -> None:
         (lambda: WikiQuery("query", 1, snippet_max_chars=63), "snippet_max_chars"),
         (lambda: WikiQuery("query", 1, snippet_max_chars=8193), "snippet_max_chars"),
         (lambda: WikiHit("", 1, 1, "direct evidence", "content"), "relative_path"),
-        (lambda: WikiHit("/absolute/note.md", 1, 1, "direct evidence", "content"), "relative_path"),
+        (
+            lambda: WikiHit("/absolute/note.md", 1, 1, "direct evidence", "content"),
+            "relative_path",
+        ),
         (lambda: WikiHit("note.md", 0, 1, "direct evidence", "content"), "line_start"),
         (lambda: WikiHit("note.md", 2, 1, "direct evidence", "content"), "line_end"),
         (lambda: WikiHit("note.md", 1, 1, "", "content"), "evidence_layer"),
         (lambda: WikiHit("note.md", 1, 1, "fabricated", "content"), "evidence_layer"),
-        (lambda: WikiHit("note.md", 1, 1, "direct evidence", "content", "../raw/a.pdf"), "linked_raw_path"),
-        (lambda: WikiHit("note.md", 1, 1, "direct evidence", "content", "raw"), "linked_raw_path"),
+        (
+            lambda: WikiHit(
+                "note.md", 1, 1, "direct evidence", "content", "../raw/a.pdf"
+            ),
+            "linked_raw_path",
+        ),
+        (
+            lambda: WikiHit("note.md", 1, 1, "direct evidence", "content", "raw"),
+            "linked_raw_path",
+        ),
     ],
 )
 def test_boundary_records_reject_invalid_values(factory: object, match: str) -> None:
@@ -729,7 +1051,9 @@ def test_json_mapping_fields_reject_tuples_and_scalars(factory: object) -> None:
         lambda: StageResponse("{}", object()),
         lambda: ToolRequest(1, "provider", "operation", {}, "key"),
         lambda: ToolContext("run", "particle", 0, "EXECUTING", 0, WORKSPACE),
-        lambda: ToolContext("run", "particle", True, AgentStage.EXECUTING, 0, WORKSPACE),
+        lambda: ToolContext(
+            "run", "particle", True, AgentStage.EXECUTING, 0, WORKSPACE
+        ),
         lambda: ToolResult("SUCCESS", {}),
         lambda: ToolResult(ToolStatus.SUCCESS, {}, [ARTIFACT]),
         lambda: ToolResult(ToolStatus.SUCCESS, {}, (object(),)),
@@ -760,7 +1084,9 @@ def test_boundary_records_reject_wrong_runtime_types(factory: object) -> None:
         lambda: StageRequest(AgentStage.PENDING, "prompt", {"bad": float("nan")}),
         lambda: ToolResult(ToolStatus.SUCCESS, {"bad": float("nan")}),
         lambda: CandidateRef("candidate", HASH, metadata={"bad": float("nan")}),
-        lambda: EvaluationContext("run", "particle", 0, WORKSPACE, HASH, {"bad": float("nan")}),
+        lambda: EvaluationContext(
+            "run", "particle", 0, WORKSPACE, HASH, {"bad": float("nan")}
+        ),
     ],
 )
 def test_boundary_records_reject_nonfinite_json(factory: object) -> None:

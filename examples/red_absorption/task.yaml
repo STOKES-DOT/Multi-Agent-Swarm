@@ -30,6 +30,7 @@ plugins:
   source_files:
     - __init__.py
     - inputs.py
+    - stage_context.py
     - models.py
     - evaluator.py
     - prompts/hypothesize.md

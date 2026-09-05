@@ -3,16 +3,34 @@
 from __future__ import annotations
 
 from multi_agent_pso.core import ConstraintResult, Evaluation, EvaluationStatus
+from multi_agent_pso.protocols import CandidateRef, EvaluationContext
 
 from .models import ExcitedState, SpectrumResult
 
 
 SIGNIFICANT_OSCILLATOR_STRENGTH = 0.05
 RED_BAND_NM = (620.0, 750.0)
+EVALUATOR_VERSION = "red-absorption-evaluator:v1"
 
 
 class RedAbsorptionEvaluator:
     """Map an externally calculated absorption spectrum to one authoritative reward."""
+
+    async def evaluate(
+        self, candidate: CandidateRef, context: EvaluationContext
+    ) -> Evaluation:
+        try:
+            metadata = candidate.to_json()["metadata"]
+            spectrum = SpectrumResult.model_validate(metadata["spectrum_result"])
+        except (KeyError, TypeError, ValueError) as error:
+            return Evaluation(
+                status=EvaluationStatus.FAILED,
+                feasible=False,
+                provenance={
+                    "error": f"invalid spectrum result: {type(error).__name__}"
+                },
+            )
+        return self.evaluate_spectrum(spectrum)
 
     def evaluate_spectrum(self, spectrum: SpectrumResult) -> Evaluation:
         provenance = {
@@ -37,12 +55,13 @@ class RedAbsorptionEvaluator:
         significant_violation = 0.0
         if selected is None:
             converged_strengths = [
-                state.oscillator_strength for state in spectrum.states if state.converged
+                state.oscillator_strength
+                for state in spectrum.states
+                if state.converged
             ]
             significant_violation = max(
                 0.0,
-                SIGNIFICANT_OSCILLATOR_STRENGTH
-                - max(converged_strengths, default=0.0),
+                SIGNIFICANT_OSCILLATOR_STRENGTH - max(converged_strengths, default=0.0),
             )
         lower, upper = RED_BAND_NM
         in_band = selected is not None and lower <= selected.wavelength_nm <= upper
@@ -70,9 +89,8 @@ class RedAbsorptionEvaluator:
         elif in_band:
             fitness = 1.0 + selected.oscillator_strength
         else:
-            fitness = (
-                -band_violation / 130.0
-                + 0.01 * min(selected.oscillator_strength, 1.0)
+            fitness = -band_violation / 130.0 + 0.01 * min(
+                selected.oscillator_strength, 1.0
             )
         return Evaluation(
             status=EvaluationStatus.SUCCESS,
@@ -113,9 +131,13 @@ class RedAbsorptionEvaluator:
             "oscillator_strength_threshold": SIGNIFICANT_OSCILLATOR_STRENGTH,
             "target_wavelength_band_nm": list(RED_BAND_NM),
             "selected_state": raw,
-            "selected_state_index": selected.state_index if selected is not None else None,
+            "selected_state_index": (
+                selected.state_index if selected is not None else None
+            ),
             "selected_energy_ev": selected.energy_ev if selected is not None else None,
-            "selected_wavelength_nm": selected.wavelength_nm if selected is not None else None,
+            "selected_wavelength_nm": (
+                selected.wavelength_nm if selected is not None else None
+            ),
             "selected_oscillator_strength": (
                 selected.oscillator_strength if selected is not None else None
             ),
@@ -127,6 +149,7 @@ class RedAbsorptionEvaluator:
 
 
 __all__ = [
+    "EVALUATOR_VERSION",
     "RED_BAND_NM",
     "SIGNIFICANT_OSCILLATOR_STRENGTH",
     "RedAbsorptionEvaluator",
