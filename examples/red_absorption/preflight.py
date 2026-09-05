@@ -192,6 +192,41 @@ def _validate_storage_target(runs_dir: Path) -> None:
         os.close(parent_fd)
 
 
+def _prepare_run_store_root(runs_dir: Path) -> Path:
+    absolute = runs_dir.absolute()
+    parent_fd = os.open(
+        absolute.parent,
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        try:
+            os.mkdir(absolute.name, mode=0o700, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except FileExistsError:
+            pass
+        descriptor = os.open(
+            absolute.name,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+                raise ValueError("runs_dir must be an owned directory")
+            os.fchmod(descriptor, 0o700)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_fd)
+    return absolute
+
+
 def _base_contract_identity(
     task_hash: str,
     raw_hash: str,
@@ -595,7 +630,7 @@ async def _default_auth_probe() -> Mapping[str, object]:
         target=_run_owned_auth_probe,
         args=(cancelled, results),
         name="codex-auth-probe",
-        daemon=True,
+        daemon=False,
     )
     with _AUTH_WORKERS_LOCK:
         _AUTH_WORKERS.add(worker)
@@ -884,7 +919,9 @@ async def preflight_red_absorption(
                     )
         if primary is None and cleanup_error is not None:
             raise cleanup_error
-    store = FileArtifactStore(runs_dir / "artifacts")
+    root = _prepare_run_store_root(runs_dir)
+    SQLiteRunStore(root / "runs.sqlite")
+    store = FileArtifactStore(root / "artifacts")
     record_bytes = record.canonical_bytes()
     content_hash = hashlib.sha256(record_bytes).hexdigest()
     path = f"preflight/{content_hash}.json"

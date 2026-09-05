@@ -28,7 +28,7 @@ conda run -n multi-agent-pso multi-agent-pso benchmark rastrigin --runs-dir /pri
 
 Red-absorption 搜索必须先用显式 task 和 run-input 文件完成一次独立
 preflight；preflight 只执行母体 MoleculeEditor inspection 和一次 spectrum
-calculation，不创建 swarm run database：
+calculation；通过后会创建或验证空的 SQLite 基础设施，但不会创建 swarm run row：
 
 ```bash
 multi-agent-pso preflight examples/red_absorption/task.yaml --inputs /absolute/path/red-inputs.yaml --runs-dir /absolute/path/red-run

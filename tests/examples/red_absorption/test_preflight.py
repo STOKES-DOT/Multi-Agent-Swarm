@@ -21,6 +21,7 @@ from examples.red_absorption.preflight import (
 )
 from examples.red_absorption.search import run_red_absorption_search
 from multi_agent_pso.configuration import LoadedRunInputs
+from multi_agent_pso.storage import SQLiteRunStore
 from tests.fixtures.red_absorption import load_valid_inputs
 from tests.integration.test_red_absorption_flow import FakeEditor, parent_graph
 
@@ -124,6 +125,8 @@ def test_auth_spawn_owner_survives_caller_asyncio_run_shutdown(monkeypatch):
     monkeypatch.setattr(preflight_module, "_AUTH_TIMEOUT_SECONDS", 0.01)
     with pytest.raises(TimeoutError, match="probe"):
         preflight_module.asyncio.run(preflight_module._default_auth_probe())
+    with preflight_module._AUTH_WORKERS_LOCK:
+        assert all(not worker.daemon for worker in preflight_module._AUTH_WORKERS)
     time.sleep(0.1)
     assert not spawn_cancelled.is_set()
     with preflight_module._AUTH_WORKERS_LOCK:
@@ -278,7 +281,7 @@ def fake_task():
 
 
 @pytest.mark.asyncio
-async def test_preflight_uses_fake_boundaries_writes_artifact_but_no_run_db(tmp_path):
+async def test_preflight_writes_artifact_and_empty_validated_run_store(tmp_path):
     loaded = fake_loaded_inputs(tmp_path)
     spectrum = FakeSpectrum()
     dependencies = PreflightDependencies(
@@ -320,7 +323,7 @@ async def test_preflight_uses_fake_boundaries_writes_artifact_but_no_run_db(tmp_
         with pytest.raises(ValidationError, match="identity"):
             type(record).model_validate(changed)
     assert spectrum.calls == 1
-    assert not (tmp_path / "runs" / "runs.sqlite").exists()
+    assert SQLiteRunStore(tmp_path / "runs" / "runs.sqlite").list_run_ids() == ()
     artifacts = tuple((tmp_path / "runs" / "artifacts" / "preflight").glob("*.json"))
     assert len(artifacts) == 1
     assert verify_red_absorption_preflight(
@@ -455,6 +458,7 @@ async def test_search_rechecks_current_parent_before_any_run_mutation(tmp_path):
             sdk_version="0.147.0",
         ),
     )
+    before_database = (runs / "runs.sqlite").read_bytes()
     changed_graph = parent_graph()
     changed_graph["state_hash"] = "9" * 64
     editor = ClosingEditor(changed_graph)
@@ -463,7 +467,7 @@ async def test_search_rechecks_current_parent_before_any_run_mutation(tmp_path):
             fake_task(), loaded, record, runs_dir=runs, molecule_editor=editor
         )
     assert editor.calls == 1 and editor.close_calls == 1
-    assert not (runs / "runs.sqlite").exists()
+    assert (runs / "runs.sqlite").read_bytes() == before_database
     assert not (runs / "workspaces").exists()
 
 

@@ -85,6 +85,23 @@ class FailedSpectrum(DelayedSpectrum):
         )
 
 
+class DelayedFailedSpectrum(FailedSpectrum):
+    async def execute_json(self, payload, **kwargs):
+        await asyncio.sleep(0.05)
+        return await super().execute_json(payload, **kwargs)
+
+
+class CancellableSpectrum(DelayedSpectrum):
+    def __init__(self):
+        super().__init__()
+        self.started = asyncio.Event()
+
+    async def execute_json(self, payload, **kwargs):
+        self.calls += 1
+        self.started.set()
+        await asyncio.Event().wait()
+
+
 class ControlledCloseSpectrum(DelayedSpectrum):
     def __init__(self, fail_first: bool = False):
         super().__init__()
@@ -363,6 +380,84 @@ async def test_terminal_spectrum_failure_is_persisted_not_left_pending(tmp_path)
     assert statuses == ["FAILED", "FAILED"]
     assert [spectrum.calls for spectrum in spectra] == [1, 0]
     assert ledger.count("run-1") == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_waiter_observes_terminal_failure_without_full_timeout(tmp_path):
+    inputs = inputs_with_concurrency(tmp_path, 2)
+    ledger = DurableBudgetLedger(tmp_path / "budget.jsonl")
+    spectra = [DelayedFailedSpectrum(), DelayedFailedSpectrum()]
+    resources = [
+        RedAbsorptionWorkflowResources.from_inputs(
+            inputs,
+            max_new_evaluations=25,
+            ledger=ledger,
+            run_id="run-1",
+        )
+        for _ in range(2)
+    ]
+    tools = [
+        RedAbsorptionWorkflowToolProvider.bind(
+            inputs,
+            VariableEditor([], parent_graph()),
+            resources[index],
+            spectrum=spectra[index],
+        )
+        for index in range(2)
+    ]
+    pair = authorized_request_context(
+        [{"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}],
+        tmp_path.resolve(),
+    )
+    results = await asyncio.wait_for(
+        asyncio.gather(*(tool.execute(*pair) for tool in tools)), timeout=1
+    )
+    assert [result.status.value for result in results] == ["FAILED", "FAILED"]
+    assert sum(spectrum.calls for spectrum in spectra) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_spectrum_is_terminal_not_permanent_pending(tmp_path):
+    inputs = inputs_with_concurrency(tmp_path, 1)
+    ledger = DurableBudgetLedger(tmp_path / "budget.jsonl")
+    resources = RedAbsorptionWorkflowResources.from_inputs(
+        inputs,
+        max_new_evaluations=25,
+        ledger=ledger,
+        run_id="run-1",
+    )
+    spectrum = CancellableSpectrum()
+    tool = RedAbsorptionWorkflowToolProvider.bind(
+        inputs,
+        VariableEditor([], parent_graph()),
+        resources,
+        spectrum=spectrum,
+    )
+    pair = authorized_request_context(
+        [{"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}],
+        tmp_path.resolve(),
+    )
+    execution = asyncio.create_task(tool.execute(*pair))
+    await spectrum.started.wait()
+    execution.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+    retry_spectrum = FailedSpectrum()
+    retry = RedAbsorptionWorkflowToolProvider.bind(
+        inputs,
+        VariableEditor([], parent_graph()),
+        RedAbsorptionWorkflowResources.from_inputs(
+            inputs,
+            max_new_evaluations=25,
+            ledger=ledger,
+            run_id="run-1",
+        ),
+        spectrum=retry_spectrum,
+    )
+    result = await asyncio.wait_for(retry.execute(*pair), timeout=1)
+    assert result.status.value == "FAILED"
+    assert retry_spectrum.calls == 0
 
 
 @pytest.mark.asyncio

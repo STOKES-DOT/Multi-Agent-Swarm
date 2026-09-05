@@ -177,6 +177,27 @@ class RedAbsorptionWorkflowResources:
         )
         return failure if isinstance(failure, Mapping) else None
 
+    async def _commit_failure_preserving(
+        self,
+        key: CacheKey,
+        status: str,
+        message: str,
+        primary: BaseException,
+    ) -> None:
+        task = asyncio.create_task(self._commit_failure(key, status, message))
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                primary.add_note(f"evaluation terminal-write cancellation: {error}")
+        try:
+            task.result()
+        except BaseException as error:
+            primary.add_note(
+                "evaluation terminal-write failure: "
+                f"{type(error).__name__}: {error}"
+            )
+
     async def _claim_execution(self, key: CacheKey) -> BudgetClaimStatus:
         async with self._budget_lock:
             if self._ledger is not None:
@@ -191,18 +212,23 @@ class RedAbsorptionWorkflowResources:
             self._execution_count += 1
             return BudgetClaimStatus.RESERVED
 
-    async def _wait_for_recovery(self, key: CacheKey) -> SpectrumResult | None:
+    async def _wait_for_terminal(
+        self, key: CacheKey
+    ) -> tuple[SpectrumResult | None, Mapping[str, object] | None]:
         if self._ledger is None:
-            return None
+            return None, None
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._timeout_seconds
         while True:
             recovered = await self._recover_async(key)
             if recovered is not None:
-                return recovered
+                return recovered, None
+            failure = await self._failure(key)
+            if failure is not None:
+                return None, failure
             remaining = deadline - loop.time()
             if remaining <= 0:
-                return None
+                return None, None
             await asyncio.sleep(min(0.05, remaining))
 
 
@@ -585,7 +611,17 @@ class RedAbsorptionWorkflowToolProvider:
                                 error=str(message),
                             )
                         elif claim is BudgetClaimStatus.PENDING:
-                            spectrum_result = await resources._wait_for_recovery(key)
+                            spectrum_result, failure = (
+                                await resources._wait_for_terminal(key)
+                            )
+                            if failure is not None:
+                                return ToolResult(
+                                    ToolStatus.TIMEOUT
+                                    if failure.get("status") == "TIMEOUT"
+                                    else ToolStatus.FAILED,
+                                    {"cache_key": list(key), "cache_hit": False},
+                                    error=str(failure.get("message", "evaluation failed")),
+                                )
                             if spectrum_result is None:
                                 return ToolResult(
                                     ToolStatus.TIMEOUT,
@@ -615,6 +651,14 @@ class RedAbsorptionWorkflowToolProvider:
                                     cwd=context.workspace,
                                     timeout_seconds=inputs.spectrum_timeout_seconds,
                                 )
+                            except asyncio.CancelledError as cancellation:
+                                await resources._commit_failure_preserving(
+                                    key,
+                                    "FAILED",
+                                    "spectrum command was cancelled",
+                                    cancellation,
+                                )
+                                raise
                             except TimeoutError:
                                 await resources._commit_failure(
                                     key, "TIMEOUT", "spectrum command timed out"

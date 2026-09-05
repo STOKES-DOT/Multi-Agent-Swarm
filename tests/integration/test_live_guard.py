@@ -5,6 +5,7 @@ import pytest
 from types import SimpleNamespace
 
 import multi_agent_pso.cli as cli_module
+import multi_agent_pso.resources as resources_module
 from multi_agent_pso.cli import main
 from multi_agent_pso.resources import (
     AsyncSemaphoreResourceManager,
@@ -122,6 +123,30 @@ def test_durable_budget_ledger_never_reopens_replaced_namespace(tmp_path):
         ledger.count("run")
     assert outside.read_bytes() == b"unchanged"
     ledger.close()
+
+
+def test_durable_budget_ledger_close_attempts_both_fds_and_can_retry(
+    tmp_path, monkeypatch
+):
+    ledger = DurableBudgetLedger(tmp_path / "budget.jsonl")
+    ledger_fd = ledger._fd
+    real_close = resources_module.os.close
+    failed = False
+
+    def flaky_close(descriptor):
+        nonlocal failed
+        if descriptor == ledger_fd and not failed:
+            failed = True
+            raise OSError("injected close failure")
+        real_close(descriptor)
+
+    monkeypatch.setattr(resources_module.os, "close", flaky_close)
+    with pytest.raises(OSError, match="injected"):
+        ledger.close()
+    assert ledger._fd == ledger_fd and ledger._parent_fd is None
+    assert not ledger._closed
+    ledger.close()
+    assert ledger._closed
 
 
 def test_durable_budget_ledger_is_first_wins_and_strict_on_read(tmp_path):

@@ -205,6 +205,7 @@ class DurableBudgetLedger:
             | os.O_NOFOLLOW
             | getattr(os, "O_CLOEXEC", 0)
         )
+        created = False
         try:
             try:
                 descriptor = os.open(
@@ -213,6 +214,7 @@ class DurableBudgetLedger:
                     0o600,
                     dir_fd=parent_fd,
                 )
+                created = True
             except FileExistsError:
                 descriptor = os.open(self._path.name, flags, dir_fd=parent_fd)
             try:
@@ -224,6 +226,8 @@ class DurableBudgetLedger:
                 ):
                     raise ValueError("budget ledger must be an owned regular file")
                 os.fchmod(descriptor, 0o600)
+                if created:
+                    os.fsync(parent_fd)
                 return descriptor, (metadata.st_dev, metadata.st_ino)
             except BaseException:
                 os.close(descriptor)
@@ -511,9 +515,23 @@ class DurableBudgetLedger:
         with self._thread_lock:
             if self._closed:
                 return
-            self._closed = True
-            os.close(self._fd)
-            os.close(self._parent_fd)
+            errors = []
+            for name in ("_fd", "_parent_fd"):
+                descriptor = getattr(self, name, None)
+                if descriptor is None:
+                    continue
+                try:
+                    os.close(descriptor)
+                except BaseException as error:
+                    errors.append(error)
+                else:
+                    setattr(self, name, None)
+            self._closed = self._fd is None and self._parent_fd is None
+            if errors:
+                primary, *secondary = errors
+                for error in secondary:
+                    primary.add_note(f"additional budget ledger close failure: {error!r}")
+                raise primary
 
 
 __all__ = [
