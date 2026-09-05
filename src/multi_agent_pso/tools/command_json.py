@@ -520,8 +520,6 @@ class JsonCommandProvider:
         self._closed = True
         if not self._guardians:
             return
-        for spawn_task in tuple(self._guardians.values()):
-            spawn_task.cancel()
         guardians = tuple(self._guardians)
         done, _ = await asyncio.wait(
             guardians,
@@ -564,7 +562,6 @@ class JsonCommandProvider:
         asyncio.subprocess.Process | _SpawnFailure | None,
         asyncio.CancelledError | None,
     ]:
-        spawn_task.cancel()
         handoff_deadline = time.monotonic() + _SPAWN_HANDOFF_GRACE_SECONDS
         while not spawn_task.done():
             remaining = max(0.0, handoff_deadline - time.monotonic())
@@ -689,7 +686,7 @@ class JsonCommandProvider:
                     )
                 elif isinstance(outcome, _SpawnFailure) and not isinstance(
                     outcome.error,
-                    (Exception, asyncio.CancelledError),
+                    Exception,
                 ):
                     raise outcome.error
             if timeout_cancellation is not None:

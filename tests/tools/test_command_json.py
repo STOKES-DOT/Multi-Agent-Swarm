@@ -41,7 +41,9 @@ def _pid_exists(pid: int) -> bool:
 async def _wait_for_pid(path: Path) -> int:
     for _ in range(200):
         if path.exists():
-            return int(path.read_text(encoding="ascii"))
+            value = path.read_text(encoding="ascii")
+            if value.isdecimal():
+                return int(value)
         await asyncio.sleep(0.005)
     raise AssertionError("child did not publish its pid")
 
@@ -265,8 +267,9 @@ async def test_cancellation_during_spawn_reaps_created_child(
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+    provider = _provider("--sleep", "30", "--ignore-term")
     task = asyncio.create_task(
-        _provider("--sleep", "30", "--ignore-term").execute_json(
+        provider.execute_json(
             {}, cwd=tmp_path.resolve(), timeout_seconds=60
         )
     )
@@ -277,6 +280,7 @@ async def test_cancellation_during_spawn_reaps_created_child(
         with pytest.raises(asyncio.CancelledError) as raised:
             await task
         assert raised.value.args == ("during-spawn",)
+        await _wait_for_pending_count(provider, 0)
         assert children[0].returncode is not None
         assert not _pid_exists(children[0].pid)
     finally:
@@ -301,29 +305,33 @@ async def test_spawn_timeout_waits_for_late_handle_then_reaps_child(
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
-    result = await _provider().execute_json(
+    provider = _provider()
+    result = await provider.execute_json(
         {}, cwd=tmp_path.resolve(), timeout_seconds=0.05
     )
 
     assert result.status is JsonCommandStatus.TIMEOUT
     assert result.elapsed_seconds < 0.5
+    assert provider.pending_cleanup_count == 0
+    assert result.exit_code is not None
     assert children[0].returncode is not None
     assert not _pid_exists(children[0].pid)
 
 
-async def test_spawn_timeout_cancels_responsive_spawn_with_bounded_handoff(
+async def test_spawn_timeout_never_cancels_unreturned_spawn_task(
     tmp_path: Path, monkeypatch
 ) -> None:
     cancellation_observed = False
+    release = asyncio.Event()
 
     async def responsive_spawn(*args, **kwargs):
         nonlocal cancellation_observed
         try:
-            await asyncio.sleep(0.45)
+            await release.wait()
         except asyncio.CancelledError:
             cancellation_observed = True
             raise
-        raise RuntimeError("test release")
+        raise RuntimeError("released after timeout")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", responsive_spawn)
     provider = _provider()
@@ -334,8 +342,10 @@ async def test_spawn_timeout_cancels_responsive_spawn_with_bounded_handoff(
 
     assert result.status is JsonCommandStatus.TIMEOUT
     assert time.monotonic() - started < 0.4
-    assert cancellation_observed is True
-    assert provider.pending_cleanup_count == 0
+    assert cancellation_observed is False
+    assert provider.pending_cleanup_count == 1
+    release.set()
+    await _wait_for_pending_count(provider, 0)
 
 
 async def test_spawn_timeout_hands_ignoring_spawn_to_guardian(
@@ -345,14 +355,17 @@ async def test_spawn_timeout_hands_ignoring_spawn_to_guardian(
     release = asyncio.Event()
     child_ready = asyncio.Event()
     children = []
+    cancellation_observed = False
 
     async def ignoring_spawn(*args, **kwargs):
+        nonlocal cancellation_observed
         process = await original_spawn(*args, **kwargs)
         children.append(process)
         child_ready.set()
         try:
             await release.wait()
         except asyncio.CancelledError:
+            cancellation_observed = True
             await release.wait()
         return process
 
@@ -364,17 +377,19 @@ async def test_spawn_timeout_hands_ignoring_spawn_to_guardian(
         result = await provider.execute_json(
             {}, cwd=tmp_path.resolve(), timeout_seconds=0.01
         )
+        assert result.status is JsonCommandStatus.TIMEOUT
+        assert time.monotonic() - started < 0.4
+        assert child_ready.is_set()
+        assert cancellation_observed is False
+        assert provider.pending_cleanup_count == 1
+        release.set()
+        await _wait_for_pending_count(provider, 0)
+        assert children[0].returncode is not None
+        assert not _pid_exists(children[0].pid)
     finally:
+        release.set()
         safety_release.cancel()
-
-    assert result.status is JsonCommandStatus.TIMEOUT
-    assert time.monotonic() - started < 0.4
-    assert child_ready.is_set()
-    assert provider.pending_cleanup_count == 1
-    release.set()
-    await _wait_for_pending_count(provider, 0)
-    assert children[0].returncode is not None
-    assert not _pid_exists(children[0].pid)
+        await _wait_for_pending_count(provider, 0)
 
 
 async def test_guardian_observes_late_spawn_exception_without_loop_warning(
@@ -416,12 +431,15 @@ async def test_aclose_is_bounded_and_rejects_new_execution_with_pending_guardian
     tmp_path: Path, monkeypatch
 ) -> None:
     release = asyncio.Event()
+    cancellation_count = 0
 
     async def ignoring_spawn(*args, **kwargs):
+        nonlocal cancellation_count
         while not release.is_set():
             try:
                 await release.wait()
             except asyncio.CancelledError:
+                cancellation_count += 1
                 continue
         raise RuntimeError("released after close")
 
@@ -432,22 +450,23 @@ async def test_aclose_is_bounded_and_rejects_new_execution_with_pending_guardian
         result = await provider.execute_json(
             {}, cwd=tmp_path.resolve(), timeout_seconds=0.01
         )
+        assert result.status is JsonCommandStatus.TIMEOUT
+        assert provider.pending_cleanup_count == 1
+        assert cancellation_count == 0
+
+        started = time.monotonic()
+        await provider.aclose()
+        assert time.monotonic() - started < 0.4
+        assert provider.pending_cleanup_count == 1
+        assert cancellation_count == 0
+        with pytest.raises(RuntimeError, match="closed"):
+            await provider.execute_json(
+                {}, cwd=tmp_path.resolve(), timeout_seconds=1
+            )
     finally:
+        release.set()
         safety_release.cancel()
-    assert result.status is JsonCommandStatus.TIMEOUT
-    assert provider.pending_cleanup_count == 1
-
-    started = time.monotonic()
-    await provider.aclose()
-    assert time.monotonic() - started < 0.4
-    assert provider.pending_cleanup_count == 1
-    with pytest.raises(RuntimeError, match="closed"):
-        await provider.execute_json(
-            {}, cwd=tmp_path.resolve(), timeout_seconds=1
-        )
-
-    release.set()
-    await _wait_for_pending_count(provider, 0)
+        await _wait_for_pending_count(provider, 0)
 
 
 async def test_async_context_manager_closes_provider(tmp_path: Path) -> None:
@@ -470,13 +489,16 @@ async def test_spawn_timeout_captures_late_completed_process_streams(
 ) -> None:
     original_spawn = asyncio.create_subprocess_exec
     children = []
+    cancellation_observed = False
 
     async def delayed_spawn(*args, **kwargs):
+        nonlocal cancellation_observed
         process = await original_spawn(*args, **kwargs)
         children.append(process)
         try:
             await asyncio.sleep(0.1)
         except asyncio.CancelledError:
+            cancellation_observed = True
             await asyncio.sleep(0.09)
         return process
 
@@ -498,6 +520,8 @@ async def test_spawn_timeout_captures_late_completed_process_streams(
     assert result.stderr == b"err"
     assert result.stdout_text == "{}"
     assert result.stderr_text == "err"
+    assert provider.pending_cleanup_count == 0
+    assert cancellation_observed is False
     assert children[0].returncode == 0
     assert not _pid_exists(children[0].pid)
 
@@ -507,6 +531,12 @@ async def test_spawn_timeout_late_capture_obeys_output_limits(
 ) -> None:
     original_spawn = asyncio.create_subprocess_exec
     children = []
+    captured_lengths = []
+    original_capture = command_json_module._capture_then_discard
+
+    async def tracking_capture(reader, destination, limit):
+        await original_capture(reader, destination, limit)
+        captured_lengths.append((len(destination), limit))
 
     async def delayed_spawn(*args, **kwargs):
         process = await original_spawn(*args, **kwargs)
@@ -518,6 +548,9 @@ async def test_spawn_timeout_late_capture_obeys_output_limits(
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+    monkeypatch.setattr(
+        command_json_module, "_capture_then_discard", tracking_capture
+    )
     limits = replace(
         JsonCommandLimits(), max_stdout_bytes=32, max_stderr_bytes=16
     )
@@ -536,6 +569,9 @@ async def test_spawn_timeout_late_capture_obeys_output_limits(
     assert result.status is JsonCommandStatus.TIMEOUT
     assert result.stdout == b"x" * limits.max_stdout_bytes
     assert len(result.stderr) <= limits.max_stderr_bytes
+    assert provider.pending_cleanup_count == 0
+    assert captured_lengths
+    assert all(length <= limit for length, limit in captured_lengths)
     assert children[0].returncode is not None
     assert not _pid_exists(children[0].pid)
 
@@ -605,7 +641,7 @@ async def test_spawn_base_exception_is_propagated_by_identity(
         SystemExit("late spawn exited"),
     ],
 )
-async def test_spawn_deadline_cancels_before_unreached_late_base_exception(
+async def test_spawn_deadline_handoff_propagates_late_base_exception(
     tmp_path: Path, monkeypatch, primary: BaseException
 ) -> None:
     async def delayed_failure(*args, **kwargs):
@@ -613,11 +649,12 @@ async def test_spawn_deadline_cancels_before_unreached_late_base_exception(
         raise primary
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_failure)
-    result = await _provider().execute_json(
-        {}, cwd=tmp_path.resolve(), timeout_seconds=0.01
-    )
+    with pytest.raises(type(primary)) as raised:
+        await _provider().execute_json(
+            {}, cwd=tmp_path.resolve(), timeout_seconds=0.01
+        )
 
-    assert result.status is JsonCommandStatus.TIMEOUT
+    assert raised.value is primary
 
 
 async def test_second_cancellation_during_cleanup_does_not_replace_first(
@@ -718,7 +755,7 @@ async def test_cleanup_continues_to_kill_after_terminate_exception(
             await children[0].wait()
 
 
-async def test_spawn_cancellation_keeps_first_when_cleanup_is_cancelled_again(
+async def test_spawn_cancellation_hands_unreturned_handle_to_guardian(
     tmp_path: Path, monkeypatch
 ) -> None:
     original_spawn = asyncio.create_subprocess_exec
@@ -736,24 +773,23 @@ async def test_spawn_cancellation_keeps_first_when_cleanup_is_cancelled_again(
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+    provider = _provider(
+        "--sleep",
+        "30",
+        "--ignore-term",
+        limits=replace(JsonCommandLimits(), terminate_grace_seconds=0.2),
+    )
     task = asyncio.create_task(
-        _provider(
-            "--sleep",
-            "30",
-            "--ignore-term",
-            limits=replace(JsonCommandLimits(), terminate_grace_seconds=0.2),
-        ).execute_json({}, cwd=tmp_path.resolve(), timeout_seconds=60)
+        provider.execute_json({}, cwd=tmp_path.resolve(), timeout_seconds=60)
     )
     await child_ready.wait()
     task.cancel("first")
-    await asyncio.sleep(0.02)
-    task.cancel("second")
 
     with pytest.raises(asyncio.CancelledError) as raised:
         await task
 
     assert raised.value.args == ("first",)
-    assert any("second" in note for note in getattr(raised.value, "__notes__", ()))
+    assert provider.pending_cleanup_count == 0
     assert children[0].returncode is not None
 
 
@@ -764,14 +800,17 @@ async def test_caller_cancellation_hands_late_spawn_to_guardian_without_waiting(
     release = asyncio.Event()
     child_ready = asyncio.Event()
     children = []
+    cancellation_observed = False
 
     async def ignoring_spawn(*args, **kwargs):
+        nonlocal cancellation_observed
         process = await original_spawn(*args, **kwargs)
         children.append(process)
         child_ready.set()
         try:
             await release.wait()
         except asyncio.CancelledError:
+            cancellation_observed = True
             await release.wait()
         return process
 
@@ -784,21 +823,18 @@ async def test_caller_cancellation_hands_late_spawn_to_guardian_without_waiting(
     safety_release = asyncio.get_running_loop().call_later(0.7, release.set)
     started = time.monotonic()
     task.cancel("first")
-    await asyncio.sleep(0.03)
-    task.cancel("second")
 
     try:
         with pytest.raises(asyncio.CancelledError) as raised:
             await task
+        assert time.monotonic() - started < 0.4
+        assert raised.value.args == ("first",)
+        assert cancellation_observed is False
+        assert provider.pending_cleanup_count == 1
     finally:
+        release.set()
         safety_release.cancel()
-    assert time.monotonic() - started < 0.4
-    assert raised.value.args == ("first",)
-    assert any("second" in note for note in getattr(raised.value, "__notes__", ()))
-    assert provider.pending_cleanup_count == 1
-
-    release.set()
-    await _wait_for_pending_count(provider, 0)
+        await _wait_for_pending_count(provider, 0)
     assert children[0].returncode is not None
     assert not _pid_exists(children[0].pid)
 
