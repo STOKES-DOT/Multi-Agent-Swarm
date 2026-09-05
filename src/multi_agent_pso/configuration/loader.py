@@ -157,6 +157,22 @@ class _ManifestBuilder:
         self.entries.append(entry)
         return entry
 
+    def add_prehashed(
+        self, role: str, path: str, sha256: str, size_bytes: int
+    ) -> SnapshotEntry:
+        if (
+            not isinstance(sha256, str)
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
+            or type(size_bytes) is not int
+            or size_bytes < 0
+        ):
+            raise ValueError("prehashed snapshot metadata is invalid")
+        self._account(size_bytes)
+        entry = SnapshotEntry(role, path, sha256, size_bytes)
+        self.entries.append(entry)
+        return entry
+
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
     """Safe YAML loader which refuses duplicate mapping keys at every depth."""
@@ -282,27 +298,10 @@ def _add_external_entries(builder: _ManifestBuilder, role: str, source: Path) ->
 
 
 def _add_maintained_wiki_entries(builder: _ManifestBuilder, source: Path) -> None:
-    if source.is_symlink() or not source.is_dir():
-        raise ValueError(f"configured wiki path must be a regular directory: {source}")
-    for anchor in ("AGENTS.md","index.md"):
-        child=source/anchor
-        if child.is_symlink() or not child.is_file(): raise ValueError(f"maintained wiki anchor must be a regular file: {child}")
-        builder.add_file("wiki",anchor,child)
-    for namespace in ("mocs","sources","entities","syntheses","questions"):
-        root=source/namespace
-        if not root.exists(): continue
-        if root.is_symlink() or not root.is_dir(): raise ValueError(f"maintained wiki namespace must be a regular directory: {root}")
-        for current,directory_names,file_names in os.walk(root,topdown=True,followlinks=False):
-            current_path=Path(current)
-            directory_names[:]=sorted(directory_names)
-            for name in directory_names:
-                child=current_path/name
-                if child.is_symlink() or not child.is_dir(): raise ValueError(f"maintained wiki contains a non-regular directory: {child}")
-            for name in sorted(file_names):
-                if not name.endswith(".md"): continue
-                child=current_path/name
-                if child.is_symlink() or not child.is_file(): raise ValueError(f"maintained wiki Markdown must be a regular file: {child}")
-                builder.add_file("wiki",child.relative_to(source).as_posix(),child)
+    from multi_agent_pso.retrieval import snapshot_maintained_wiki
+
+    for entry in snapshot_maintained_wiki(source):
+        builder.add_prehashed("wiki", entry.path, entry.sha256, entry.size_bytes)
 
 
 def _parse_entrypoint(value: str) -> tuple[str, str]:

@@ -79,6 +79,7 @@ class ToolContext:
     stage: AgentStage
     attempt: int
     workspace: Path
+    metadata: Mapping[str, JsonValue] = field(default_factory=_empty_json_mapping)
 
     def __post_init__(self) -> None:
         _require_instance(self.stage, AgentStage, "stage")
@@ -87,6 +88,7 @@ class ToolContext:
         _require_nonnegative(self.iteration_id, "iteration_id")
         _require_nonnegative(self.attempt, "attempt")
         _require_absolute_workspace(self.workspace)
+        object.__setattr__(self, "metadata", _freeze_json_mapping(self.metadata))
 
     def to_json(self) -> dict[str, JsonValue]:
         return {
@@ -96,6 +98,7 @@ class ToolContext:
             "stage": self.stage.value,
             "attempt": self.attempt,
             "workspace": str(self.workspace),
+            "metadata": _json_mapping(self.metadata),
         }
 
 

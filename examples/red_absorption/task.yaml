@@ -32,5 +32,9 @@ plugins:
     - inputs.py
     - models.py
     - evaluator.py
+    - prompts/hypothesize.md
     - prompts/propose_action.md
     - prompts/reflect.md
+    - schemas/hypothesis.schema.json
+    - schemas/tool-request.schema.json
+    - schemas/reflection.schema.json

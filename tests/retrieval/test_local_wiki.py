@@ -9,10 +9,51 @@ import pytest
 
 import multi_agent_pso.retrieval.local_wiki as local_wiki_module
 from multi_agent_pso.protocols import WikiHit, WikiRetriever
-from multi_agent_pso.retrieval import LocalWikiRetriever, WikiIndexLimits, WikiQuery
+from multi_agent_pso.retrieval import (
+    LocalWikiRetriever,
+    WikiIndexLimits,
+    WikiQuery,
+    WikiSnapshotEntry,
+    snapshot_maintained_wiki,
+)
 
 
 FIXTURE_WIKI = Path(__file__).parents[1] / "fixtures" / "wiki"
+
+
+def test_maintained_snapshot_reuses_safe_namespace_and_excludes_raw() -> None:
+    entries = snapshot_maintained_wiki(FIXTURE_WIKI)
+    assert entries and all(isinstance(entry, WikiSnapshotEntry) for entry in entries)
+    assert {"AGENTS.md", "index.md"} <= set(entry.path for entry in entries)
+    assert any(entry.path.startswith("sources/") for entry in entries)
+    assert not any(
+        entry.path.startswith(("raw/", "derived/", ".obsidian/", "structures/"))
+        for entry in entries
+    )
+    assert all(len(entry.sha256) == 64 and entry.size_bytes >= 0 for entry in entries)
+
+
+def test_maintained_snapshot_counts_nonmarkdown_entries_and_rejects_symlinks(
+    tmp_path: Path,
+) -> None:
+    root = _wiki(tmp_path, {"sources/a.md": "# A\ntext\n"})
+    for index in range(3):
+        (root / "sources" / f"ignored-{index}.txt").write_text("x")
+    with pytest.raises(ValueError, match="max_entries"):
+        snapshot_maintained_wiki(root, replace(WikiIndexLimits(), max_entries=2))
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside")
+    (root / "sources" / "bad.md").symlink_to(outside)
+    with pytest.raises(ValueError, match="symlink"):
+        snapshot_maintained_wiki(root)
+
+
+@pytest.mark.parametrize(
+    "path", ["", "/absolute.md", "../escape.md", "bad\\name.md", "bad\x00name.md"]
+)
+def test_snapshot_entry_path_is_strict_relative_posix(path: str) -> None:
+    with pytest.raises(ValueError):
+        WikiSnapshotEntry(path, "a" * 64, 1)
 
 
 def _wiki(tmp_path: Path, pages: dict[str, str] | None = None) -> Path:
@@ -117,9 +158,7 @@ def test_rank_is_overlap_then_heading_then_source_then_path(tmp_path: Path) -> N
     root = _wiki(
         tmp_path,
         {
-            "mocs/heading.md": (
-                "# Alpha beta — cross-paper synthesis\nalpha beta\n"
-            ),
+            "mocs/heading.md": ("# Alpha beta — cross-paper synthesis\nalpha beta\n"),
             "sources/body.md": "# Other — direct evidence\nalpha beta\n",
             "sources/a.md": "# Other — direct evidence\nalpha\n",
             "sources/b.md": "# Other — direct evidence\nalpha\n",
@@ -161,17 +200,14 @@ def test_snippet_is_bounded_and_reports_exact_lines(tmp_path: Path) -> None:
         {
             "sources/long.md": (
                 "# Heading — direct evidence\n"
-                "unrelated\n"
-                + "target "
-                + "x" * 200
-                + "\ntrailing\n"
+                "unrelated\n" + "target " + "x" * 200 + "\ntrailing\n"
             )
         },
     )
 
-    hit = LocalWikiRetriever(root).search(
-        WikiQuery("target", 1, snippet_max_chars=64)
-    )[0]
+    hit = LocalWikiRetriever(root).search(WikiQuery("target", 1, snippet_max_chars=64))[
+        0
+    ]
 
     assert len(hit.content) == 64
     assert hit.content.startswith("target ")
@@ -311,7 +347,9 @@ def test_raw_snapshot_metadata_accepts_only_standalone_canonical_lines(
 ) -> None:
     root = _wiki(
         tmp_path,
-        {"sources/source.md": f"# Source — direct evidence\n{metadata}\nrawmetatoken\n"},
+        {
+            "sources/source.md": f"# Source — direct evidence\n{metadata}\nrawmetatoken\n"
+        },
     )
     raw = root / "raw/source/v1.pdf"
     raw.parent.mkdir(parents=True)
@@ -533,9 +571,9 @@ def test_evidence_terminator_does_not_allow_extra_syntax(
         },
     )
 
-    hit = LocalWikiRetriever(root).search(
-        WikiQuery("invalidterminatedlabeltoken", 1)
-    )[0]
+    hit = LocalWikiRetriever(root).search(WikiQuery("invalidterminatedlabeltoken", 1))[
+        0
+    ]
 
     assert hit.evidence_layer == "open hypothesis"
 
@@ -682,9 +720,7 @@ def test_snippet_uses_token_span_not_substring_inside_another_token(
         },
     )
 
-    hit = LocalWikiRetriever(root).search(
-        WikiQuery("red", 1, snippet_max_chars=64)
-    )[0]
+    hit = LocalWikiRetriever(root).search(WikiQuery("red", 1, snippet_max_chars=64))[0]
 
     assert " red " in hit.content
     assert "hundred" not in hit.content
@@ -992,7 +1028,9 @@ def test_anchors_count_toward_file_and_total_byte_limits(tmp_path: Path) -> None
     defaults = WikiIndexLimits()
     with pytest.raises(ValueError, match="max_files"):
         LocalWikiRetriever(root, limits=replace(defaults, max_files=1))
-    anchor_bytes = sum((root / name).stat().st_size for name in ("AGENTS.md", "index.md"))
+    anchor_bytes = sum(
+        (root / name).stat().st_size for name in ("AGENTS.md", "index.md")
+    )
     with pytest.raises(ValueError, match="max_total_bytes"):
         LocalWikiRetriever(
             root,
@@ -1000,7 +1038,9 @@ def test_anchors_count_toward_file_and_total_byte_limits(tmp_path: Path) -> None
         )
 
 
-def test_entry_limit_stops_scandir_at_limit_plus_one(tmp_path: Path, monkeypatch) -> None:
+def test_entry_limit_stops_scandir_at_limit_plus_one(
+    tmp_path: Path, monkeypatch
+) -> None:
     root = _wiki(tmp_path)
     sources = root / "sources"
     sources.mkdir()
@@ -1032,7 +1072,11 @@ def test_entry_limit_stops_scandir_at_limit_plus_one(tmp_path: Path, monkeypatch
 
     def counting_scandir(fd):
         iterator = original_scandir(fd)
-        return CountingIterator(iterator) if os.fstat(fd).st_ino == source_inode else iterator
+        return (
+            CountingIterator(iterator)
+            if os.fstat(fd).st_ino == source_inode
+            else iterator
+        )
 
     monkeypatch.setattr(os, "scandir", counting_scandir)
     with pytest.raises(ValueError, match="max_entries"):
@@ -1043,7 +1087,9 @@ def test_entry_limit_stops_scandir_at_limit_plus_one(tmp_path: Path, monkeypatch
     assert consumed == 3
 
 
-def test_entry_name_byte_budget_counts_nonmarkdown_and_directories(tmp_path: Path) -> None:
+def test_entry_name_byte_budget_counts_nonmarkdown_and_directories(
+    tmp_path: Path,
+) -> None:
     root = _wiki(tmp_path)
     sources = root / "sources"
     sources.mkdir()

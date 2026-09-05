@@ -504,6 +504,10 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
     assert isinstance(adapter, TaskAdapter)
 
     context = ToolContext("run", "particle", 0, AgentStage.EXECUTING, 0, WORKSPACE)
+    metadata_context = ToolContext("run", "particle", 0, AgentStage.EXECUTING, 0, WORKSPACE, metadata={"proposal":{"provider":"fixture"}})
+    assert metadata_context.to_json()["metadata"] == {"proposal":{"provider":"fixture"}}
+    with pytest.raises(TypeError):
+        metadata_context.metadata["proposal"] = {}  # type: ignore[index]
     result = ToolResult(ToolStatus.SUCCESS, {"position": "realized"})
     store = RunStoreFake()
     assert store.get_committed_tool_result("request-key") is None

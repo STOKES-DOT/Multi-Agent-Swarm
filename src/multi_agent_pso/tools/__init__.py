@@ -11,6 +11,8 @@ from .molecule_editor import (
     MOLECULE_EDITOR_SCRIPT,
     MoleculeEditorProvider,
     MoleculeEditorResult,
+    validate_commands,
+    validate_source,
 )
 
 __all__ = [
@@ -22,4 +24,6 @@ __all__ = [
     "MOLECULE_EDITOR_SCRIPT",
     "MoleculeEditorProvider",
     "MoleculeEditorResult",
+    "validate_commands",
+    "validate_source",
 ]

@@ -777,6 +777,7 @@ class FakeAdapter:
         self.realized_value = realized_value
         self.evaluated_value = evaluated_value
         self.adherence_value = adherence_value
+        self.candidate_contexts: list[ToolContext] = []
 
     def build_stage_request(self, stage: AgentStage, context: Mapping[str, object]) -> StageRequest:
         self.contexts[stage].append(copy.deepcopy(dict(context)))
@@ -799,6 +800,7 @@ class FakeAdapter:
         return value
 
     def candidate_from_tool_result(self, result: ToolResult, context: ToolContext) -> CandidateRef:
+        self.candidate_contexts.append(context)
         if self.candidate_exception is not None:
             raise self.candidate_exception
         if self.candidate_failure:
@@ -833,8 +835,10 @@ class FakeTool:
         self.exception = exception
         self.payload = dict(payload or {"tool": "ok"})
         self.artifacts = artifacts
+        self.contexts: list[ToolContext] = []
 
     async def execute(self, request: ToolRequest, context: ToolContext) -> ToolResult:
+        self.contexts.append(context)
         self.executed_keys.append(request.idempotency_key)
         if self.exception is not None:
             raise self.exception

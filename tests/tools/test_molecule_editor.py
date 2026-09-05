@@ -18,6 +18,8 @@ from multi_agent_pso.tools.molecule_editor import (
     MAX_EDIT_ATTEMPTS,
     MoleculeEditorProvider,
     MoleculeEditorResult,
+    validate_commands,
+    validate_source,
 )
 
 
@@ -113,6 +115,14 @@ def _valid(**updates):
     value = _real_payload()
     value.update(updates)
     return value
+
+
+def test_public_source_and_command_validators_match_provider_boundary() -> None:
+    graph = _real_graph()
+    source = validate_source({"kind": "chemical_graph", "value": graph})
+    commands = [{"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}]
+    assert source["value"] == graph
+    assert validate_commands(commands, graph) == commands
 
 
 def test_exit_zero_does_not_override_invalid_status() -> None:

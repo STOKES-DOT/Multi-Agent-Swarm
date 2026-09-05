@@ -623,4 +623,23 @@ class MoleculeEditorProvider:
         return output  # type: ignore[return-value]
 
 
-__all__ = ["MAX_EDIT_ATTEMPTS", "MOLECULE_EDITOR_SCRIPT", "MoleculeEditorProvider", "MoleculeEditorResult"]
+def validate_source(source: Mapping[str, object]) -> dict[str, object]:
+    """Validate and defensively copy a MoleculeEditor source envelope."""
+    return MoleculeEditorProvider._source(dict(source))
+
+
+def validate_commands(
+    commands: Sequence[Mapping[str, object]], graph: Mapping[str, object]
+) -> list[dict[str, object]]:
+    """Validate a complete edit transaction against an inspected graph."""
+    return MoleculeEditorProvider._commands(commands, graph)
+
+
+__all__ = [
+    "MAX_EDIT_ATTEMPTS",
+    "MOLECULE_EDITOR_SCRIPT",
+    "MoleculeEditorProvider",
+    "MoleculeEditorResult",
+    "validate_commands",
+    "validate_source",
+]

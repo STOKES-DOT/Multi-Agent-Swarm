@@ -577,6 +577,7 @@ class AgentLoop:
                     current_stage,
                     0,
                     self._workspace,
+                    metadata={"proposal": proposal},
                 )
                 try:
                     candidate = self._adapter.candidate_from_tool_result(
@@ -2323,7 +2324,18 @@ class AgentLoop:
             return ToolResult(ToolStatus.REJECTED, error="invalid tool proposal"), ToolRequest(self._identity("request", run_id, particle_id, iteration_id, "invalid"), "task", "invalid", {}, key), False
         request = ToolRequest(self._identity("request", run_id, particle_id, iteration_id, provider, operation), provider, operation, payload, key)
         self._copy_json(request.to_json())
-        result = await self._tool.execute(request, ToolContext(run_id, particle_id, iteration_id, AgentStage.EXECUTING, 0, self._workspace))
+        result = await self._tool.execute(
+            request,
+            ToolContext(
+                run_id,
+                particle_id,
+                iteration_id,
+                AgentStage.EXECUTING,
+                0,
+                self._workspace,
+                metadata={"proposal": bounded_proposal},
+            ),
+        )
         self._copy_json(result.to_json())
         self._verify_tool_result_artifacts(result)
         self._store.record_tool_result(key, result)

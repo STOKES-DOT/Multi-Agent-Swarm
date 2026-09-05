@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import stat
@@ -78,6 +79,86 @@ class WikiIndexLimits:
         ):
             _require_limit(getattr(self, name), name, minimum=1)
         _require_limit(self.max_depth, "max_depth", minimum=0)
+
+
+@dataclass(frozen=True, slots=True)
+class WikiSnapshotEntry:
+    """Digest-only identity for one safely read maintained Wiki file."""
+
+    path: str
+    sha256: str
+    size_bytes: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, str) or "\\" in self.path or "\x00" in self.path:
+            raise ValueError("snapshot path must be normalized relative POSIX")
+        path = PurePosixPath(self.path)
+        if (
+            not self.path
+            or path.is_absolute()
+            or any(part in {"", ".", ".."} for part in self.path.split("/"))
+            or path.as_posix() != self.path
+        ):
+            raise ValueError("snapshot path must be normalized relative POSIX")
+        if (
+            not isinstance(self.sha256, str)
+            or len(self.sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.sha256)
+        ):
+            raise ValueError("snapshot sha256 must be lowercase hex")
+        if type(self.size_bytes) is not int or self.size_bytes < 0:
+            raise ValueError("snapshot size_bytes must be nonnegative")
+
+
+def snapshot_maintained_wiki(
+    root: Path, limits: WikiIndexLimits = WikiIndexLimits()
+) -> tuple[WikiSnapshotEntry, ...]:
+    """Snapshot anchors and maintained Markdown through the retrieval FD boundary."""
+    if not isinstance(root, Path) or not isinstance(limits, WikiIndexLimits):
+        raise TypeError("root and WikiIndexLimits are required")
+    _require_fd_platform()
+    budget = _IndexBudget(limits)
+    snapshots: list[WikiSnapshotEntry] = []
+    root_fd = _open_root(root)
+    with _owned_fd(root_fd):
+        for anchor in ("AGENTS.md", "index.md"):
+            metadata = _required_regular_stat(root_fd, anchor, anchor)
+            budget.reserve_file(metadata.st_size, anchor)
+            text = _read_utf8_at(
+                root_fd,
+                anchor,
+                anchor,
+                max_bytes=limits.max_file_bytes,
+                expected=metadata,
+            )
+            encoded = text.encode("utf-8")
+            snapshots.append(
+                WikiSnapshotEntry(
+                    anchor, hashlib.sha256(encoded).hexdigest(), len(encoded)
+                )
+            )
+        for namespace in _SEARCH_NAMESPACES:
+            metadata = _optional_stat_at(root_fd, namespace)
+            if metadata is None:
+                continue
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise ValueError(
+                    "wiki maintained namespace must be a regular directory"
+                )
+            namespace_fd = _open_directory_at(root_fd, namespace, expected=metadata)
+            with _owned_fd(namespace_fd):
+                for relative_path, text in _markdown_documents(
+                    namespace_fd, PurePosixPath(namespace), budget, depth=0
+                ):
+                    encoded = text.encode("utf-8")
+                    snapshots.append(
+                        WikiSnapshotEntry(
+                            relative_path,
+                            hashlib.sha256(encoded).hexdigest(),
+                            len(encoded),
+                        )
+                    )
+    return tuple(sorted(snapshots, key=lambda entry: entry.path))
 
 
 @dataclass(slots=True)
@@ -232,9 +313,7 @@ class LocalWikiRetriever:
             for item in ranked[: query.max_results]
         )
 
-    def _build_sections(
-        self, root_fd: int, budget: _IndexBudget
-    ) -> Iterator[_Section]:
+    def _build_sections(self, root_fd: int, budget: _IndexBudget) -> Iterator[_Section]:
         for namespace in _SEARCH_NAMESPACES:
             namespace_stat = _optional_stat_at(root_fd, namespace)
             if namespace_stat is None:
@@ -319,7 +398,9 @@ def _open_root(root: Path) -> int:
     try:
         fd = os.open(root, _base_flags() | os.O_DIRECTORY)
     except OSError as error:
-        raise ValueError("wiki root must be an existing non-symlink directory") from error
+        raise ValueError(
+            "wiki root must be an existing non-symlink directory"
+        ) from error
     try:
         if not stat.S_ISDIR(os.fstat(fd).st_mode):
             raise ValueError("wiki root must be an existing directory")
@@ -357,9 +438,7 @@ def _optional_stat_at(parent_fd: int, name: str) -> os.stat_result | None:
         raise ValueError("wiki path could not be inspected") from error
 
 
-def _required_regular_stat(
-    parent_fd: int, name: str, label: str
-) -> os.stat_result:
+def _required_regular_stat(parent_fd: int, name: str, label: str) -> os.stat_result:
     value = _optional_stat_at(parent_fd, name)
     if value is None or stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode):
         raise ValueError(f"wiki root requires a regular {label}")
@@ -505,9 +584,7 @@ def _markdown_documents(
         if stat.S_ISDIR(entry_stat.st_mode):
             if depth >= budget.limits.max_depth:
                 raise ValueError("Wiki index exceeds max_depth")
-            child_fd = _open_directory_at(
-                directory_fd, name, expected=entry_stat
-            )
+            child_fd = _open_directory_at(directory_fd, name, expected=entry_stat)
             with _owned_fd(child_fd):
                 yield from _markdown_documents(
                     child_fd,
@@ -527,9 +604,7 @@ def _markdown_documents(
             )
 
 
-def _linked_raw(
-    root_fd: int, relative_path: str, lines: tuple[str, ...]
-) -> str | None:
+def _linked_raw(root_fd: int, relative_path: str, lines: tuple[str, ...]) -> str | None:
     if not relative_path.startswith("sources/"):
         return None
     valid: list[str] = []
@@ -568,9 +643,7 @@ def _raw_regular_exists(root_fd: int, relative_path: str) -> bool:
                 or not stat.S_ISDIR(component_stat.st_mode)
             ):
                 return False
-            child_fd = _open_directory_at(
-                parent_fd, part, expected=component_stat
-            )
+            child_fd = _open_directory_at(parent_fd, part, expected=component_stat)
             opened.append((parent_fd, part, child_fd))
             parent_fd = child_fd
         final_stat = _optional_stat_at(parent_fd, parts[-1])
@@ -580,9 +653,7 @@ def _raw_regular_exists(root_fd: int, relative_path: str) -> bool:
             or not stat.S_ISREG(final_stat.st_mode)
         ):
             return False
-        final_fd = _open_regular_at(
-            parent_fd, parts[-1], expected=final_stat
-        )
+        final_fd = _open_regular_at(parent_fd, parts[-1], expected=final_stat)
         try:
             after_final = _optional_stat_at(parent_fd, parts[-1])
             if (
@@ -677,9 +748,7 @@ def _emit_markdown_section(
     evidence_layer = (
         declared
         if declared is not None
-        else evidence_stack[-1][1]
-        if evidence_stack
-        else "open hypothesis"
+        else evidence_stack[-1][1] if evidence_stack else "open hypothesis"
     )
     evidence_stack.append((level, evidence_layer))
     if _normalized_words(heading) == "evidence boundary":
@@ -713,11 +782,7 @@ def _evidence_boundary_fragments(
         if not line.strip():
             continue
         match = _EVIDENCE_BULLET_RE.match(line)
-        layer = (
-            _canonical_evidence_label(match.group(1))
-            if match is not None
-            else None
-        )
+        layer = _canonical_evidence_label(match.group(1)) if match is not None else None
         yield _section(
             relative_path,
             layer or "",
@@ -755,9 +820,7 @@ def _section(
     )
 
 
-def _declared_section_layer(
-    heading: str, lines: tuple[str, ...]
-) -> str | None:
+def _declared_section_layer(heading: str, lines: tuple[str, ...]) -> str | None:
     for line in lines:
         marker = _EVIDENCE_MARKER_RE.match(line)
         if marker is not None:
@@ -810,9 +873,7 @@ def _tokens(value: str) -> tuple[str, ...]:
     return tuple(span.value for span in _token_spans(value))
 
 
-def _line_fragment(
-    line: str, matches: tuple[_TokenSpan, ...], max_chars: int
-) -> str:
+def _line_fragment(line: str, matches: tuple[_TokenSpan, ...], max_chars: int) -> str:
     if not matches:
         return line[:max_chars]
     match = matches[0]

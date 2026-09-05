@@ -153,6 +153,17 @@ async def test_execution_reuses_committed_tool_result(tmp_path):
 
     assert episode.status is EpisodeStatus.COMPLETED
     assert dependencies["tool_provider"].executed_keys == []
+    proposal=dependencies["task_adapter"].candidate_contexts[-1].metadata["proposal"]
+    assert proposal["provider"]=="fake"
+
+
+@pytest.mark.asyncio
+async def test_tool_and_candidate_contexts_carry_persisted_proposal(tmp_path):
+    dependencies=make_fake_dependencies(tmp_path)
+    await AgentLoop(**dependencies).run_particle("run-1","p0",0)
+    tool_proposal=dependencies["tool_provider"].contexts[-1].metadata["proposal"]
+    candidate_proposal=dependencies["task_adapter"].candidate_contexts[-1].metadata["proposal"]
+    assert tool_proposal==candidate_proposal
 
 
 @pytest.mark.asyncio
