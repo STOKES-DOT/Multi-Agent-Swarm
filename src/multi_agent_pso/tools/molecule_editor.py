@@ -7,6 +7,7 @@ import math
 import re
 import sys
 import weakref
+import networkx as nx
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -130,9 +131,51 @@ def _validate_graph(value: object) -> dict[str, object]:
         endpoint_pairs.add(pair)
         if bond["begin_atom_id"] not in atom_ids or bond["end_atom_id"] not in atom_ids or bond["bond_type"] not in _DIRECTION_BY_BOND or bond["bond_direction"] not in _DIRECTION_BY_BOND[bond["bond_type"]]: raise ValueError("bond domain invalid")
         if type(bond["aromatic"]) is not bool or type(bond["conjugated"]) is not bool or bond["stereo"] not in {"STEREONONE","STEREOANY","STEREOZ","STEREOE","STEREOCIS","STEREOTRANS"} or not isinstance(bond["stereo_atom_ids"],list) or any(v not in atom_ids for v in bond["stereo_atom_ids"]): raise ValueError("bond stereo invalid")
+        if bond["aromatic"] is not (bond["bond_type"]=="AROMATIC"): raise ValueError("bond aromatic flag mismatches type")
         if bond["bond_type"]!="DOUBLE" and (bond["stereo"]!="STEREONONE" or bond["stereo_atom_ids"]): raise ValueError("bond stereo incompatible with bond type")
     if value["next_bond_serial"] <= max(bond_serials,default=0): raise ValueError("next_bond_serial is stale")
+    adjacency={atom:set() for atom in atom_ids}
+    for bond in bonds:
+        adjacency[bond["begin_atom_id"]].add(bond["end_atom_id"]); adjacency[bond["end_atom_id"]].add(bond["begin_atom_id"])
+    for bond in bonds:
+        _validate_bond_stereo_refs(bond["bond_type"],bond["stereo"],bond["stereo_atom_ids"],bond["begin_atom_id"],bond["end_atom_id"],adjacency)
     return value
+
+
+def _validate_bond_stereo_refs(bond_type: str, stereo: str, refs: object, begin: str, end: str, adjacency: dict[str,set[str]], *, topology_known: bool=True) -> None:
+    if not isinstance(refs,list): raise ValueError("stereo_atom_ids must be a list")
+    specified=stereo in {"STEREOZ","STEREOE","STEREOCIS","STEREOTRANS"}
+    if bond_type != "DOUBLE":
+        if refs or stereo != "STEREONONE": raise ValueError("non-double stereo must be empty")
+        return
+    if specified or refs:
+        if len(refs)!=2 or any(type(value) is not str for value in refs) or begin in refs or end in refs: raise ValueError("double stereo refs invalid")
+        if topology_known and (refs[0] not in adjacency.get(begin,set())-{end} or refs[1] not in adjacency.get(end,set())-{begin}): raise ValueError("double stereo refs are not endpoint neighbors")
+
+
+def _normalized_cycle(cycle: list[str]) -> list[str]:
+    rotations=[]
+    for oriented in (cycle,list(reversed(cycle))): rotations.extend(oriented[i:]+oriented[:i] for i in range(len(oriented)))
+    return min(rotations) if rotations else []
+
+
+def _validate_views(data: dict[str, object], graph: dict[str, object]) -> None:
+    if data.get("parent_state_hash") != graph.get("parent_state_hash") or data.get("atom_table") != graph["atoms"] or data.get("bond_table") != graph["bonds"]: raise ValueError("outer graph views mismatch")
+    atom_ids={a["atom_id"] for a in graph["atoms"]}; bond_ids={b["bond_id"] for b in graph["bonds"]}
+    for name,targets in (("atom_id_mapping",atom_ids),("bond_id_mapping",bond_ids)):
+        mapping=data.get(name)
+        if not isinstance(mapping,dict) or any(type(k) is not str or type(v) is not str or v not in targets for k,v in mapping.items()): raise ValueError(f"{name} invalid")
+        if data.get("mode")=="inspect" and mapping != {value:value for value in targets}: raise ValueError("inspect mappings must be identity")
+    topology=data.get("topology"); fields={"atom_count","bond_count","component_count","component_sizes","bridge_bond_ids","cycle_atom_ids","degree_by_atom_id","symmetry_class_by_atom_id"}
+    if not isinstance(topology,dict) or set(topology)!=fields: raise ValueError("topology fields invalid")
+    network=nx.Graph(); network.add_nodes_from(atom_ids); edge_to_id={}
+    for bond in graph["bonds"]: network.add_edge(bond["begin_atom_id"],bond["end_atom_id"]); edge_to_id[frozenset((bond["begin_atom_id"],bond["end_atom_id"]))]=bond["bond_id"]
+    components=sorted((tuple(sorted(c)) for c in nx.connected_components(network)),key=lambda c:c)
+    bridges=sorted(edge_to_id[frozenset(edge)] for edge in nx.bridges(network)); cycles=sorted(_normalized_cycle(c) for c in nx.cycle_basis(network)); degrees={a:network.degree(a) for a in sorted(atom_ids)}
+    expected={"atom_count":len(atom_ids),"bond_count":len(bond_ids),"component_count":len(components),"component_sizes":[len(c) for c in components],"bridge_bond_ids":bridges,"cycle_atom_ids":cycles,"degree_by_atom_id":degrees}
+    if any(topology.get(k)!=v for k,v in expected.items()): raise ValueError("topology does not match graph")
+    symmetry=topology["symmetry_class_by_atom_id"]
+    if not isinstance(symmetry,dict) or set(symmetry)!=atom_ids or any(type(v) is not int or v<0 for v in symmetry.values()): raise ValueError("symmetry classes invalid")
 
 
 def _validate_unready_geometry(data: dict[str, object], status: str) -> None:
@@ -202,6 +245,8 @@ def _validate_artifacts(data: dict[str, object], chemical: str, geometry: str, a
         if paths != expected or partial or manifest["commit_marker"] != "result.json": raise ValueError("artifact READY manifest mismatch")
     elif paths or manifest["commit_marker"] is not None or (artifact == "NOT_REQUESTED" and partial):
         raise ValueError("unready artifact exposes committed paths")
+    if artifact == "FAILED" and ("result.json" in partial or not set(partial)<=set(planned)):
+        raise ValueError("failed artifact partial paths invalid")
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -231,6 +276,10 @@ class MoleculeEditorResult:
             return cls(False, "FAILED", "FAILED", "FAILED", False, None, None, process)
         data = _plain(payload)
         assert isinstance(data, dict)
+        top_errors = data.get("errors", [])
+        top_warnings = data.get("warnings", [])
+        if data.get("mode") is not None:
+            _diagnostics(top_errors, "errors"); _diagnostics(top_warnings, "warnings")
         chemical = data.get("chemical_status")
         geometry = data.get("geometry_status")
         artifact = data.get("artifact_status")
@@ -255,6 +304,7 @@ class MoleculeEditorResult:
                 raise ValueError("outer/graph geometry_status mismatch")
             if graph.get("committed_commands") != data.get("committed_commands"):
                 raise ValueError("outer/graph committed_commands mismatch")
+            if data.get("mode") is not None: _validate_views(data, graph)
             candidate = graph
         else:
             if data.get("graph") is not None or data.get("chemical_identity_hash") is not None or data.get("state_hash") is not None or data.get("committed_commands", []) != [] or geometry != "NOT_REQUESTED":
@@ -266,6 +316,7 @@ class MoleculeEditorResult:
                     if data.get(key) != []: raise ValueError("invalid result exposes child list")
                 for key in ("atom_id_mapping","bond_id_mapping"):
                     if data.get(key) != {}: raise ValueError("invalid result exposes child mapping")
+                if not top_errors: raise ValueError("invalid chemical result requires errors")
             if data.get("transaction_status") == "ROLLED_BACK":
                 rollback = data.get("rollback")
                 parent_graph = _validate_graph(data.get("parent_graph"))
@@ -278,7 +329,11 @@ class MoleculeEditorResult:
             _validate_ready_geometry(data, graph)
         elif "geometry_result" in data or "geometry" in data or data.get("mode") is not None:
             _validate_unready_geometry(data, geometry)
+            if geometry == "FAILED":
+                geometry_errors=data["geometry_result"]["errors"]
+                if not geometry_errors or any(error not in top_errors for error in geometry_errors): raise ValueError("geometry failure errors mismatch")
         _validate_artifacts(data, chemical, geometry, artifact)
+        if artifact == "FAILED" and not any(isinstance(error,dict) and error.get("code") in {"ARTIFACT_WRITE_FAILED","OUTPUT_EXISTS"} for error in top_errors): raise ValueError("artifact failure requires top artifact error")
         computed = chemical == "VALID" and geometry == "READY" and artifact in {"NOT_REQUESTED", "READY"}
         if ready_claim is not computed:
             raise ValueError("ready_for_evaluator status mismatch")
@@ -417,6 +472,10 @@ class MoleculeEditorProvider:
         atoms = {a.get("atom_id") for a in validated_graph.get("atoms", ()) if isinstance(a, Mapping)}
         bonds = {b.get("bond_id") for b in validated_graph.get("bonds", ()) if isinstance(b, Mapping)}
         atom_refs, bond_refs, used = set(atoms), set(bonds), set()
+        adjacency={atom:set() for atom in atom_refs}; endpoints={}
+        for bond in validated_graph["bonds"]:
+            begin,end=bond["begin_atom_id"],bond["end_atom_id"]; adjacency[begin].add(end); adjacency[end].add(begin); endpoints[bond["bond_id"]]=(begin,end)
+        topology_known=True
         output = []
         for raw in commands:
             if type(raw) is not dict or raw.get("operation") not in _OPERATIONS: raise ValueError("edit operation is invalid")
@@ -433,6 +492,7 @@ class MoleculeEditorProvider:
             if item.get("radical_electrons", 0) != 0: raise ValueError("radicals are unsupported")
             for key in ("no_implicit","aromatic","conjugated"):
                 if key in item and type(item[key]) is not bool: raise ValueError(f"{key} must be boolean")
+            if "aromatic" in item and "bond_type" in item and item["aromatic"] is not (item["bond_type"]=="AROMATIC"): raise ValueError("aromatic flag mismatches bond type")
             if "bond_type" in item and item["bond_type"] not in {"SINGLE","DOUBLE","TRIPLE","AROMATIC"}: raise ValueError("bond_type is invalid")
             if "chiral_tag" in item and item["chiral_tag"] not in {"CHI_UNSPECIFIED","CHI_TETRAHEDRAL_CW","CHI_TETRAHEDRAL_CCW"}: raise ValueError("chiral_tag is invalid")
             if "stereo" in item and item["stereo"] not in {"STEREONONE","STEREOANY","STEREOZ","STEREOE","STEREOCIS","STEREOTRANS"}: raise ValueError("stereo is invalid")
@@ -446,6 +506,9 @@ class MoleculeEditorProvider:
             if "stereo_atom_ids" in item:
                 stereo_ids = item["stereo_atom_ids"]
                 if not isinstance(stereo_ids, list) or any(value not in atom_refs for value in stereo_ids): raise ValueError("stereo_atom_ids are invalid")
+            if op in {"add_bond","change_bond"}:
+                begin,end=(item["begin"],item["end"]) if op=="add_bond" else endpoints[item["bond_id"]]
+                _validate_bond_stereo_refs(item["bond_type"],item.get("stereo","STEREONONE"),item.get("stereo_atom_ids",[]),begin,end,adjacency,topology_known=topology_known)
             ref = item.get("client_ref")
             if ref is not None:
                 if not isinstance(ref, str) or not _LOCAL.fullmatch(ref) or ref in used: raise ValueError("client_ref is invalid or duplicate")
@@ -455,6 +518,20 @@ class MoleculeEditorProvider:
                 fragment = item.get("fragment_graph"); anchor = item.get("fragment_anchor_atom_id")
                 validated_fragment = _validate_graph(_plain(fragment))
                 if anchor not in {a.get("atom_id") for a in validated_fragment.get("atoms", ()) if isinstance(a, Mapping)}: raise ValueError("fragment anchor is invalid")
+                topology_known=False
+            if op=="add_atom": adjacency[item["client_ref"]]=set()
+            elif op=="remove_atom":
+                removed=item["atom_id"]
+                for neighbor in tuple(adjacency[removed]): adjacency[neighbor].discard(removed)
+                adjacency.pop(removed); atom_refs.discard(removed)
+                for identity,pair in tuple(endpoints.items()):
+                    if removed in pair: endpoints.pop(identity); bond_refs.discard(identity)
+            elif op=="add_bond":
+                adjacency[item["begin"]].add(item["end"]); adjacency[item["end"]].add(item["begin"])
+                if item.get("client_ref"): endpoints[item["client_ref"]]=(item["begin"],item["end"])
+            elif op=="remove_bond":
+                begin,end=endpoints[item["bond_id"]]; adjacency[begin].discard(end); adjacency[end].discard(begin)
+                endpoints.pop(item["bond_id"]); bond_refs.discard(item["bond_id"])
             output.append(_plain(item))
         return output  # type: ignore[return-value]
 

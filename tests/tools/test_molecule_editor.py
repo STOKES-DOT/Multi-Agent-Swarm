@@ -56,7 +56,8 @@ def _geometry_placeholder(status="NOT_REQUESTED"):
 def _real_payload():
     full, compact = _geometry_placeholder()
     graph = _real_graph()
-    return {"mode":"inspect","chemical_status":"VALID","geometry_status":"NOT_REQUESTED","artifact_status":"NOT_REQUESTED","ready_for_evaluator":False,"canonical_isomeric_smiles":"CO","parent_state_hash":None,"state_hash":HASH,"chemical_identity_hash":HASH,"total_charge":0,"multiplicity":1,"atom_id_mapping":{},"bond_id_mapping":{},"coordinate_order":[],"committed_commands":[],"graph":graph,"atom_table":[],"bond_table":[],"topology":None,"geometry_hash":None,"geometry_result":full,"geometry":compact,"artifacts":{"paths":[],"planned_paths":[],"partial_uncommitted_paths":[],"commit_marker":None,"planned_commit_marker":"result.json"}}
+    topology={"atom_count":2,"bond_count":1,"component_count":1,"component_sizes":[2],"bridge_bond_ids":["b0001"],"cycle_atom_ids":[],"degree_by_atom_id":{"a0001":1,"a0002":1},"symmetry_class_by_atom_id":{"a0001":0,"a0002":1}}
+    return {"mode":"inspect","chemical_status":"VALID","geometry_status":"NOT_REQUESTED","artifact_status":"NOT_REQUESTED","ready_for_evaluator":False,"canonical_isomeric_smiles":"CO","parent_state_hash":None,"state_hash":HASH,"chemical_identity_hash":HASH,"total_charge":0,"multiplicity":1,"atom_id_mapping":{"a0001":"a0001","a0002":"a0002"},"bond_id_mapping":{"b0001":"b0001"},"coordinate_order":[],"committed_commands":[],"graph":graph,"atom_table":deepcopy(graph["atoms"]),"bond_table":deepcopy(graph["bonds"]),"topology":topology,"geometry_hash":None,"geometry_result":full,"geometry":compact,"artifacts":{"paths":[],"planned_paths":[],"partial_uncommitted_paths":[],"commit_marker":None,"planned_commit_marker":"result.json"},"errors":[],"warnings":[]}
 
 
 def _ready_payload():
@@ -69,8 +70,26 @@ def _ready_payload():
     return data
 
 
+def _stereo_graph(include_center=True):
+    graph=_real_graph(); graph["atoms"].extend([deepcopy(graph["atoms"][0]),deepcopy(graph["atoms"][0])]); graph["atoms"][2]["atom_id"]="a0003"; graph["atoms"][3]["atom_id"]="a0004"; graph["next_atom_serial"]=5
+    center=graph["bonds"][0]; graph["bonds"]=[]; serial=1
+    if include_center: center.update({"bond_id":"b0001","bond_type":"DOUBLE","stereo":"STEREOE","stereo_atom_ids":["a0003","a0004"],"bond_direction":"NONE"}); graph["bonds"].append(center); serial=2
+    for begin,end in (("a0003","a0001"),("a0002","a0004")):
+        bond=deepcopy(_real_graph()["bonds"][0]); bond.update({"bond_id":f"b{serial:04d}","begin_atom_id":begin,"end_atom_id":end}); graph["bonds"].append(bond); serial+=1
+    graph["next_bond_serial"]=serial
+    return graph
+
+
+def _payload_with_graph(graph):
+    data=_real_payload(); data["graph"]=graph; data["atom_table"]=deepcopy(graph["atoms"]); data["bond_table"]=deepcopy(graph["bonds"]); atom_ids=[a["atom_id"] for a in graph["atoms"]]; bond_ids=[b["bond_id"] for b in graph["bonds"]]; data["atom_id_mapping"]={v:v for v in atom_ids}; data["bond_id_mapping"]={v:v for v in bond_ids}; degrees={v:0 for v in atom_ids}
+    for bond in graph["bonds"]: degrees[bond["begin_atom_id"]]+=1; degrees[bond["end_atom_id"]]+=1
+    data["topology"]={"atom_count":len(atom_ids),"bond_count":len(bond_ids),"component_count":1,"component_sizes":[len(atom_ids)],"bridge_bond_ids":sorted(bond_ids),"cycle_atom_ids":[],"degree_by_atom_id":degrees,"symmetry_class_by_atom_id":{v:i for i,v in enumerate(atom_ids)}}
+    return data
+
+
 def _invalid_payload(mode="inspect"):
-    data=_real_payload(); data.update({"mode":mode,"chemical_status":"INVALID","canonical_isomeric_smiles":None,"state_hash":None,"chemical_identity_hash":None,"graph":None,"ready_for_evaluator":False,"atom_id_mapping":{},"bond_id_mapping":{},"committed_commands":[],"atom_table":[],"bond_table":[],"topology":None})
+    error={"code":"ATOM_VALENCE_ERROR","message":"invalid","details":{}}
+    data=_real_payload(); data.update({"mode":mode,"chemical_status":"INVALID","canonical_isomeric_smiles":None,"state_hash":None,"chemical_identity_hash":None,"graph":None,"ready_for_evaluator":False,"atom_id_mapping":{},"bond_id_mapping":{},"committed_commands":[],"atom_table":[],"bond_table":[],"topology":None,"errors":[error]})
     if mode=="edit": data.update({"transaction_status":"ROLLED_BACK","parent_state_hash":HASH,"parent_graph":_real_graph(),"rollback":{"preserved":True,"parent_state_hash":HASH}})
     return data
 
@@ -194,10 +213,38 @@ def test_artifact_publication_matrix_is_ordered_and_strict() -> None:
 def test_failed_geometry_and_artifact_keep_only_structured_diagnostics() -> None:
     data=_real_payload(); data["geometry_status"]="FAILED"; data["artifact_status"]="FAILED"; data["graph"]["geometry_status"]="FAILED"
     error={"code":"GEOMETRY_OPTIMIZATION_FAILED","message":"failed","details":{}}
-    full,compact=_geometry_placeholder("FAILED"); full["errors"]=[error]; compact["errors"]=[error]; data["geometry_result"]=full; data["geometry"]=compact
-    data["artifacts"]={"paths":[],"planned_paths":["molecule.chemical-graph.json","result.json"],"partial_uncommitted_paths":["partial.tmp"],"commit_marker":None,"planned_commit_marker":"result.json"}
+    artifact_error={"code":"ARTIFACT_WRITE_FAILED","message":"write failed","details":{}}; full,compact=_geometry_placeholder("FAILED"); full["errors"]=[error]; compact["errors"]=[error]; data["geometry_result"]=full; data["geometry"]=compact; data["errors"]=[error,artifact_error]
+    data["artifacts"]={"paths":[],"planned_paths":["molecule.chemical-graph.json","result.json"],"partial_uncommitted_paths":["molecule.chemical-graph.json"],"commit_marker":None,"planned_commit_marker":"result.json"}
     result=MoleculeEditorResult.from_process(exit_code=0,payload=data)
     assert result.geometry_status==result.artifact_status=="FAILED"
+
+
+@pytest.mark.parametrize("mutation",["parent","atom_table","bond_table","atom_mapping","bond_mapping","inspect_mapping","atom_count","degrees","bridges","cycles","symmetry"])
+def test_valid_envelope_views_and_topology_tampering_is_rejected(mutation) -> None:
+    data=_real_payload()
+    if mutation=="parent": data["parent_state_hash"]=HASH2
+    elif mutation=="atom_table": data["atom_table"]=[]
+    elif mutation=="bond_table": data["bond_table"]=[]
+    elif mutation=="atom_mapping": data["atom_id_mapping"]={"a0001":"a9999"}
+    elif mutation=="bond_mapping": data["bond_id_mapping"]={1:"b0001"}
+    elif mutation=="inspect_mapping": data["atom_id_mapping"]={"a0001":"a0002","a0002":"a0001"}
+    elif mutation=="atom_count": data["topology"]["atom_count"]=3
+    elif mutation=="degrees": data["topology"]["degree_by_atom_id"]["a0001"]=2
+    elif mutation=="bridges": data["topology"]["bridge_bond_ids"]=[]
+    elif mutation=="cycles": data["topology"]["cycle_atom_ids"]=[["a0001","a0002"]]
+    else: data["topology"]["symmetry_class_by_atom_id"]={"a0001":True,"a0002":1}
+    with pytest.raises((TypeError,ValueError)): MoleculeEditorResult.from_process(exit_code=0,payload=data)
+
+
+@pytest.mark.parametrize("mutation",["invalid_no_errors","failed_geometry_no_errors","artifact_partial_outside","artifact_partial_result"])
+def test_diagnostics_and_failed_artifact_attacks_are_rejected(mutation) -> None:
+    if mutation=="invalid_no_errors": data=_invalid_payload(); data["errors"]=[]
+    else:
+        data=_real_payload(); data["geometry_status"]="FAILED"; data["artifact_status"]="FAILED"; data["graph"]["geometry_status"]="FAILED"; error={"code":"GEOMETRY_OPTIMIZATION_FAILED","message":"failed","details":{}}; full,compact=_geometry_placeholder("FAILED"); full["errors"]=[error]; compact["errors"]=[error]; data["geometry_result"]=full; data["geometry"]=compact; artifact_error={"code":"ARTIFACT_WRITE_FAILED","message":"failed","details":{}}; data["errors"]=[error,artifact_error]; data["artifacts"]={"paths":[],"planned_paths":["molecule.chemical-graph.json","result.json"],"partial_uncommitted_paths":[],"commit_marker":None,"planned_commit_marker":"result.json"}
+        if mutation=="failed_geometry_no_errors": data["geometry_result"]["errors"]=[]; data["geometry"]["errors"]=[]
+        elif mutation=="artifact_partial_outside": data["artifacts"]["partial_uncommitted_paths"]=["outside.tmp"]
+        else: data["artifacts"]["partial_uncommitted_paths"]=["result.json"]
+    with pytest.raises(ValueError): MoleculeEditorResult.from_process(exit_code=0,payload=data)
 
 
 @pytest.mark.parametrize("mutation",["duplicate_atom","bad_element","missing_endpoint","bad_direction","serial_bool"])
@@ -250,7 +297,8 @@ def test_ready_coordinates_are_bound_to_graph_identity(mutation) -> None:
 def test_ready_coordinates_accept_explicit_graph_hydrogens_and_geometry_hydrogens() -> None:
     data=_ready_payload(); graph=data["graph"]
     hydrogen={"atom_id":"a0003","atomic_number":1,"isotope":0,"formal_charge":0,"radical_electrons":0,"chiral_tag":"CHI_UNSPECIFIED","chiral_neighbor_atom_ids":[],"explicit_h_count":0,"no_implicit":False,"aromatic":False,"atom_map":None}
-    graph["atoms"].append(hydrogen); graph["next_atom_serial"]=4
+    graph["atoms"].append(hydrogen); graph["next_atom_serial"]=4; bond=deepcopy(graph["bonds"][0]); bond.update({"bond_id":"b0002","begin_atom_id":"a0001","end_atom_id":"a0003"}); graph["bonds"].append(bond); graph["next_bond_serial"]=3
+    data["atom_table"]=deepcopy(graph["atoms"]); data["bond_table"]=deepcopy(graph["bonds"]); data["atom_id_mapping"]["a0003"]="a0003"; data["bond_id_mapping"]["b0002"]="b0002"; data["topology"].update({"atom_count":3,"bond_count":2,"component_sizes":[3],"bridge_bond_ids":["b0001","b0002"],"degree_by_atom_id":{"a0001":2,"a0002":1,"a0003":1},"symmetry_class_by_atom_id":{"a0001":0,"a0002":1,"a0003":2}})
     order=data["coordinate_order"]; order.extend(["a0003","h:a0001:1"])
     coords=data["geometry_result"]["conformers"][0]["coordinates"]; coords.extend([{"atom_id":value,"atomic_number":1,"x_angstrom":0.0,"y_angstrom":1.0,"z_angstrom":0.0} for value in order[-2:]])
     data["geometry_result"]["coordinate_order"]=order
@@ -262,11 +310,13 @@ def test_non_double_graph_bond_requires_empty_stereo_atom_ids(bond_type) -> None
     data=_real_payload(); bond=data["graph"]["bonds"][0]; bond.update({"bond_type":bond_type,"stereo":"STEREONONE","stereo_atom_ids":["a0001","a0002"],"bond_direction":"NONE"})
     with pytest.raises(ValueError): MoleculeEditorResult.from_process(exit_code=0,payload=data)
     bond["stereo_atom_ids"]=[]
+    bond["aromatic"] = bond_type == "AROMATIC"
+    data["bond_table"]=deepcopy(data["graph"]["bonds"])
     assert MoleculeEditorResult.from_process(exit_code=0,payload=data).candidate
 
 
 def test_double_graph_bond_allows_valid_stereo_atom_ids() -> None:
-    data=_real_payload(); bond=data["graph"]["bonds"][0]; bond.update({"bond_type":"DOUBLE","stereo":"STEREOE","stereo_atom_ids":["a0001","a0002"],"bond_direction":"NONE"})
+    data=_payload_with_graph(_stereo_graph())
     assert MoleculeEditorResult.from_process(exit_code=0,payload=data).candidate
 
 
@@ -282,9 +332,9 @@ def test_non_double_command_requires_empty_stereo_atom_ids(operation,bond_type) 
 
 @pytest.mark.parametrize("operation",["add_bond","change_bond"])
 def test_double_command_allows_valid_stereo_atom_ids(operation) -> None:
-    command={"operation":operation,"bond_type":"DOUBLE","stereo":"STEREOE","stereo_atom_ids":["a0001","a0002"]}
+    graph=_stereo_graph(include_center=operation=="change_bond"); command={"operation":operation,"bond_type":"DOUBLE","stereo":"STEREOE","stereo_atom_ids":["a0003","a0004"]}
     command.update({"begin":"a0001","end":"a0002"} if operation=="add_bond" else {"bond_id":"b0001"})
-    assert MoleculeEditorProvider._commands([command],_real_graph())==[command]
+    assert MoleculeEditorProvider._commands([command],graph)==[command]
 
 
 @pytest.mark.parametrize(
