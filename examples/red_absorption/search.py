@@ -5,14 +5,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from pathlib import Path
+import stat
+import sys
 
 from multi_agent_pso.configuration import LoadedRunInputs, TaskPackage
 from multi_agent_pso.core.topology import RingTopology
 from multi_agent_pso.core.update_rule import ConstrictedUpdateRule
 from multi_agent_pso.orchestration import AgentLoop, SynchronousSwarmRunner
 from multi_agent_pso.reporting import build_run_report_from_store, publish_run_report
-from multi_agent_pso.resources import AsyncSemaphoreResourceManager
+from multi_agent_pso.resources import AsyncSemaphoreResourceManager, SQLiteBudgetLedger
 from multi_agent_pso.retrieval import LocalWikiRetriever
 from multi_agent_pso.runtimes import LocalCodexRuntime
 from multi_agent_pso.storage import FileArtifactStore, SQLiteRunStore
@@ -46,10 +49,43 @@ def _config_hash(task: TaskPackage, inputs: LoadedRunInputs, record: PreflightRe
 def _particle_workspace(root: Path, run_id: str, particle_id: str) -> Path:
     if not particle_id or "/" in particle_id or "\\" in particle_id or ".." in particle_id:
         raise ValueError("particle_id is unsafe for a workspace")
-    workspace = root / "workspaces" / run_id / particle_id
-    workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
-    workspace.chmod(0o700)
-    return workspace.resolve(strict=True)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("workspace root is unsafe")
+    root = root.resolve(strict=True)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptors = [os.open(root, flags)]
+    try:
+        for part in ("workspaces", run_id, particle_id):
+            parent_fd = descriptors[-1]
+            try:
+                child_fd = os.open(part, flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                os.mkdir(part, mode=0o700, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+                child_fd = os.open(part, flags, dir_fd=parent_fd)
+            except OSError as error:
+                raise ValueError(
+                    "workspace path contains a symlink or unsafe component"
+                ) from error
+            metadata = os.fstat(child_fd)
+            if not stat.S_ISDIR(metadata.st_mode):
+                os.close(child_fd)
+                raise ValueError("workspace component is not a directory")
+            descriptors.append(child_fd)
+        os.fchmod(descriptors[-1], 0o700)
+        public = root.joinpath("workspaces", run_id, particle_id)
+        namespace = os.stat(
+            particle_id,
+            dir_fd=descriptors[-2],
+            follow_symlinks=False,
+        )
+        opened = os.fstat(descriptors[-1])
+        if (namespace.st_dev, namespace.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError("workspace namespace changed during creation")
+        return public
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 async def run_red_absorption_search(
@@ -75,24 +111,34 @@ async def run_red_absorption_search(
         runs_dir.parent.resolve(strict=True),
         molecule_editor=molecule_editor,
     )
-    config_hash = _config_hash(task, loaded, preflight)
-    run_id = f"red-{config_hash[:24]}"
-    root = runs_dir.resolve(strict=False)
-    root.mkdir(parents=True, exist_ok=True)
-    artifacts = FileArtifactStore(root / "artifacts")
-    store = SQLiteRunStore(root / "runs.sqlite")
-    wiki = LocalWikiRetriever(spec.wiki.path)
-    spectrum = JsonCommandProvider(inputs.spectrum_argv)
-    workflow_resources = RedAbsorptionWorkflowResources.from_inputs(
-        inputs, max_new_evaluations=preflight.max_new_evaluations
-    )
-    slots = AsyncSemaphoreResourceManager(
-        agent_concurrency=spec.concurrency.agents,
-        evaluation_concurrency=spec.concurrency.evaluations,
-    )
-    stage_context = RedAbsorptionStageContextProvider(inputs, wiki, editor)
-    tools: list[RedAbsorptionWorkflowToolProvider] = []
-    runtime = LocalCodexRuntime(model=spec.agent.model)
+    spectrum = None
+    try:
+        config_hash = _config_hash(task, loaded, preflight)
+        run_id = f"red-{config_hash[:24]}"
+        root = runs_dir.resolve(strict=False)
+        root.mkdir(parents=True, exist_ok=True)
+        artifacts = FileArtifactStore(root / "artifacts")
+        store = SQLiteRunStore(root / "runs.sqlite")
+        wiki = LocalWikiRetriever(spec.wiki.path)
+        spectrum = JsonCommandProvider(inputs.spectrum_argv)
+        workflow_resources = RedAbsorptionWorkflowResources.from_inputs(
+            inputs,
+            max_new_evaluations=preflight.max_new_evaluations,
+            ledger=SQLiteBudgetLedger(root / "evaluation_budget.sqlite"),
+            run_id=run_id,
+        )
+        slots = AsyncSemaphoreResourceManager(
+            agent_concurrency=spec.concurrency.agents,
+            evaluation_concurrency=spec.concurrency.evaluations,
+        )
+        stage_context = RedAbsorptionStageContextProvider(inputs, wiki, editor)
+        tools: list[RedAbsorptionWorkflowToolProvider] = []
+        runtime = LocalCodexRuntime(model=spec.agent.model)
+    except BaseException:
+        if spectrum is not None:
+            await spectrum.aclose()
+        await editor.aclose()
+        raise
     try:
         async with runtime:
             def make_loop(particle_id, target):
@@ -152,9 +198,27 @@ async def run_red_absorption_search(
             "spectrum_execution_count": workflow_resources.execution_count,
         }
     finally:
-        await asyncio.gather(*(tool.aclose() for tool in tools), return_exceptions=True)
-        await spectrum.aclose()
-        await editor.aclose()
+        primary = sys.exception()
+        cleanup_errors = [
+            result
+            for result in await asyncio.gather(
+                *(tool.aclose() for tool in tools), return_exceptions=True
+            )
+            if isinstance(result, BaseException)
+        ]
+        for resource in (spectrum, editor):
+            try:
+                await resource.aclose()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if primary is not None:
+            for error in cleanup_errors:
+                primary.add_note(f"search cleanup failed: {error!r}")
+        elif cleanup_errors:
+            first, *rest = cleanup_errors
+            for error in rest:
+                first.add_note(f"additional search cleanup failed: {error!r}")
+            raise first
 
 
 __all__ = ["run_red_absorption_search"]

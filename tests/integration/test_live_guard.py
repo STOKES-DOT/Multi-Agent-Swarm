@@ -5,7 +5,10 @@ from types import SimpleNamespace
 
 import multi_agent_pso.cli as cli_module
 from multi_agent_pso.cli import main
-from multi_agent_pso.resources import AsyncSemaphoreResourceManager
+from multi_agent_pso.resources import (
+    AsyncSemaphoreResourceManager,
+    SQLiteBudgetLedger,
+)
 from examples.red_absorption.search import _particle_workspace
 
 
@@ -27,6 +30,42 @@ def test_particle_workspaces_are_private_canonical_and_distinct(tmp_path) -> Non
     assert p0 != p1
     assert p0.is_dir() and p1.is_dir()
     assert p0.stat().st_mode & 0o777 == 0o700
+
+
+def test_particle_workspace_rejects_symlink_without_chmod_target(tmp_path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    workspaces = tmp_path / "workspaces"
+    workspaces.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink|unsafe"):
+        _particle_workspace(tmp_path, "run-1", "p0")
+    assert outside.stat().st_mode & 0o777 == 0o755
+
+
+def test_sqlite_budget_reservation_is_atomic_persistent_and_cache_reopenable(tmp_path):
+    import threading
+
+    path = tmp_path / "budget.sqlite"
+    ledger = SQLiteBudgetLedger(path)
+    barrier = threading.Barrier(30)
+    accepted = []
+
+    def reserve(index):
+        barrier.wait()
+        if ledger.reserve("run-1", f"key-{index}", 25):
+            accepted.append(index)
+
+    threads = [threading.Thread(target=reserve, args=(index,)) for index in range(30)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(accepted) == ledger.count("run-1") == 25
+    key = f"key-{accepted[0]}"
+    ledger.commit("run-1", key, {"spectrum": "cached"})
+    reopened = SQLiteBudgetLedger(path)
+    assert reopened.get("run-1", key) == {"spectrum": "cached"}
+    assert not reopened.reserve("run-1", "overflow", 25)
 
 
 def task_file(tmp_path):
@@ -114,7 +153,25 @@ def test_preflight_cli_invokes_preflight_once_and_prints_sanitized_summary(
         cli_module,
         "_execute_red_preflight",
         lambda *values: calls.append(values)
-        or SimpleNamespace(identity="a" * 64, max_new_evaluations=25, passed=True),
+        or SimpleNamespace(
+            identity="a" * 64,
+            artifact_relative_path="preflight/a.json",
+            authentication_method="chatgpt",
+            parent_state_hash="b" * 64,
+            parent_chemical_hash="c" * 64,
+            parent_geometry_hash="d" * 64,
+            protocol_functional="B3LYP",
+            protocol_basis="STO-3G",
+            protocol_method="TDDFT",
+            protocol_backend="fixture",
+            protocol_backend_version="1",
+            backend_hardware="cpu",
+            geometry_workflow="vertical_from_molecule_editor",
+            evaluation_concurrency=1,
+            spectrum_timeout_seconds=60.0,
+            max_new_evaluations=25,
+            passed=True,
+        ),
     )
     assert main(
         [

@@ -23,6 +23,8 @@ class FakeSpectrum:
         self.calls = 0
         self.wrong_geometry = wrong_geometry
         self.failed = failed
+        self.close_calls = 0
+        self.close_error = None
 
     async def execute_json(self, payload, **kwargs):
         self.calls += 1
@@ -49,6 +51,11 @@ class FakeSpectrum:
         }
         return SimpleNamespace(status=SimpleNamespace(value="SUCCESS"), stdout_text=json.dumps(spectrum))
 
+    async def aclose(self):
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
+
 
 class ClosingEditor(FakeEditor):
     def __init__(self, graph):
@@ -57,6 +64,31 @@ class ClosingEditor(FakeEditor):
 
     async def aclose(self):
         self.close_calls += 1
+
+
+@pytest.mark.asyncio
+async def test_preflight_publishes_only_after_all_owned_resources_close_cleanly(tmp_path):
+    loaded = fake_loaded_inputs(tmp_path)
+    editor = ClosingEditor(parent_graph())
+    spectrum = FakeSpectrum()
+    spectrum.close_error = RuntimeError("close failed")
+    with pytest.raises(RuntimeError, match="close failed"):
+        await preflight_red_absorption(
+            tmp_path / "task.yaml",
+            tmp_path / "inputs.yaml",
+            tmp_path / "runs",
+            dependencies=PreflightDependencies(
+                task_loader=lambda path: fake_task(),
+                input_loader=lambda path: loaded,
+                auth_probe=lambda: {"authenticated": True, "method": "chatgpt"},
+                molecule_editor=editor,
+                spectrum=spectrum,
+                sdk_version="0.147.0",
+                own_resources=True,
+            ),
+        )
+    assert spectrum.close_calls == editor.close_calls == 1
+    assert not (tmp_path / "runs" / "artifacts").exists()
 
 
 def fake_loaded_inputs(tmp_path):

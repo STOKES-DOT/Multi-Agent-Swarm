@@ -3,7 +3,9 @@
 import argparse
 import asyncio
 import json
+import os
 import sqlite3
+import stat
 import sys
 from pathlib import Path
 import yaml
@@ -16,8 +18,18 @@ from . import __version__
 def _expected_red_evaluations(task_path: Path) -> int:
     if not isinstance(task_path, Path) or task_path.is_symlink() or not task_path.is_file():
         raise ValueError("task must be an existing regular file")
-    data = task_path.read_bytes()
-    if len(data) > 1024 * 1024:
+    descriptor = os.open(
+        task_path,
+        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024 * 1024:
+            raise ValueError("task file exceeds guard byte limit")
+        data = os.read(descriptor, 1024 * 1024 + 1)
+    finally:
+        os.close(descriptor)
+    if len(data) > 1024 * 1024 or len(data) != metadata.st_size:
         raise ValueError("task file exceeds guard byte limit")
     raw = yaml.load(data.decode("utf-8"), Loader=_UniqueKeySafeLoader)
     try:
@@ -152,7 +164,27 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps(
                     {
                         "identity": record.identity,
+                        "artifact_path": record.artifact_relative_path,
+                        "authentication_method": record.authentication_method,
+                        "parent_hashes": {
+                            "state": record.parent_state_hash,
+                            "chemical": record.parent_chemical_hash,
+                            "geometry": record.parent_geometry_hash,
+                        },
+                        "protocol": {
+                            "functional": record.protocol_functional,
+                            "basis": record.protocol_basis,
+                            "method": record.protocol_method,
+                            "backend": record.protocol_backend,
+                            "backend_version": record.protocol_backend_version,
+                            "hardware": record.backend_hardware,
+                            "geometry_workflow": record.geometry_workflow,
+                        },
+                        "evaluation_concurrency": record.evaluation_concurrency,
+                        "spectrum_timeout_seconds": record.spectrum_timeout_seconds,
                         "max_new_evaluations": record.max_new_evaluations,
+                        "estimated_total_spectrum_calculations": 1
+                        + record.max_new_evaluations,
                         "passed": record.passed,
                     },
                     sort_keys=True,

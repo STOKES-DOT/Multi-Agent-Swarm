@@ -9,8 +9,11 @@ import hashlib
 import importlib.metadata
 import inspect
 import json
+import os
 from pathlib import Path
 import re
+import stat
+import sys
 from types import MappingProxyType
 from typing import Any
 
@@ -36,6 +39,27 @@ from .models import SpectrumResult
 
 _HASH = re.compile(r"^[0-9a-f]{64}$")
 _MAX_PREFLIGHT_BYTES = 256 * 1024
+
+
+def _validate_storage_target(runs_dir: Path) -> None:
+    if not isinstance(runs_dir, Path):
+        raise TypeError("runs_dir must be a Path")
+    parent = runs_dir.parent.resolve(strict=True)
+    if not parent.is_dir() or not os.access(parent, os.W_OK):
+        raise ValueError("run storage parent is not writable")
+    if runs_dir.exists() or runs_dir.is_symlink():
+        metadata = os.lstat(runs_dir)
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("runs_dir must be a regular directory namespace")
+        database = runs_dir / "runs.sqlite"
+        if database.exists() or database.is_symlink():
+            database_metadata = os.lstat(database)
+            if stat.S_ISLNK(database_metadata.st_mode) or not stat.S_ISREG(
+                database_metadata.st_mode
+            ):
+                raise ValueError("runs.sqlite target is unsafe")
+    if not all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW")):
+        raise RuntimeError("run storage claims require POSIX no-follow support")
 
 
 def _base_contract_identity(
@@ -70,6 +94,8 @@ def _contract_identity(
     spectrum_hash: str,
     evaluation_status: str,
     passed: bool,
+    authentication_method: str,
+    backend_hardware: str,
 ) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -81,6 +107,8 @@ def _contract_identity(
                 "preflight_spectrum_hash": spectrum_hash,
                 "spectrum_evaluation_status": evaluation_status,
                 "passed": passed,
+                "authentication_method": authentication_method,
+                "backend_hardware": backend_hardware,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -107,6 +135,7 @@ class PreflightRecord(BaseModel):
     protocol_method: str
     protocol_backend: str
     protocol_backend_version: str
+    backend_hardware: str
     geometry_workflow: str
     authentication_method: str
     versions: Mapping[str, str]
@@ -157,6 +186,8 @@ class PreflightRecord(BaseModel):
             self.preflight_spectrum_hash,
             self.spectrum_evaluation_status,
             self.passed,
+            self.authentication_method,
+            self.backend_hardware,
         )
         if self.base_identity != expected_base or self.identity != expected:
             raise ValueError("preflight identity does not match its contract fields")
@@ -171,6 +202,11 @@ class PreflightRecord(BaseModel):
             allow_nan=False,
         ).encode("utf-8") + b"\n"
 
+    @property
+    def artifact_relative_path(self) -> str:
+        digest = hashlib.sha256(self.canonical_bytes()).hexdigest()
+        return f"preflight/{digest}.json"
+
 
 @dataclass(frozen=True, slots=True)
 class PreflightDependencies:
@@ -184,6 +220,7 @@ class PreflightDependencies:
     sdk_version: str | None = None
     runtime_version: str = "local-codex-runtime:v1"
     molecule_editor_version: str = "0.1.0"
+    own_resources: bool = False
 
 
 def _parent_source(inputs: RedAbsorptionRunInputs) -> dict[str, object]:
@@ -259,13 +296,47 @@ async def _default_auth_probe() -> Mapping[str, object]:
         "codex",
         "login",
         "status",
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
-    if len(stdout) + len(stderr) > 64 * 1024 or process.returncode != 0:
+    async def read_bounded(stream) -> bytes:
+        value = bytearray()
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                return bytes(value)
+            value.extend(chunk)
+            if len(value) > 64 * 1024:
+                raise RuntimeError("Codex authentication output exceeded 64 KiB")
+
+    try:
+        stdout, stderr, returncode = await asyncio.wait_for(
+            asyncio.gather(
+                read_bounded(process.stdout),
+                read_bounded(process.stderr),
+                process.wait(),
+            ),
+            timeout=10,
+        )
+    except BaseException:
+        if process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=0.25)
+            except (TimeoutError, ProcessLookupError):
+                if process.returncode is None:
+                    process.kill()
+                await process.wait()
+        raise
+    if returncode != 0:
         raise RuntimeError("Codex authentication status is unavailable")
-    text = (stdout + stderr).decode("utf-8", errors="replace").casefold()
+    try:
+        text = (stdout + stderr).decode("utf-8").casefold()
+    except UnicodeDecodeError as error:
+        raise RuntimeError("Codex authentication status is not UTF-8") from error
+    if not any(marker in text for marker in ("logged in", "authenticated")):
+        raise RuntimeError("Codex status did not confirm authentication")
     return {
         "authenticated": True,
         "method": "chatgpt" if "chatgpt" in text else "codex-login",
@@ -310,12 +381,17 @@ async def preflight_red_absorption(
     dependencies: PreflightDependencies | None = None,
 ) -> PreflightRecord:
     dependencies = dependencies or PreflightDependencies()
+    _validate_storage_target(runs_dir)
     task = dependencies.task_loader(task_path)
     loaded = dependencies.input_loader(inputs_path)
     inputs = loaded.value
     maximum = task.spec.pso.population_size * task.spec.pso.iterations
     if maximum != 25:
         raise ValueError("red-absorption v1 preflight requires a 5 x 5 search")
+    if inputs.parent.protected_smarts:
+        raise ValueError(
+            "protected_smarts require CLI-authoritative AtomId enumeration before preflight"
+        )
     auth_probe = dependencies.auth_probe or _default_auth_probe
     auth = await _resolve_probe(auth_probe())
     if not isinstance(auth, Mapping) or auth.get("authenticated") is not True:
@@ -327,8 +403,8 @@ async def preflight_red_absorption(
 
     editor = dependencies.molecule_editor or MoleculeEditorProvider()
     spectrum = dependencies.spectrum or JsonCommandProvider(inputs.spectrum_argv)
-    own_editor = dependencies.molecule_editor is None
-    own_spectrum = dependencies.spectrum is None
+    own_editor = dependencies.molecule_editor is None or dependencies.own_resources
+    own_spectrum = dependencies.spectrum is None or dependencies.own_resources
     try:
         inspection = await editor.inspect(
             _parent_source(inputs),
@@ -380,6 +456,14 @@ async def preflight_red_absorption(
                 "preflight requires SUCCESS spectrum and evaluation status"
             )
         protocol = inputs.calculation_protocol
+        backend_metadata = result.provenance.backend_metadata
+        hardware = (
+            backend_metadata.get("hardware", "not-recorded")
+            if isinstance(backend_metadata, Mapping)
+            else "not-recorded"
+        )
+        if not isinstance(hardware, str) or not hardware.strip():
+            hardware = "not-recorded"
         base_identity = _identity(task, loaded, versions)
         identity = _contract_identity(
             base_identity,
@@ -389,6 +473,8 @@ async def preflight_red_absorption(
             result.spectrum_hash,
             evaluation.status.value,
             True,
+            method,
+            hardware,
         )
         record = PreflightRecord(
             identity=identity,
@@ -407,6 +493,7 @@ async def preflight_red_absorption(
             protocol_method=protocol.excited_state_method,
             protocol_backend=protocol.backend,
             protocol_backend_version=protocol.backend_version,
+            backend_hardware=hardware,
             geometry_workflow=protocol.geometry_workflow,
             authentication_method=method,
             versions=versions,
@@ -417,27 +504,41 @@ async def preflight_red_absorption(
             max_new_evaluations=maximum,
             passed=True,
         )
-        store = FileArtifactStore(runs_dir / "artifacts")
-        record_bytes = record.canonical_bytes()
-        content_hash = hashlib.sha256(record_bytes).hexdigest()
-        path = f"preflight/{content_hash}.json"
-        try:
-            store.publish_bytes(path, record_bytes, "application/json")
-        except FileExistsError:
-            reference = ArtifactRef(
-                relative_path=path,
-                sha256=content_hash,
-                size_bytes=len(record_bytes),
-                media_type="application/json",
-                committed=True,
-            )
-            store.verify(reference)
-        return record
     finally:
-        if own_spectrum:
-            await spectrum.aclose()
-        if own_editor:
-            await editor.aclose()
+        primary = sys.exception()
+        cleanup_error: BaseException | None = None
+        for owned, resource in ((own_spectrum, spectrum), (own_editor, editor)):
+            if not owned:
+                continue
+            try:
+                await resource.aclose()
+            except BaseException as error:
+                if primary is not None:
+                    primary.add_note(f"preflight cleanup failed: {error!r}")
+                elif cleanup_error is None:
+                    cleanup_error = error
+                else:
+                    cleanup_error.add_note(
+                        f"additional preflight cleanup failed: {error!r}"
+                    )
+        if primary is None and cleanup_error is not None:
+            raise cleanup_error
+    store = FileArtifactStore(runs_dir / "artifacts")
+    record_bytes = record.canonical_bytes()
+    content_hash = hashlib.sha256(record_bytes).hexdigest()
+    path = f"preflight/{content_hash}.json"
+    try:
+        store.publish_bytes(path, record_bytes, "application/json")
+    except FileExistsError:
+        reference = ArtifactRef(
+            relative_path=path,
+            sha256=content_hash,
+            size_bytes=len(record_bytes),
+            media_type="application/json",
+            committed=True,
+        )
+        store.verify(reference)
+    return record
 
 
 def verify_red_absorption_preflight(
@@ -451,25 +552,46 @@ def verify_red_absorption_preflight(
     directory = runs_dir / "artifacts" / "preflight"
     if directory.is_symlink() or not directory.is_dir():
         raise ValueError("matching preflight artifact is missing")
-    candidates = sorted(directory.iterdir())
-    if len(candidates) > 1024:
-        raise ValueError("preflight artifact directory exceeds its entry budget")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    directory_fd = os.open(directory, flags | os.O_DIRECTORY)
+    documents: list[tuple[str, bytes]] = []
+    try:
+        names = []
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                names.append(entry.name)
+                if len(names) > 1024:
+                    raise ValueError(
+                        "preflight artifact directory exceeds its entry budget"
+                    )
+        for name in sorted(names):
+            expected_hash = name.removesuffix(".json")
+            if not name.endswith(".json") or _HASH.fullmatch(expected_hash) is None:
+                continue
+            descriptor = os.open(name, flags, dir_fd=directory_fd)
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    continue
+                if metadata.st_size > _MAX_PREFLIGHT_BYTES:
+                    raise ValueError("preflight artifact exceeds its byte budget")
+                data = os.read(descriptor, _MAX_PREFLIGHT_BYTES + 1)
+                if len(data) != metadata.st_size:
+                    raise ValueError("preflight artifact changed while reading")
+                documents.append((name, data))
+            finally:
+                os.close(descriptor)
+    finally:
+        os.close(directory_fd)
     matches = []
     store = FileArtifactStore(runs_dir / "artifacts")
-    for path in candidates:
-        if path.is_symlink() or not path.is_file() or not path.name.endswith(".json"):
-            continue
-        expected_hash = path.stem
-        if _HASH.fullmatch(expected_hash) is None:
-            continue
-        data = path.read_bytes()
-        if len(data) > _MAX_PREFLIGHT_BYTES:
-            raise ValueError("preflight artifact exceeds its byte budget")
+    for name, data in documents:
+        expected_hash = name.removesuffix(".json")
         actual_hash = hashlib.sha256(data).hexdigest()
         if actual_hash != expected_hash:
             raise ValueError("preflight artifact content hash mismatch")
         reference = ArtifactRef(
-            relative_path=f"preflight/{path.name}",
+            relative_path=f"preflight/{name}",
             sha256=actual_hash,
             size_bytes=len(data),
             media_type="application/json",

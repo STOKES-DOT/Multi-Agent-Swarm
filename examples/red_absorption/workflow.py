@@ -11,6 +11,7 @@ from typing import Protocol
 from multi_agent_pso.core import AgentStage
 from multi_agent_pso.protocols import ToolContext, ToolRequest, ToolResult, ToolStatus
 from multi_agent_pso.tools import JsonCommandProvider, JsonCommandStatus
+from multi_agent_pso.resources import SQLiteBudgetLedger
 
 from .evaluator import EVALUATOR_VERSION
 from .inputs import RedAbsorptionRunInputs
@@ -54,6 +55,8 @@ class RedAbsorptionWorkflowResources:
         inputs: RedAbsorptionRunInputs,
         cache: MutableMapping[CacheKey, SpectrumResult],
         max_new_evaluations: int,
+        ledger: SQLiteBudgetLedger | None,
+        run_id: str | None,
     ):
         self._concurrency = inputs.evaluation_concurrency
         self._protocol_hash = inputs.calculation_protocol.protocol_hash
@@ -65,6 +68,8 @@ class RedAbsorptionWorkflowResources:
         self._cache_hit_count = 0
         self._max_new_evaluations = max_new_evaluations
         self._budget_lock = asyncio.Lock()
+        self._ledger = ledger
+        self._run_id = run_id
         self._loop = None
         self._loop_guard = threading.Lock()
 
@@ -75,6 +80,8 @@ class RedAbsorptionWorkflowResources:
         cache: MutableMapping[CacheKey, SpectrumResult] | None = None,
         *,
         max_new_evaluations: int = 25,
+        ledger: SQLiteBudgetLedger | None = None,
+        run_id: str | None = None,
     ) -> "RedAbsorptionWorkflowResources":
         if not isinstance(inputs, RedAbsorptionRunInputs):
             raise TypeError("inputs must be RedAbsorptionRunInputs")
@@ -82,7 +89,15 @@ class RedAbsorptionWorkflowResources:
             raise TypeError("cache must be a mutable mapping")
         if type(max_new_evaluations) is not int or max_new_evaluations <= 0:
             raise ValueError("max_new_evaluations must be a positive integer")
-        return cls(inputs, {} if cache is None else cache, max_new_evaluations)
+        if (ledger is None) != (run_id is None):
+            raise ValueError("ledger and run_id must be supplied together")
+        return cls(
+            inputs,
+            {} if cache is None else cache,
+            max_new_evaluations,
+            ledger,
+            run_id,
+        )
 
     @property
     def concurrency(self) -> int:
@@ -90,7 +105,11 @@ class RedAbsorptionWorkflowResources:
 
     @property
     def execution_count(self) -> int:
-        return self._execution_count
+        return (
+            self._execution_count
+            if self._ledger is None
+            else self._ledger.count(self._run_id)
+        )
 
     @property
     def cache_hit_count(self) -> int:
@@ -110,8 +129,33 @@ class RedAbsorptionWorkflowResources:
         async with self._locks_guard:
             return self._locks.setdefault(key, asyncio.Lock())
 
-    async def _reserve_execution(self) -> bool:
+    @staticmethod
+    def _ledger_key(key: CacheKey) -> str:
+        import hashlib
+        import json
+
+        return hashlib.sha256(
+            json.dumps(key, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _recover(self, key: CacheKey) -> SpectrumResult | None:
+        if self._ledger is None:
+            return None
+        payload = self._ledger.get(self._run_id, self._ledger_key(key))
+        return None if payload is None else SpectrumResult.model_validate(payload)
+
+    def _commit_result(self, key: CacheKey, result: SpectrumResult) -> None:
+        if self._ledger is not None:
+            self._ledger.commit(
+                self._run_id, self._ledger_key(key), result.model_dump(mode="json")
+            )
+
+    async def _reserve_execution(self, key: CacheKey) -> bool:
         async with self._budget_lock:
+            if self._ledger is not None:
+                return self._ledger.reserve(
+                    self._run_id, self._ledger_key(key), self._max_new_evaluations
+                )
             if self._execution_count >= self._max_new_evaluations:
                 return False
             self._execution_count += 1
@@ -125,6 +169,42 @@ def _parent_source(inputs: RedAbsorptionRunInputs) -> dict[str, object]:
     if parent.kind == "chemical_graph":
         return {"kind": "chemical_graph", "value": parent.value}
     return {"kind": "path", "path": parent.path, "format": parent.format}
+
+
+def _violates_protection_policy(
+    inputs: RedAbsorptionRunInputs, authoritative: Mapping[str, object]
+) -> bool:
+    if inputs.parent.protected_smarts:
+        # SMARTS matching belongs to the CLI authority. Until its inspection
+        # envelope exposes matched AtomIds, fail closed instead of guessing.
+        return True
+    protected = set(inputs.parent.protected_atom_ids)
+    if not protected:
+        return False
+    graph = authoritative.get("inspected_graph")
+    commands = authoritative.get("commands")
+    if not isinstance(graph, Mapping) or not isinstance(commands, (list, tuple)):
+        return True
+    bond_atoms = {
+        bond.get("bond_id"): {bond.get("begin_atom_id"), bond.get("end_atom_id")}
+        for bond in graph.get("bonds", [])
+        if isinstance(bond, Mapping)
+    }
+    atom_fields = (
+        "atom_id",
+        "anchor_atom_id",
+        "retained_atom_id",
+        "begin",
+        "end",
+    )
+    for command in commands:
+        if not isinstance(command, Mapping):
+            return True
+        touched = {command.get(field) for field in atom_fields}
+        touched.update(bond_atoms.get(command.get("bond_id"), set()))
+        if protected & touched:
+            return True
+    return False
 
 
 class RedAbsorptionWorkflowToolProvider:
@@ -247,6 +327,11 @@ class RedAbsorptionWorkflowToolProvider:
                 error="tool request differs from persisted proposal",
             )
         inputs = self._inputs
+        if _violates_protection_policy(inputs, authoritative):
+            return ToolResult(
+                ToolStatus.REJECTED,
+                error="edit violates protected parent structure policy",
+            )
         resources = self._resources
         geometry = inputs.geometry.model_dump(mode="json")
         try:
@@ -337,16 +422,16 @@ class RedAbsorptionWorkflowToolProvider:
         )
         lock = await resources._lock_for(key)
         async with lock:
-            spectrum_result = resources._cache.get(key)
+            spectrum_result = resources._cache.get(key) or resources._recover(key)
             spectrum_process = None
             if spectrum_result is None:
                 async with resources._spectrum_slots:
-                    spectrum_result = resources._cache.get(key)
+                    spectrum_result = resources._cache.get(key) or resources._recover(key)
                     if spectrum_result is not None:
                         resources._cache_hit_count += 1
                         cache_hit = True
                     else:
-                        if not await resources._reserve_execution():
+                        if not await resources._reserve_execution(key):
                             return ToolResult(
                                 ToolStatus.REJECTED,
                                 {"cache_key": list(key), "cache_hit": False},
@@ -412,6 +497,7 @@ class RedAbsorptionWorkflowToolProvider:
                                 failed_process_payload,
                                 error="spectrum provenance mismatch",
                             )
+                        resources._commit_result(key, spectrum_result)
                         resources._cache[key] = spectrum_result
                         cache_hit = False
             else:
