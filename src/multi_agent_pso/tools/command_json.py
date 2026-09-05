@@ -495,6 +495,7 @@ class JsonCommandProvider:
             asyncio.Task[None],
             asyncio.Task[asyncio.subprocess.Process | _SpawnFailure],
         ] = {}
+        self._ownerships: set[asyncio.Event] = set()
 
     @property
     def argv(self) -> tuple[str, ...]:
@@ -506,7 +507,7 @@ class JsonCommandProvider:
 
     @property
     def pending_cleanup_count(self) -> int:
-        return len(self._guardians)
+        return len(self._ownerships)
 
     async def __aenter__(self) -> "JsonCommandProvider":
         if self._closed:
@@ -518,15 +519,23 @@ class JsonCommandProvider:
 
     async def aclose(self) -> None:
         self._closed = True
-        if not self._guardians:
+        if not self._ownerships:
             return
-        guardians = tuple(self._guardians)
-        done, _ = await asyncio.wait(
-            guardians,
+        waiters = tuple(
+            asyncio.create_task(ownership.wait())
+            for ownership in tuple(self._ownerships)
+        )
+        done, pending = await asyncio.wait(
+            waiters,
             timeout=_CLOSE_HANDOFF_GRACE_SECONDS,
         )
-        for guardian in done:
-            self._forget_guardian(guardian)
+        for waiter in pending:
+            waiter.cancel()
+        await asyncio.gather(*done, *pending, return_exceptions=True)
+
+    def _release_ownership(self, ownership: asyncio.Event) -> None:
+        self._ownerships.discard(ownership)
+        ownership.set()
 
     def _forget_guardian(self, guardian: asyncio.Task[None]) -> None:
         self._guardians.pop(guardian, None)
@@ -538,14 +547,16 @@ class JsonCommandProvider:
     def _register_guardian(
         self,
         spawn_task: asyncio.Task[asyncio.subprocess.Process | _SpawnFailure],
+        ownership: asyncio.Event,
     ) -> None:
-        guardian = asyncio.create_task(self._guard_spawn(spawn_task))
+        guardian = asyncio.create_task(self._guard_spawn(spawn_task, ownership))
         self._guardians[guardian] = spawn_task
         guardian.add_done_callback(self._forget_guardian)
 
     async def _guard_spawn(
         self,
         spawn_task: asyncio.Task[asyncio.subprocess.Process | _SpawnFailure],
+        ownership: asyncio.Event,
     ) -> None:
         try:
             outcome = await asyncio.shield(spawn_task)
@@ -553,10 +564,13 @@ class JsonCommandProvider:
                 await self._capture_late_process(outcome)
         except BaseException:
             pass
+        finally:
+            self._release_ownership(ownership)
 
     async def _bounded_spawn_handoff(
         self,
         spawn_task: asyncio.Task[asyncio.subprocess.Process | _SpawnFailure],
+        ownership: asyncio.Event,
         primary: asyncio.CancelledError | None,
     ) -> tuple[
         asyncio.subprocess.Process | _SpawnFailure | None,
@@ -579,7 +593,7 @@ class JsonCommandProvider:
                         "JSON command spawn cleanup was cancelled",
                     )
         if not spawn_task.done():
-            self._register_guardian(spawn_task)
+            self._register_guardian(spawn_task, ownership)
             return None, primary
         try:
             return spawn_task.result(), primary
@@ -639,56 +653,63 @@ class JsonCommandProvider:
         deadline = started_clock + timeout
         stdin = _canonical_stdin(payload, self._limits)
         spawn_task = asyncio.create_task(_capture_spawn(*self._argv, cwd=directory))
+        ownership = asyncio.Event()
+        self._ownerships.add(ownership)
         remaining = max(0.0, deadline - time.monotonic())
         try:
             spawn_done, _ = await asyncio.wait((spawn_task,), timeout=remaining)
         except asyncio.CancelledError as cancellation:
             outcome, cancellation = await self._bounded_spawn_handoff(
                 spawn_task,
+                ownership,
                 cancellation,
             )
             if isinstance(outcome, asyncio.subprocess.Process):
-                await self._capture_late_process(
-                    outcome,
-                    primary=cancellation,
-                )
-            elif isinstance(outcome, _SpawnFailure) and not isinstance(
-                outcome.error, asyncio.CancelledError
-            ):
-                _add_secondary(
-                    cancellation,
-                    outcome.error,
-                    "JSON command spawn failed during cancellation",
-                )
+                try:
+                    await self._capture_late_process(
+                        outcome,
+                        primary=cancellation,
+                    )
+                finally:
+                    self._release_ownership(ownership)
+            elif isinstance(outcome, _SpawnFailure):
+                self._release_ownership(ownership)
+                if not isinstance(outcome.error, asyncio.CancelledError):
+                    _add_secondary(
+                        cancellation,
+                        outcome.error,
+                        "JSON command spawn failed during cancellation",
+                    )
             raise cancellation
 
         if not spawn_done:
             outcome, timeout_cancellation = await self._bounded_spawn_handoff(
                 spawn_task,
+                ownership,
                 None,
             )
             if isinstance(outcome, asyncio.subprocess.Process):
-                stdout, stderr, exit_code = await self._capture_late_process(
-                    outcome,
-                    primary=timeout_cancellation,
-                )
+                try:
+                    stdout, stderr, exit_code = await self._capture_late_process(
+                        outcome,
+                        primary=timeout_cancellation,
+                    )
+                finally:
+                    self._release_ownership(ownership)
             else:
                 exit_code = None
                 stdout = b""
                 stderr = b""
-                if timeout_cancellation is not None and isinstance(
-                    outcome, _SpawnFailure
-                ):
-                    _add_secondary(
-                        timeout_cancellation,
-                        outcome.error,
-                        "JSON command spawn failed during cancellation",
-                    )
-                elif isinstance(outcome, _SpawnFailure) and not isinstance(
-                    outcome.error,
-                    Exception,
-                ):
-                    raise outcome.error
+                if isinstance(outcome, _SpawnFailure):
+                    self._release_ownership(ownership)
+                    if timeout_cancellation is not None:
+                        _add_secondary(
+                            timeout_cancellation,
+                            outcome.error,
+                            "JSON command spawn failed during cancellation",
+                        )
+                    elif not isinstance(outcome.error, Exception):
+                        raise outcome.error
             if timeout_cancellation is not None:
                 raise timeout_cancellation
             return self._result(
@@ -704,6 +725,7 @@ class JsonCommandProvider:
 
         outcome = spawn_task.result()
         if isinstance(outcome, _SpawnFailure):
+            self._release_ownership(ownership)
             if isinstance(outcome.error, Exception):
                 return self._result(
                     stdin=stdin,
@@ -771,14 +793,20 @@ class JsonCommandProvider:
             else:
                 await asyncio.gather(*watched)
         except asyncio.CancelledError as cancellation:
-            await _cleanup_resilient(
-                process,
-                work_tasks,
-                wait_task,
-                self._limits.terminate_grace_seconds,
-                primary=cancellation,
-            )
+            try:
+                await _cleanup_resilient(
+                    process,
+                    work_tasks,
+                    wait_task,
+                    self._limits.terminate_grace_seconds,
+                    primary=cancellation,
+                )
+            finally:
+                self._release_ownership(ownership)
             raise cancellation
+        except BaseException:
+            self._release_ownership(ownership)
+            raise
 
         stdout = bytes(stdout_buffer)
         stderr = bytes(stderr_buffer)
@@ -795,7 +823,7 @@ class JsonCommandProvider:
                 if parsed is not None
                 else JsonCommandStatus.INVALID_JSON
             )
-        return self._result(
+        result = self._result(
             stdin=stdin,
             stdout=stdout,
             stderr=stderr,
@@ -805,6 +833,8 @@ class JsonCommandProvider:
             started_at=started_at,
             started_clock=started_clock,
         )
+        self._release_ownership(ownership)
+        return result
 
     def _result(
         self,

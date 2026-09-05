@@ -469,6 +469,45 @@ async def test_aclose_is_bounded_and_rejects_new_execution_with_pending_guardian
         await _wait_for_pending_count(provider, 0)
 
 
+async def test_aclose_reports_foreground_spawn_ownership_until_reaped(
+    tmp_path: Path, monkeypatch
+) -> None:
+    original_spawn = asyncio.create_subprocess_exec
+    child_ready = asyncio.Event()
+    release = asyncio.Event()
+    children = []
+
+    async def delayed_spawn(*args, **kwargs):
+        process = await original_spawn(*args, **kwargs)
+        children.append(process)
+        child_ready.set()
+        await release.wait()
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+    provider = _provider("--sleep", "30", "--ignore-term")
+    execute = asyncio.create_task(
+        provider.execute_json({}, cwd=tmp_path.resolve(), timeout_seconds=60)
+    )
+    await child_ready.wait()
+
+    started = time.monotonic()
+    await provider.aclose()
+    assert time.monotonic() - started < 0.4
+    assert provider.pending_cleanup_count == 1
+    assert execute.done() is False
+    assert children[0].returncode is None
+
+    release.set()
+    await asyncio.sleep(0)
+    execute.cancel("close-active")
+    with pytest.raises(asyncio.CancelledError):
+        await execute
+    assert provider.pending_cleanup_count == 0
+    assert children[0].returncode is not None
+    assert not _pid_exists(children[0].pid)
+
+
 async def test_async_context_manager_closes_provider(tmp_path: Path) -> None:
     provider = _provider()
     async with provider as entered:
