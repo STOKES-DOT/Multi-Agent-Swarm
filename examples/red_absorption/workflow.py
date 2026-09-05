@@ -353,10 +353,15 @@ class RedAbsorptionWorkflowToolProvider:
                                 command_result, "elapsed_seconds", None
                             ),
                         }
+                        failed_process_payload = {
+                            "cache_key": list(key),
+                            "cache_hit": False,
+                            "spectrum_process": spectrum_process,
+                        }
                         if command_result.status is JsonCommandStatus.TIMEOUT:
                             return ToolResult(
                                 ToolStatus.TIMEOUT,
-                                {"spectrum_process": spectrum_process},
+                                failed_process_payload,
                                 error="spectrum command timed out",
                             )
                         if (
@@ -365,7 +370,7 @@ class RedAbsorptionWorkflowToolProvider:
                         ):
                             return ToolResult(
                                 ToolStatus.FAILED,
-                                {"spectrum_process": spectrum_process},
+                                failed_process_payload,
                                 error=f"spectrum command failed: {command_result.status.value}",
                             )
                         try:
@@ -375,7 +380,7 @@ class RedAbsorptionWorkflowToolProvider:
                         except (TypeError, ValueError) as error:
                             return ToolResult(
                                 ToolStatus.FAILED,
-                                {"spectrum_process": spectrum_process},
+                                failed_process_payload,
                                 error=f"invalid spectrum result: {type(error).__name__}",
                             )
                         if (
@@ -385,7 +390,7 @@ class RedAbsorptionWorkflowToolProvider:
                         ):
                             return ToolResult(
                                 ToolStatus.FAILED,
-                                {"spectrum_process": spectrum_process},
+                                failed_process_payload,
                                 error="spectrum provenance mismatch",
                             )
                         resources._cache[key] = spectrum_result

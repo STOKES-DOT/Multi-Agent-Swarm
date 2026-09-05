@@ -9,12 +9,19 @@ import hashlib
 import json
 import math
 import re
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from multi_agent_pso.core import Evaluation, EvaluationStatus, StoredStageEvent
+from multi_agent_pso.core import (
+    Evaluation,
+    EvaluationStatus,
+    IterationSnapshot,
+    RunStatus,
+    StoredStageEvent,
+)
 from multi_agent_pso.orchestration import SwarmRunResult
+from multi_agent_pso.protocols import StoredRunEvidence
 from multi_agent_pso.storage import FileArtifactStore
 from multi_agent_pso.core import ArtifactRef
 
@@ -87,6 +94,7 @@ class ReportStatusCounts(_FrozenModel):
 class RunReport(_FrozenModel):
     schema_version: int = 1
     run_id: str = Field(min_length=1)
+    run_status: RunStatus | Literal["UNKNOWN"]
     iterations: tuple[IterationReport, ...]
     status_counts: ReportStatusCounts
     final_claim: str
@@ -112,6 +120,8 @@ class RunReport(_FrozenModel):
             "",
             f"- schema_version: {self.schema_version}",
             f"- run_id: {json.dumps(self.run_id, ensure_ascii=False)}",
+            f"- run_status: {self.run_status}",
+            f"- iterations: {len(self.iterations)} recorded iteration reports",
             f"- final_claim: {json.dumps(self.final_claim, ensure_ascii=False)}",
             "- status_counts: "
             + json.dumps(
@@ -159,10 +169,7 @@ class RecordedRunEvidence:
 @runtime_checkable
 class ReportRunStore(Protocol):
     def list_run_ids(self) -> tuple[str, ...]: ...
-    def list_iteration_snapshots_json(
-        self, run_id: str
-    ) -> tuple[Mapping[str, object], ...]: ...
-    def list_run_stage_events(self, run_id: str) -> tuple[StoredStageEvent, ...]: ...
+    def read_run_evidence(self, run_id: str) -> StoredRunEvidence: ...
 
 
 def _mapping(value: object) -> Mapping[str, object] | None:
@@ -707,6 +714,7 @@ def build_run_report(source: SwarmRunResult | RecordedRunEvidence) -> RunReport:
     reports = []
     if isinstance(source, SwarmRunResult):
         _validate_complete_swarm_result(source)
+        run_status: RunStatus | Literal["UNKNOWN"] = source.final_snapshot.run_status
         for generation in source.generations:
             previous = next(
                 (
@@ -741,6 +749,14 @@ def build_run_report(source: SwarmRunResult | RecordedRunEvidence) -> RunReport:
         snapshots = sorted(
             source.snapshots, key=lambda value: int(value.get("iteration_id", -1))
         )
+        try:
+            run_status = (
+                "UNKNOWN"
+                if not snapshots
+                else IterationSnapshot.model_validate(snapshots[-1]).run_status
+            )
+        except (TypeError, ValueError):
+            run_status = "UNKNOWN"
         events = defaultdict(list)
         for event in _trusted_recorded_events(source):
             events[event.event.iteration_id].append(event)
@@ -813,6 +829,7 @@ def build_run_report(source: SwarmRunResult | RecordedRunEvidence) -> RunReport:
     )
     return RunReport(
         run_id=run_id,
+        run_status=run_status,
         iterations=tuple(reports),
         status_counts=status_counts,
         final_claim=claim,
@@ -830,17 +847,15 @@ def build_run_report_from_store(
     selected = run_id if run_id is not None else (run_ids[-1] if run_ids else None)
     if selected is None or selected not in run_ids:
         raise ValueError("requested run does not exist")
-    stage_events = store.list_run_stage_events(selected)
+    stored = store.read_run_evidence(selected)
+    if stored.run_id != selected:
+        raise ValueError("report store returned evidence for a different run")
     return build_run_report(
         RecordedRunEvidence(
             selected,
-            store.list_iteration_snapshots_json(selected),
-            stage_events,
-            frozenset(
-                stored.sequence
-                for stored in stage_events
-                if stored.event.event_type != "started"
-            ),
+            tuple(stored.snapshots),
+            tuple(stored.events),
+            stored.committed_terminal_sequences,
         )
     )
 
@@ -863,7 +878,12 @@ def publish_run_report(
         if format == "json"
         else report.to_markdown().encode()
     )
-    path = f"reports/{report.run_id}.{suffix}"
+    report_digest = hashlib.sha256(report.canonical_json().encode("utf-8")).hexdigest()
+    path = (
+        f"reports/{report.run_id}.{suffix}"
+        if report.run_status is RunStatus.COMPLETED
+        else f"reports/{report.run_id}/{report_digest}.{suffix}"
+    )
     try:
         return artifacts.publish_bytes(path, data, media)
     except FileExistsError:

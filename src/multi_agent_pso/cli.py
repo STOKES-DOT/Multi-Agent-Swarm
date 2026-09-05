@@ -79,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
                         "artifact": reference.model_dump(mode="json"),
                         "summary": {
                             "run_id": report_value.run_id,
+                            "run_status": report_value.run_status,
                             "iterations": len(report_value.iterations),
                             "final_claim": report_value.final_claim,
                         },

@@ -4,27 +4,78 @@ import json
 from pathlib import Path
 
 import pytest
+import multi_agent_pso.protocols as protocols_module
 
+from examples.red_absorption.workflow import (
+    RedAbsorptionWorkflowResources,
+    RedAbsorptionWorkflowToolProvider,
+)
 from multi_agent_pso.core import (
     AgentStage,
     EvaluationStatus,
     IterationSnapshot,
+    RunStatus,
     StageEvent,
     StoredStageEvent,
 )
 from multi_agent_pso.orchestration import GenerationResult, SwarmRunResult
+from multi_agent_pso.protocols import StoredRunEvidence
 from multi_agent_pso.reporting import (
     IterationReport,
+    RunReport,
     build_run_report,
     build_run_report_from_store,
     publish_run_report,
 )
 from multi_agent_pso.storage import FileArtifactStore, SQLiteRunStore
+from multi_agent_pso.tools import JsonCommandStatus
+from tests.fixtures.red_absorption import load_valid_inputs
 from tests.fixtures.reports import (
     REPORT_CONFIG_HASH,
     checkpoint_for_report_event,
     recorded_evidence,
 )
+from tests.integration.test_red_absorption_flow import (
+    FakeEditor,
+    ResultSpectrum,
+    authorized_request_context,
+    parent_graph,
+)
+
+
+def test_protocols_export_storage_neutral_recorded_run_evidence() -> None:
+    evidence_type = getattr(protocols_module, "StoredRunEvidence", None)
+    assert isinstance(evidence_type, type)
+
+
+def test_store_reporting_reads_one_transaction_consistent_evidence_bundle() -> None:
+    evidence = recorded_evidence()
+
+    class AtomicReportStore:
+        read_calls = 0
+
+        def list_run_ids(self):
+            return (evidence.run_id,)
+
+        def read_run_evidence(self, run_id):
+            self.read_calls += 1
+            return StoredRunEvidence(
+                run_id,
+                evidence.snapshots,
+                evidence.events,
+                evidence.committed_terminal_sequences,
+            )
+
+        def list_iteration_snapshots_json(self, run_id):
+            raise AssertionError("split snapshot read must not be used")
+
+        def list_run_stage_events(self, run_id):
+            raise AssertionError("split event read must not be used")
+
+    store = AtomicReportStore()
+    report = build_run_report_from_store(store, latest=True)
+    assert report.run_id == evidence.run_id
+    assert store.read_calls == 1
 
 
 def test_report_derives_truth_metrics_and_safe_final_claim() -> None:
@@ -56,7 +107,7 @@ def test_report_derives_truth_metrics_and_safe_final_claim() -> None:
     assert report.scientific_claim == report.final_claim
     assert report.status_counts.successful_evaluations == 2
     markdown = report.to_markdown()
-    for field in ("schema_version", "run_id", "final_claim", "status_counts"):
+    for field in RunReport.model_fields:
         assert f"- {field}:" in markdown
     for field in IterationReport.model_fields:
         assert f"- {field}:" in markdown
@@ -317,8 +368,23 @@ def test_agent_attempt_usage_is_counted_once_per_resolved_attempt() -> None:
     assert item.agent_elapsed_coverage == 3
 
 
-def test_failed_spectrum_process_is_an_execution_but_not_a_completed_calculation() -> None:
+@pytest.mark.asyncio
+async def test_failed_spectrum_process_is_an_execution_but_not_a_completed_calculation(
+    tmp_path: Path,
+) -> None:
     evidence = recorded_evidence()
+    inputs = load_valid_inputs(tmp_path)
+    tool = RedAbsorptionWorkflowToolProvider.bind(
+        inputs,
+        FakeEditor([], parent_graph()),
+        RedAbsorptionWorkflowResources.from_inputs(inputs),
+        spectrum=ResultSpectrum(JsonCommandStatus.PROCESS_ERROR),
+    )
+    request, context = authorized_request_context(
+        [{"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}],
+        tmp_path.resolve(),
+    )
+    process_result = await tool.execute(request, context)
 
     def rewrite(event):
         payload = event.model_dump(mode="json")["payload"]
@@ -326,17 +392,7 @@ def test_failed_spectrum_process_is_an_execution_but_not_a_completed_calculation
             update={
                 "payload": {
                     **payload,
-                    "tool_result": {
-                        "status": "FAILED",
-                        "payload": {
-                            "cache_hit": False,
-                            "spectrum_process": {
-                                "status": "PROCESS_ERROR",
-                                "exit_code": 1,
-                                "elapsed_seconds": 0.5,
-                            },
-                        },
-                    },
+                    "tool_result": process_result.to_json(),
                 }
             }
         )
@@ -351,7 +407,8 @@ def test_failed_spectrum_process_is_an_execution_but_not_a_completed_calculation
     item = build_run_report(changed).iterations[0]
     assert item.spectrum_execution_count == 1
     assert item.completed_calculation == 1
-    assert item.spectrum_elapsed_seconds == pytest.approx(0.5)
+    assert item.spectrum_elapsed_coverage == 1
+    await tool.aclose()
 
 
 def test_completed_calculation_requires_a_strict_spectrum_result() -> None:
@@ -415,6 +472,7 @@ def test_swarm_result_replay_or_partial_history_requires_store_reporting(
 
 def test_publish_is_deterministic_idempotent_and_conflict_safe(tmp_path: Path) -> None:
     report = build_run_report(recorded_evidence())
+    assert report.run_status is RunStatus.COMPLETED
     store = FileArtifactStore(tmp_path / "artifacts")
     first = publish_run_report(report, store, "json")
     second = publish_run_report(report, store, "json")
@@ -425,6 +483,50 @@ def test_publish_is_deterministic_idempotent_and_conflict_safe(tmp_path: Path) -
     changed = report.model_copy(update={"final_claim": "changed"})
     with pytest.raises(Exception):
         publish_run_report(changed, store, "json")
+
+
+def test_active_reports_are_content_versioned_while_final_report_is_fixed(
+    tmp_path: Path,
+) -> None:
+    evidence = recorded_evidence("active-run")
+    active = type(evidence)(
+        evidence.run_id,
+        (evidence.snapshots[0],),
+        (),
+        frozenset(),
+    )
+    first_report = build_run_report(active)
+    assert first_report.run_status is RunStatus.RUNNING
+    store = FileArtifactStore(tmp_path / "artifacts")
+    first = publish_run_report(first_report, store, "json")
+    assert first.relative_path.startswith("reports/active-run/")
+    assert publish_run_report(first_report, store, "json") == first
+
+    started = StoredStageEvent(
+        sequence=1,
+        event=StageEvent(
+            run_id=evidence.run_id,
+            particle_id="p0",
+            iteration_id=0,
+            stage=AgentStage.EXECUTING,
+            attempt=0,
+            event_type="started",
+        ),
+    )
+    updated = build_run_report(
+        type(evidence)(
+            evidence.run_id,
+            (evidence.snapshots[0],),
+            (started,),
+            frozenset(),
+        )
+    )
+    second = publish_run_report(updated, store, "json")
+    assert second.relative_path.startswith("reports/active-run/")
+    assert second.relative_path != first.relative_path
+
+    final = publish_run_report(build_run_report(evidence), store, "json")
+    assert final.relative_path == "reports/active-run.json"
 
 
 def test_sqlite_reporting_reads_runs_snapshots_and_events_in_order(

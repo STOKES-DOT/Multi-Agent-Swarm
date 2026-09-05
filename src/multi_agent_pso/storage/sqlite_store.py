@@ -32,6 +32,7 @@ from multi_agent_pso.core import (
 from multi_agent_pso.protocols import (
     EpisodeClaimConflict,
     RunStoreCorruptionError,
+    StoredRunEvidence,
     ToolResult,
     ToolStatus,
 )
@@ -208,6 +209,7 @@ _EXPECTED_SCHEMA_FINGERPRINT = _expected_schema_fingerprint()
 _WAL_LOCK_TIMEOUT_SECONDS = 5.0
 _WAL_MAX_ATTEMPTS = 64
 _REPORT_JSON_MAX_UTF8_BYTES = 256 * 1024
+_REPORT_TOTAL_JSON_MAX_UTF8_BYTES = 64 * 1024 * 1024
 _REPORT_MAX_ROWS = 100_000
 _CLAIM_THREAD_GUARD = threading.Lock()
 _CLAIM_THREAD_LOCKS: dict[tuple[str, str], threading.Lock] = {}
@@ -277,9 +279,20 @@ class SQLiteRunStore:
     def list_run_ids(self) -> tuple[str, ...]:
         connection = self._connect()
         try:
+            connection.execute("BEGIN")
+            count = connection.execute("SELECT COUNT(*) AS count FROM runs").fetchone()[
+                "count"
+            ]
+            if count > _REPORT_MAX_ROWS:
+                raise RunStoreCorruptionError(
+                    "run store corrupted: run row budget exceeded"
+                )
             return tuple(
                 row["run_id"]
-                for row in connection.execute("SELECT run_id FROM runs ORDER BY rowid")
+                for row in connection.execute(
+                    "SELECT run_id FROM runs ORDER BY rowid LIMIT ?",
+                    (_REPORT_MAX_ROWS + 1,),
+                )
             )
         finally:
             connection.close()
@@ -287,176 +300,223 @@ class SQLiteRunStore:
     def list_iteration_snapshots_json(
         self, run_id: str
     ) -> tuple[Mapping[str, JsonValue], ...]:
-        run_id = _require_identifier(run_id, "run_id")
+        return self.read_run_evidence(run_id).snapshots
+
+    def list_run_stage_events(self, run_id: str) -> tuple[StoredStageEvent, ...]:
+        return self.read_run_evidence(run_id).events
+
+    def read_run_evidence(self, run_id: str) -> StoredRunEvidence:
+        run = _require_identifier(run_id, "run_id")
         connection = self._connect()
         try:
             connection.execute("BEGIN")
             run_row = connection.execute(
-                "SELECT snapshot_hash FROM runs WHERE run_id = ?", (run_id,)
+                "SELECT snapshot_hash FROM runs WHERE run_id = ?", (run,)
             ).fetchone()
-            rows = connection.execute(
-                """SELECT run_id, iteration_id, snapshot_json FROM iterations
-                WHERE run_id = ? ORDER BY iteration_id LIMIT ?""",
-                (run_id, _REPORT_MAX_ROWS + 1),
-            ).fetchall()
-            if len(rows) > _REPORT_MAX_ROWS:
-                raise RunStoreCorruptionError(
-                    "run store corrupted: too many iteration snapshots"
+            if run_row is None:
+                raise ValueError("requested run does not exist")
+            total_bytes = 0
+            for table, payload_column in (
+                ("iterations", "snapshot_json"),
+                ("stage_events", "payload_json"),
+                ("thread_checkpoints", "payload_json"),
+            ):
+                total_bytes += self._preflight_report_table(
+                    connection, table, payload_column, run
                 )
-            values: list[Mapping[str, JsonValue]] = []
-            for row in rows:
-                try:
-                    document = _decode_report_json_object(
-                        row["snapshot_json"], "iteration snapshot"
-                    )
-                    snapshot = IterationSnapshot.model_validate(document)
-                    if (
-                        snapshot.run_id != row["run_id"]
-                        or snapshot.iteration_id != row["iteration_id"]
-                        or run_row is None
-                        or snapshot.config_snapshot_hash != run_row["snapshot_hash"]
-                    ):
-                        raise ValueError(
-                            "iteration snapshot identity does not match its row"
-                        )
-                    values.append(snapshot.model_dump(mode="json"))
-                except RunStoreCorruptionError:
-                    raise
-                except Exception as error:
-                    raise RunStoreCorruptionError(
-                        "run store corrupted: invalid iteration snapshot row"
-                    ) from error
-            return tuple(values)
+            if total_bytes > _REPORT_TOTAL_JSON_MAX_UTF8_BYTES:
+                raise RunStoreCorruptionError(
+                    "run store corrupted: report total JSON budget exceeded"
+                )
+            snapshots = self._read_report_snapshots(
+                connection, run, run_row["snapshot_hash"]
+            )
+            events, committed_sequences = self._read_report_events(
+                connection, run, run_row["snapshot_hash"]
+            )
+            return StoredRunEvidence(
+                run,
+                snapshots,
+                events,
+                frozenset(committed_sequences),
+            )
         finally:
             connection.close()
 
-    def list_run_stage_events(self, run_id: str) -> tuple[StoredStageEvent, ...]:
-        run_id = _require_identifier(run_id, "run_id")
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN")
-            run_row = connection.execute(
-                "SELECT snapshot_hash FROM runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            event_rows = connection.execute(
-                """SELECT event_id, run_id, particle_id, iteration_id, stage,
-                attempt, event_type, payload_json FROM stage_events
-                WHERE run_id = ? ORDER BY event_id LIMIT ?""",
-                (run_id, _REPORT_MAX_ROWS + 1),
-            ).fetchall()
-            checkpoint_rows = connection.execute(
-                """SELECT checkpoint_id, run_id, particle_id, iteration_id,
-                payload_json FROM thread_checkpoints WHERE run_id = ?
-                ORDER BY checkpoint_id LIMIT ?""",
-                (run_id, _REPORT_MAX_ROWS + 1),
-            ).fetchall()
-            if len(event_rows) > _REPORT_MAX_ROWS or len(
-                checkpoint_rows
-            ) > _REPORT_MAX_ROWS:
-                raise RunStoreCorruptionError(
-                    "run store corrupted: report evidence row budget exceeded"
+    @staticmethod
+    def _preflight_report_table(
+        connection: sqlite3.Connection,
+        table: str,
+        payload_column: str,
+        run_id: str,
+    ) -> int:
+        allowed = {
+            ("iterations", "snapshot_json"),
+            ("stage_events", "payload_json"),
+            ("thread_checkpoints", "payload_json"),
+        }
+        if (table, payload_column) not in allowed:
+            raise AssertionError("untrusted report table")
+        row = connection.execute(
+            f"""SELECT COUNT(*) AS row_count,
+            COALESCE(SUM(length(CAST({payload_column} AS BLOB))), 0) AS total_bytes,
+            COALESCE(MAX(length(CAST({payload_column} AS BLOB))), 0) AS max_bytes
+            FROM {table} WHERE run_id = ?""",
+            (run_id,),
+        ).fetchone()
+        if row["row_count"] > _REPORT_MAX_ROWS:
+            raise RunStoreCorruptionError(
+                f"run store corrupted: {table} row budget exceeded"
+            )
+        if row["max_bytes"] > _REPORT_JSON_MAX_UTF8_BYTES:
+            raise RunStoreCorruptionError(
+                f"run store corrupted: {table} per-row JSON budget exceeded"
+            )
+        if row["total_bytes"] > _REPORT_TOTAL_JSON_MAX_UTF8_BYTES:
+            raise RunStoreCorruptionError(
+                f"run store corrupted: {table} total JSON budget exceeded"
+            )
+        return int(row["total_bytes"])
+
+    @staticmethod
+    def _read_report_snapshots(
+        connection: sqlite3.Connection, run_id: str, snapshot_hash: str
+    ) -> tuple[Mapping[str, JsonValue], ...]:
+        rows = connection.execute(
+            """SELECT run_id, iteration_id, snapshot_json FROM iterations
+            WHERE run_id = ? ORDER BY iteration_id""",
+            (run_id,),
+        )
+        values: list[Mapping[str, JsonValue]] = []
+        for row in rows:
+            try:
+                document = _decode_report_json_object(
+                    row["snapshot_json"], "iteration snapshot"
                 )
-            event_rows_by_sequence = {
-                int(row["event_id"]): row for row in event_rows
-            }
-            committed_sequences: set[int] = set()
-            committed_events: dict[int, StageEvent] = {}
-            for row in checkpoint_rows:
-                try:
-                    document = _decode_report_json_object(
-                        row["payload_json"], "stage checkpoint"
+                snapshot = IterationSnapshot.model_validate(document)
+                if (
+                    snapshot.run_id != row["run_id"]
+                    or snapshot.iteration_id != row["iteration_id"]
+                    or snapshot.config_snapshot_hash != snapshot_hash
+                ):
+                    raise ValueError("iteration snapshot identity does not match its row")
+                values.append(snapshot.model_dump(mode="json"))
+            except RunStoreCorruptionError:
+                raise
+            except Exception as error:
+                raise RunStoreCorruptionError(
+                    "run store corrupted: invalid iteration snapshot row"
+                ) from error
+        return tuple(values)
+
+    def _read_report_events(
+        self, connection: sqlite3.Connection, run_id: str, snapshot_hash: str
+    ) -> tuple[tuple[StoredStageEvent, ...], set[int]]:
+        event_rows = connection.execute(
+            """SELECT event_id, run_id, particle_id, iteration_id, stage,
+            attempt, event_type, payload_json FROM stage_events
+            WHERE run_id = ? ORDER BY event_id""",
+            (run_id,),
+        ).fetchall()
+        checkpoint_rows = connection.execute(
+            """SELECT checkpoint_id, run_id, particle_id, iteration_id,
+            payload_json FROM thread_checkpoints WHERE run_id = ?
+            ORDER BY checkpoint_id""",
+            (run_id,),
+        ).fetchall()
+        event_rows_by_sequence = {
+            int(row["event_id"]): row for row in event_rows
+        }
+        committed_sequences: set[int] = set()
+        committed_events: dict[int, StageEvent] = {}
+        for row in checkpoint_rows:
+            try:
+                document = _decode_report_json_object(
+                    row["payload_json"], "stage checkpoint"
+                )
+                checkpoint = EpisodeCheckpoint.model_validate(document)
+                if (
+                    checkpoint.run_id,
+                    checkpoint.particle_id,
+                    checkpoint.iteration_id,
+                ) != (
+                    row["run_id"],
+                    row["particle_id"],
+                    row["iteration_id"],
+                ):
+                    raise ValueError("checkpoint identity does not match its row")
+                if checkpoint.protocol_snapshot_hash != snapshot_hash:
+                    raise ValueError("checkpoint protocol hash does not match run")
+                sequence = checkpoint.terminal_event_sequence
+                if sequence is None or sequence in committed_sequences:
+                    raise ValueError(
+                        "checkpoint terminal sequence is missing or duplicated"
                     )
-                    checkpoint = EpisodeCheckpoint.model_validate(document)
-                    if (
-                        checkpoint.run_id,
-                        checkpoint.particle_id,
-                        checkpoint.iteration_id,
-                    ) != (
-                        row["run_id"],
-                        row["particle_id"],
-                        row["iteration_id"],
-                    ):
-                        raise ValueError("checkpoint identity does not match its row")
-                    if (
-                        run_row is None
-                        or checkpoint.protocol_snapshot_hash
-                        != run_row["snapshot_hash"]
-                    ):
-                        raise ValueError("checkpoint protocol hash does not match run")
-                    sequence = checkpoint.terminal_event_sequence
-                    if sequence is None or sequence in committed_sequences:
-                        raise ValueError(
-                            "checkpoint terminal sequence is missing or duplicated"
-                        )
-                    event_row = event_rows_by_sequence.get(sequence)
-                    if event_row is None:
-                        raise ValueError("checkpoint terminal event is missing")
-                    event = self._stage_event_from_row(event_row)
-                    if event.event_type == "started" or (
-                        checkpoint.run_id,
-                        checkpoint.particle_id,
-                        checkpoint.iteration_id,
-                        checkpoint.completed_stage,
-                        checkpoint.completed_attempt,
-                        checkpoint.terminal_event_type,
-                    ) != (
-                        event.run_id,
-                        event.particle_id,
-                        event.iteration_id,
-                        event.stage,
-                        event.attempt,
-                        event.event_type,
-                    ):
-                        raise ValueError(
-                            "checkpoint does not match its terminal stage event"
-                        )
-                    committed_sequences.add(sequence)
-                    committed_events[sequence] = event
-                except RunStoreCorruptionError:
-                    raise
-                except Exception as error:
-                    raise RunStoreCorruptionError(
-                        "run store corrupted: invalid report stage checkpoint"
-                    ) from error
-            resolved_attempts: dict[
-                tuple[str, str, int, object, int], dict[str, int]
-            ] = {}
-            for sequence, event in sorted(committed_events.items()):
-                key = (
+                event_row = event_rows_by_sequence.get(sequence)
+                if event_row is None:
+                    raise ValueError("checkpoint terminal event is missing")
+                event = self._stage_event_from_row(event_row)
+                if event.event_type == "started" or (
+                    checkpoint.run_id,
+                    checkpoint.particle_id,
+                    checkpoint.iteration_id,
+                    checkpoint.completed_stage,
+                    checkpoint.completed_attempt,
+                    checkpoint.terminal_event_type,
+                ) != (
                     event.run_id,
                     event.particle_id,
                     event.iteration_id,
                     event.stage,
                     event.attempt,
-                )
-                classification = (
-                    "interrupted"
-                    if event.event_type == "interrupted"
-                    else "resolution"
-                )
-                resolved = resolved_attempts.setdefault(key, {})
-                if classification in resolved or (
-                    classification == "interrupted" and "resolution" in resolved
+                    event.event_type,
                 ):
-                    raise RunStoreCorruptionError(
-                        "run store corrupted: duplicate report stage checkpoint"
+                    raise ValueError(
+                        "checkpoint does not match its terminal stage event"
                     )
-                resolved[classification] = sequence
-            result: list[StoredStageEvent] = []
-            for row in event_rows:
-                sequence = int(row["event_id"])
-                if row["event_type"] != "started" and sequence not in committed_sequences:
-                    continue
-                try:
-                    event = self._stage_event_from_row(row)
-                except Exception as error:
-                    raise RunStoreCorruptionError(
-                        "run store corrupted: invalid report stage event"
-                    ) from error
-                result.append(StoredStageEvent(sequence=sequence, event=event))
-            return tuple(result)
-        finally:
-            connection.close()
+                committed_sequences.add(sequence)
+                committed_events[sequence] = event
+            except RunStoreCorruptionError:
+                raise
+            except Exception as error:
+                raise RunStoreCorruptionError(
+                    "run store corrupted: invalid report stage checkpoint"
+                ) from error
+        resolved_attempts: dict[
+            tuple[str, str, int, object, int], dict[str, int]
+        ] = {}
+        for sequence, event in sorted(committed_events.items()):
+            key = (
+                event.run_id,
+                event.particle_id,
+                event.iteration_id,
+                event.stage,
+                event.attempt,
+            )
+            classification = (
+                "interrupted" if event.event_type == "interrupted" else "resolution"
+            )
+            resolved = resolved_attempts.setdefault(key, {})
+            if classification in resolved or (
+                classification == "interrupted" and "resolution" in resolved
+            ):
+                raise RunStoreCorruptionError(
+                    "run store corrupted: duplicate report stage checkpoint"
+                )
+            resolved[classification] = sequence
+        result: list[StoredStageEvent] = []
+        for row in event_rows:
+            sequence = int(row["event_id"])
+            if row["event_type"] != "started" and sequence not in committed_sequences:
+                continue
+            try:
+                event = self._stage_event_from_row(row)
+            except Exception as error:
+                raise RunStoreCorruptionError(
+                    "run store corrupted: invalid report stage event"
+                ) from error
+            result.append(StoredStageEvent(sequence=sequence, event=event))
+        return tuple(result), committed_sequences
 
     @contextmanager
     def episode_claim(

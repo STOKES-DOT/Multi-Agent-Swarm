@@ -244,9 +244,16 @@ class ResultSpectrum(JsonCommandProvider):
     def __init__(self, status: JsonCommandStatus, stdout_text: str | None = None):
         self.status = status
         self.stdout_text = stdout_text
+        self.exit_code = 1 if status is JsonCommandStatus.PROCESS_ERROR else None
+        self.elapsed_seconds = 0.5
 
     async def execute_json(self, *args, **kwargs):
-        return SimpleNamespace(status=self.status, stdout_text=self.stdout_text)
+        return SimpleNamespace(
+            status=self.status,
+            stdout_text=self.stdout_text,
+            exit_code=self.exit_code,
+            elapsed_seconds=self.elapsed_seconds,
+        )
 
 
 def authorized_request_context(commands, workspace: Path):
@@ -518,3 +525,47 @@ async def test_workflow_maps_spectrum_process_boundaries(
     result = await tool.execute(request, context)
     assert result.status is expected and tool.execution_count == 1
     assert result.payload["spectrum_process"]["status"] == spectrum.status.value
+    assert result.payload["cache_hit"] is False
+    assert tuple(result.payload["cache_key"])[-1] == "red-absorption-evaluator:v1"
+
+
+@pytest.mark.asyncio
+async def test_workflow_provenance_mismatch_keeps_miss_audit_payload(
+    tmp_path: Path,
+) -> None:
+    inputs = load_valid_inputs(tmp_path)
+    spectrum = {
+        "status": "SUCCESS",
+        "states": [
+            {
+                "state_index": 1,
+                "energy_ev": 1239.841984 / 650,
+                "wavelength_nm": 650.0,
+                "oscillator_strength": 0.2,
+                "converged": True,
+                "root_character": None,
+            }
+        ],
+        "provenance": {
+            "protocol": inputs.calculation_protocol.model_dump(mode="json"),
+            "geometry_hash": "0" * 64,
+            "command_metadata": None,
+            "backend_metadata": None,
+        },
+        "error": None,
+    }
+    tool = RedAbsorptionWorkflowToolProvider.bind(
+        inputs,
+        FakeEditor([], parent_graph()),
+        RedAbsorptionWorkflowResources.from_inputs(inputs),
+        spectrum=ResultSpectrum(JsonCommandStatus.SUCCESS, json.dumps(spectrum)),
+    )
+    request, context = authorized_request_context(
+        [{"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}],
+        tmp_path.resolve(),
+    )
+    result = await tool.execute(request, context)
+    assert result.status is ToolStatus.FAILED
+    assert result.payload["cache_hit"] is False
+    assert result.payload["cache_key"]
+    assert result.payload["spectrum_process"]["status"] == "SUCCESS"

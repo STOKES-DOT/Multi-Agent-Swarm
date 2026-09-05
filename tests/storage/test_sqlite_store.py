@@ -227,13 +227,125 @@ def test_reporting_reads_enforce_row_and_payload_budgets(
         )
         connection.commit()
     monkeypatch.setattr(sqlite_store_module, "_REPORT_MAX_ROWS", 1)
-    with pytest.raises(RunStoreCorruptionError, match="too many"):
+    with pytest.raises(RunStoreCorruptionError, match="row budget"):
         store.list_iteration_snapshots_json("report-run")
 
     monkeypatch.setattr(sqlite_store_module, "_REPORT_MAX_ROWS", 100_000)
     monkeypatch.setattr(sqlite_store_module, "_REPORT_JSON_MAX_UTF8_BYTES", 64)
-    with pytest.raises(RunStoreCorruptionError, match="snapshot"):
+    with pytest.raises(RunStoreCorruptionError, match="per-row"):
         store.list_iteration_snapshots_json("report-run")
+
+
+@pytest.mark.parametrize("limit", ["rows", "per_row", "total"])
+def test_reporting_budget_preflight_runs_before_payload_select(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: str
+) -> None:
+    path = tmp_path / "runs.sqlite"
+    store = SQLiteRunStore(path)
+    store.create_run("report-run", "a" * 64)
+    with sqlite3.connect(path) as connection:
+        connection.executemany(
+            "INSERT INTO iterations VALUES (?, ?, ?)",
+            [
+                ("report-run", snapshot["iteration_id"], json.dumps(snapshot))
+                for snapshot in recorded_evidence().snapshots
+            ],
+        )
+        connection.commit()
+    if limit == "rows":
+        monkeypatch.setattr(sqlite_store_module, "_REPORT_MAX_ROWS", 1)
+    elif limit == "per_row":
+        monkeypatch.setattr(sqlite_store_module, "_REPORT_JSON_MAX_UTF8_BYTES", 64)
+    else:
+        monkeypatch.setattr(
+            sqlite_store_module, "_REPORT_TOTAL_JSON_MAX_UTF8_BYTES", 64
+        )
+    statements: list[str] = []
+    original_connect = store._connect
+
+    def tracked_connect():
+        connection = original_connect()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(store, "_connect", tracked_connect)
+    with pytest.raises(RunStoreCorruptionError):
+        store.list_iteration_snapshots_json("report-run")
+    assert not any(
+        "SELECT run_id, iteration_id, snapshot_json" in statement
+        for statement in statements
+    )
+
+
+def test_reporting_run_id_row_budget_is_checked_before_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SQLiteRunStore(tmp_path / "runs.sqlite")
+    store.create_run("one", "a" * 64)
+    store.create_run("two", "b" * 64)
+    monkeypatch.setattr(sqlite_store_module, "_REPORT_MAX_ROWS", 1)
+    with pytest.raises(RunStoreCorruptionError, match="run"):
+        store.list_run_ids()
+
+
+def test_read_run_evidence_uses_one_sqlite_snapshot_during_concurrent_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "runs.sqlite"
+    reader = SQLiteRunStore(path)
+    writer = SQLiteRunStore(path)
+    reader.create_run("report-run", "a" * 64)
+    first, second = recorded_evidence().snapshots
+    with reader.iteration_transaction("report-run", 0) as transaction:
+        transaction.put_snapshot_json(first)
+    original_connect = reader._connect
+    inserted = threading.Event()
+    failures: list[BaseException] = []
+
+    def write_next() -> None:
+        try:
+            with writer.iteration_transaction("report-run", 1) as transaction:
+                transaction.put_snapshot_json(second)
+            writer.append_stage_event(
+                StageEvent(
+                    run_id="report-run",
+                    particle_id="p0",
+                    iteration_id=1,
+                    stage=AgentStage.EXECUTING,
+                    attempt=0,
+                    event_type="started",
+                )
+            )
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            inserted.set()
+
+    triggered = False
+
+    def consistent_connect():
+        connection = original_connect()
+
+        def trace(statement: str) -> None:
+            nonlocal triggered
+            if not triggered and "FROM stage_events" in statement:
+                triggered = True
+                thread = threading.Thread(target=write_next)
+                thread.start()
+                assert inserted.wait(5)
+                thread.join(5)
+
+        connection.set_trace_callback(trace)
+        return connection
+
+    monkeypatch.setattr(reader, "_connect", consistent_connect)
+    evidence = reader.read_run_evidence("report-run")
+    assert failures == []
+    assert [snapshot["iteration_id"] for snapshot in evidence.snapshots] == [0]
+    assert evidence.events == ()
+    refreshed = writer.read_run_evidence("report-run")
+    assert [snapshot["iteration_id"] for snapshot in refreshed.snapshots] == [0, 1]
+    assert len(refreshed.events) == 1
 
 
 def _checkpoint(

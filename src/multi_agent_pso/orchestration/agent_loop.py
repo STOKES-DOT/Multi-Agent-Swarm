@@ -2340,6 +2340,8 @@ class AgentLoop:
                 raise ValueError("task adapter returned a request for the wrong stage")
             async with self._resources.agent_slot():
                 response = await self._runtime.run_stage(thread, request)
+            response_usage = self._audit_payload(response.usage.to_json())
+            response_metadata = self._audit_payload(response.provider_metadata)
             try:
                 _validate_text_budget(response.raw_text, boundary="agent response")
                 parsed = self._adapter.parse_stage_response(stage, response)
@@ -2391,6 +2393,8 @@ class AgentLoop:
                     "request": request_payload,
                     "response_excerpt": _safe_utf8_text(response.raw_text, 1024),
                     "response_sha256": _streaming_text_sha256(response.raw_text),
+                    "usage": response_usage,
+                    "provider_metadata": response_metadata,
                     "context_additions": dict(context_additions),
                 }
                 context["correction"] = diagnostic

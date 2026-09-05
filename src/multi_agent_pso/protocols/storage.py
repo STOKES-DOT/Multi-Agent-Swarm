@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import ContextManager, Protocol, runtime_checkable
 
 from pydantic import JsonValue
@@ -27,6 +28,16 @@ class EpisodeClaimConflict(RuntimeError):
 
 class RunStoreCorruptionError(RuntimeError):
     """Persisted run evidence is malformed or internally inconsistent."""
+
+
+@dataclass(frozen=True, slots=True)
+class StoredRunEvidence:
+    """Storage-neutral, transaction-consistent inputs for run reporting."""
+
+    run_id: str
+    snapshots: tuple[Mapping[str, JsonValue], ...]
+    events: tuple[StoredStageEvent, ...]
+    committed_terminal_sequences: frozenset[int]
 
 
 @runtime_checkable
@@ -112,5 +123,6 @@ __all__ = [
     "EpisodeClaimConflict",
     "IterationTransaction",
     "RunStoreCorruptionError",
+    "StoredRunEvidence",
     "RunStore",
 ]

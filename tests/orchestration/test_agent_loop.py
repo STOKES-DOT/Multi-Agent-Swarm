@@ -22,6 +22,7 @@ from multi_agent_pso.orchestration import (
     AuditPersistenceError,
     IncompatibleCheckpointError,
 )
+from multi_agent_pso.reporting import RecordedRunEvidence, build_run_report
 import multi_agent_pso.orchestration.agent_loop as agent_loop_module
 from multi_agent_pso.protocols import (
     ArtifactIntegrityError,
@@ -144,6 +145,72 @@ async def test_schema_correction_retries_twice_then_succeeds(tmp_path):
         AgentStage.HYPOTHESIZING,
         AgentStage.HYPOTHESIZING,
     ]
+
+
+@pytest.mark.asyncio
+async def test_schema_correction_persists_real_response_usage_for_reporting(tmp_path):
+    dependencies = make_fake_dependencies(
+        tmp_path, provider_metadata={"duration_ms": 100}
+    )
+    delegate = dependencies["runtime"]
+
+    class ScriptedRuntime:
+        def __init__(self):
+            self.first = True
+
+        async def start_thread(self, particle_id, workspace):
+            return await delegate.start_thread(particle_id, workspace)
+
+        async def restore_thread(self, particle_id, workspace, checkpoint):
+            return await delegate.restore_thread(particle_id, workspace, checkpoint)
+
+        async def run_stage(self, thread, request):
+            if self.first:
+                self.first = False
+                return StageResponse(
+                    "not-json",
+                    TokenUsage(7, 3, 1),
+                    {"duration_ms": 250},
+                )
+            return await delegate.run_stage(thread, request)
+
+        async def rotate_thread(self, thread, checkpoint):
+            return await delegate.rotate_thread(thread, checkpoint)
+
+        async def close_thread(self, thread):
+            return await delegate.close_thread(thread)
+
+    dependencies["runtime"] = ScriptedRuntime()
+    await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
+    failed = next(
+        event
+        for event in dependencies["run_store"].events
+        if event.stage is AgentStage.HYPOTHESIZING and event.event_type == "failed"
+    )
+    assert failed.payload["usage"] == {
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "cached_input_tokens": 1,
+    }
+    assert failed.payload["provider_metadata"] == {"duration_ms": 250}
+    stored = tuple(dependencies["run_store"].stored_events)
+    report = build_run_report(
+        RecordedRunEvidence(
+            "run-1",
+            (),
+            stored,
+            frozenset(
+                item.sequence
+                for item in stored
+                if item.event.event_type != "started"
+            ),
+        )
+    )
+    item = report.iterations[0]
+    assert item.codex_input_tokens == 10
+    assert item.codex_output_tokens == 6
+    assert item.codex_cached_input_tokens == 1
+    assert item.agent_elapsed_seconds == pytest.approx(0.55)
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ import sqlite3
 
 import pytest
 
+from multi_agent_pso.core import AgentStage, StageEvent
 from multi_agent_pso.cli import main
 from multi_agent_pso.benchmarks import (
     run_continuous_benchmark,
@@ -133,3 +134,34 @@ def test_report_cli_converts_store_corruption_to_code_two_without_traceback(
     captured = capsys.readouterr()
     assert "report error:" in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_report_cli_versions_active_evidence_and_is_idempotent(tmp_path, capsys) -> None:
+    evidence = recorded_evidence("active-run")
+    store = SQLiteRunStore(tmp_path / "runs.sqlite")
+    store.create_run(evidence.run_id, REPORT_CONFIG_HASH)
+    with store.iteration_transaction(evidence.run_id, 0) as transaction:
+        transaction.put_snapshot_json(evidence.snapshots[0])
+    args = ["report", "--runs-dir", str(tmp_path), "--latest"]
+    assert main(args) == 0
+    first_output = json.loads(capsys.readouterr().out)
+    assert first_output["summary"]["run_status"] == "RUNNING"
+    first = first_output["artifact"]
+    assert main(args) == 0
+    assert json.loads(capsys.readouterr().out)["artifact"] == first
+
+    store.append_stage_event(
+        StageEvent(
+            run_id=evidence.run_id,
+            particle_id="p0",
+            iteration_id=0,
+            stage=AgentStage.EXECUTING,
+            attempt=0,
+            event_type="started",
+        )
+    )
+    assert main(args) == 0
+    second = json.loads(capsys.readouterr().out)["artifact"]
+    assert second["relative_path"] != first["relative_path"]
+    assert main(args) == 0
+    assert json.loads(capsys.readouterr().out)["artifact"] == second

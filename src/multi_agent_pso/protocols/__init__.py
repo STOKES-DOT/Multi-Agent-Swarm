@@ -14,6 +14,7 @@ from .storage import (
     IterationTransaction,
     RunStoreCorruptionError,
     RunStore,
+    StoredRunEvidence,
 )
 from .task_adapter import TaskAdapter
 from .tools import CandidateRef, ToolContext, ToolProvider, ToolRequest, ToolResult, ToolStatus
@@ -57,6 +58,7 @@ __all__ = [
     "ResourceManager",
     "RunStoreCorruptionError",
     "RunStore",
+    "StoredRunEvidence",
     "StageRequest",
     "StageResponse",
     "StageContextProvider",
