@@ -130,7 +130,7 @@ def _validate_graph(value: object) -> dict[str, object]:
         endpoint_pairs.add(pair)
         if bond["begin_atom_id"] not in atom_ids or bond["end_atom_id"] not in atom_ids or bond["bond_type"] not in _DIRECTION_BY_BOND or bond["bond_direction"] not in _DIRECTION_BY_BOND[bond["bond_type"]]: raise ValueError("bond domain invalid")
         if type(bond["aromatic"]) is not bool or type(bond["conjugated"]) is not bool or bond["stereo"] not in {"STEREONONE","STEREOANY","STEREOZ","STEREOE","STEREOCIS","STEREOTRANS"} or not isinstance(bond["stereo_atom_ids"],list) or any(v not in atom_ids for v in bond["stereo_atom_ids"]): raise ValueError("bond stereo invalid")
-        if bond["bond_type"]!="DOUBLE" and bond["stereo"]!="STEREONONE": raise ValueError("bond stereo incompatible with bond type")
+        if bond["bond_type"]!="DOUBLE" and (bond["stereo"]!="STEREONONE" or bond["stereo_atom_ids"]): raise ValueError("bond stereo incompatible with bond type")
     if value["next_bond_serial"] <= max(bond_serials,default=0): raise ValueError("next_bond_serial is stale")
     return value
 
@@ -439,7 +439,7 @@ class MoleculeEditorProvider:
             if "bond_direction" in item and item["bond_direction"] not in {"NONE","BEGINWEDGE","BEGINDASH","ENDDOWNRIGHT","ENDUPRIGHT","EITHERDOUBLE","UNKNOWN"}: raise ValueError("bond_direction is invalid")
             if "bond_type" in item:
                 direction=item.get("bond_direction","NONE"); stereo=item.get("stereo","STEREONONE")
-                if direction not in _DIRECTION_BY_BOND[item["bond_type"]] or (item["bond_type"]!="DOUBLE" and stereo!="STEREONONE"): raise ValueError("bond direction/stereo incompatible with type")
+                if direction not in _DIRECTION_BY_BOND[item["bond_type"]] or (item["bond_type"]!="DOUBLE" and (stereo!="STEREONONE" or item.get("stereo_atom_ids",[]))): raise ValueError("bond direction/stereo incompatible with type")
             for key in ("atom_id", "anchor_atom_id", "retained_atom_id", "begin", "end"):
                 if key in item and item[key] not in atom_refs: raise ValueError(f"unknown or forward atom reference: {item[key]}")
             if "bond_id" in item and item["bond_id"] not in bond_refs: raise ValueError(f"unknown or forward bond reference: {item['bond_id']}")

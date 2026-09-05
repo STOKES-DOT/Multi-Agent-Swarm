@@ -257,6 +257,36 @@ def test_ready_coordinates_accept_explicit_graph_hydrogens_and_geometry_hydrogen
     assert MoleculeEditorResult.from_process(exit_code=0,payload=data).ready_for_evaluator
 
 
+@pytest.mark.parametrize("bond_type",["SINGLE","TRIPLE","AROMATIC"])
+def test_non_double_graph_bond_requires_empty_stereo_atom_ids(bond_type) -> None:
+    data=_real_payload(); bond=data["graph"]["bonds"][0]; bond.update({"bond_type":bond_type,"stereo":"STEREONONE","stereo_atom_ids":["a0001","a0002"],"bond_direction":"NONE"})
+    with pytest.raises(ValueError): MoleculeEditorResult.from_process(exit_code=0,payload=data)
+    bond["stereo_atom_ids"]=[]
+    assert MoleculeEditorResult.from_process(exit_code=0,payload=data).candidate
+
+
+def test_double_graph_bond_allows_valid_stereo_atom_ids() -> None:
+    data=_real_payload(); bond=data["graph"]["bonds"][0]; bond.update({"bond_type":"DOUBLE","stereo":"STEREOE","stereo_atom_ids":["a0001","a0002"],"bond_direction":"NONE"})
+    assert MoleculeEditorResult.from_process(exit_code=0,payload=data).candidate
+
+
+@pytest.mark.parametrize("operation",["add_bond","change_bond"])
+@pytest.mark.parametrize("bond_type",["SINGLE","TRIPLE","AROMATIC"])
+def test_non_double_command_requires_empty_stereo_atom_ids(operation,bond_type) -> None:
+    command={"operation":operation,"bond_type":bond_type,"stereo":"STEREONONE","stereo_atom_ids":["a0001","a0002"]}
+    command.update({"begin":"a0001","end":"a0002"} if operation=="add_bond" else {"bond_id":"b0001"})
+    with pytest.raises(ValueError): MoleculeEditorProvider._commands([command],_real_graph())
+    command["stereo_atom_ids"]=[]
+    assert MoleculeEditorProvider._commands([command],_real_graph())==[command]
+
+
+@pytest.mark.parametrize("operation",["add_bond","change_bond"])
+def test_double_command_allows_valid_stereo_atom_ids(operation) -> None:
+    command={"operation":operation,"bond_type":"DOUBLE","stereo":"STEREOE","stereo_atom_ids":["a0001","a0002"]}
+    command.update({"begin":"a0001","end":"a0002"} if operation=="add_bond" else {"bond_id":"b0001"})
+    assert MoleculeEditorProvider._commands([command],_real_graph())==[command]
+
+
 @pytest.mark.parametrize(
     "commands",
     [
