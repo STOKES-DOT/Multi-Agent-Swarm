@@ -70,11 +70,30 @@ class IterationReport(_FrozenModel):
     spectrum_elapsed_coverage: int = 0
 
 
+class ReportStatusCounts(_FrozenModel):
+    submitted: int = Field(default=0, ge=0)
+    completed_calculation: int = Field(default=0, ge=0)
+    evaluated: int = Field(default=0, ge=0)
+    successful_evaluations: int = Field(default=0, ge=0)
+    successful_feasible_evaluations: int = Field(default=0, ge=0)
+    failed: int = Field(default=0, ge=0)
+    timeout: int = Field(default=0, ge=0)
+    invalid: int = Field(default=0, ge=0)
+    duplicates: int = Field(default=0, ge=0)
+    cache_hits: int = Field(default=0, ge=0)
+    spectrum_execution_count: int = Field(default=0, ge=0)
+
+
 class RunReport(_FrozenModel):
     schema_version: int = 1
     run_id: str = Field(min_length=1)
     iterations: tuple[IterationReport, ...]
+    status_counts: ReportStatusCounts
     final_claim: str
+
+    @property
+    def scientific_claim(self) -> str:
+        return self.final_claim
 
     def canonical_json(self) -> str:
         return json.dumps(
@@ -86,24 +105,39 @@ class RunReport(_FrozenModel):
         )
 
     def to_markdown(self) -> str:
-        lines = [f"# Run report: {self.run_id}", "", self.final_claim, ""]
+        lines = [
+            f"# Run report: {self.run_id}",
+            "",
+            self.scientific_claim,
+            "",
+            f"- schema_version: {self.schema_version}",
+            f"- run_id: {json.dumps(self.run_id, ensure_ascii=False)}",
+            f"- final_claim: {json.dumps(self.final_claim, ensure_ascii=False)}",
+            "- status_counts: "
+            + json.dumps(
+                self.status_counts.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "",
+            "## Aggregate status counts",
+            "",
+        ]
+        for name, value in self.status_counts.model_dump(mode="json").items():
+            lines.append(f"- {name}: {value}")
+        lines.append("")
         for item in self.iterations:
-            lines.extend(
-                [
-                    f"## Iteration {item.iteration_id}",
-                    "",
-                    f"- gbest fitness: {item.gbest_fitness}",
-                    f"- selected wavelength: {item.selected_wavelength_nm} nm",
-                    f"- oscillator strength: {item.selected_oscillator_strength}",
-                    f"- feasible rate: {item.feasible_rate}",
-                    f"- submitted/completed/evaluated: {item.submitted}/{item.completed_calculation}/{item.evaluated}",
-                    f"- failures/timeouts/invalid: {item.failed}/{item.timeout}/{item.invalid}",
-                    f"- unique candidates: {len(item.unique_candidate_hashes)}",
-                    f"- spectrum executions/cache hits: {item.spectrum_execution_count}/{item.cache_hits}",
-                    f"- recorded elapsed seconds: {item.recorded_elapsed_seconds}",
-                    "",
-                ]
-            )
+            lines.extend([f"## Iteration {item.iteration_id}", ""])
+            for name, value in item.model_dump(mode="json").items():
+                serialized = json.dumps(
+                    value,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+                lines.append(f"- {name}: {serialized}")
+            lines.append("")
         return "\n".join(lines).rstrip() + "\n"
 
 
@@ -112,6 +146,14 @@ class RecordedRunEvidence:
     run_id: str
     snapshots: tuple[Mapping[str, object], ...]
     events: tuple[StoredStageEvent, ...]
+    committed_terminal_sequences: frozenset[int] = frozenset()
+
+    def __post_init__(self) -> None:
+        if any(
+            type(sequence) is not int or sequence < 1
+            for sequence in self.committed_terminal_sequences
+        ):
+            raise ValueError("committed terminal sequences must be positive integers")
 
 
 @runtime_checkable
@@ -125,6 +167,26 @@ class ReportRunStore(Protocol):
 
 def _mapping(value: object) -> Mapping[str, object] | None:
     return value if isinstance(value, Mapping) else None
+
+
+def _trusted_recorded_events(source: RecordedRunEvidence) -> tuple[StoredStageEvent, ...]:
+    by_sequence: dict[int, StoredStageEvent] = {}
+    for stored in source.events:
+        if stored.sequence in by_sequence:
+            raise ValueError("recorded event sequences must be unique")
+        by_sequence[stored.sequence] = stored
+    missing = source.committed_terminal_sequences - by_sequence.keys()
+    if missing:
+        raise ValueError("committed terminal sequence is missing from recorded events")
+    for sequence in source.committed_terminal_sequences:
+        if by_sequence[sequence].event.event_type == "started":
+            raise ValueError("a started event cannot be a committed terminal")
+    return tuple(
+        stored
+        for stored in source.events
+        if stored.event.event_type == "started"
+        or stored.sequence in source.committed_terminal_sequences
+    )
 
 
 def _spectrum(value: object) -> Mapping[str, object] | None:
@@ -141,12 +203,27 @@ def _spectrum(value: object) -> Mapping[str, object] | None:
     if result["status"] == "SUCCESS" and (not states or result["error"] is not None):
         return None
     if result["status"] == "FAILED" and (
-        states or not isinstance(result["error"], Mapping)
+        states
+        or not isinstance(result["error"], Mapping)
+        or not isinstance(result["error"].get("code"), str)
+        or not result["error"]["code"].strip()
+        or not isinstance(result["error"].get("message"), str)
+        or not result["error"]["message"].strip()
     ):
         return None
+    indices = []
     for state in states:
         if (
             not isinstance(state, Mapping)
+            or set(state)
+            - {
+                "state_index",
+                "energy_ev",
+                "wavelength_nm",
+                "oscillator_strength",
+                "converged",
+                "root_character",
+            }
             or not {
                 "state_index",
                 "energy_ev",
@@ -155,22 +232,64 @@ def _spectrum(value: object) -> Mapping[str, object] | None:
                 "converged",
             }.issubset(state)
             or type(state["state_index"]) is not int
+            or not 1 <= state["state_index"] <= 512
             or type(state["converged"]) is not bool
             or any(
                 type(state[key]) not in {int, float}
                 or not math.isfinite(float(state[key]))
                 for key in ("energy_ev", "wavelength_nm", "oscillator_strength")
             )
+            or float(state["energy_ev"]) <= 0
+            or float(state["wavelength_nm"]) <= 0
+            or float(state["oscillator_strength"]) < 0
+            or not math.isfinite(
+                float(state["energy_ev"]) * float(state["wavelength_nm"])
+            )
+            or abs(
+                float(state["energy_ev"]) * float(state["wavelength_nm"])
+                - 1239.841984
+            )
+            / 1239.841984
+            > 0.01 + 1e-12
+            or (
+                state.get("root_character") is not None
+                and (
+                    not isinstance(state.get("root_character"), str)
+                    or not state["root_character"].strip()
+                )
+            )
         ):
             return None
+        indices.append(state["state_index"])
     provenance = result["provenance"]
     protocol = _mapping(provenance.get("protocol"))
     if (
         protocol is None
+        or set(provenance)
+        - {"protocol", "geometry_hash", "command_metadata", "backend_metadata"}
         or protocol.get("functional") != "B3LYP"
         or protocol.get("basis") != "STO-3G"
         or protocol.get("excited_state_method") != "TDDFT"
+        or protocol.get("geometry_workflow")
+        not in {"vertical_from_molecule_editor", "b3lyp_sto3g_optimized"}
+        or not isinstance(protocol.get("backend"), str)
+        or not protocol["backend"].strip()
+        or not isinstance(protocol.get("backend_version"), str)
+        or not protocol["backend_version"].strip()
+        or type(protocol.get("n_states")) is not int
+        or not 1 <= protocol["n_states"] <= 512
+        or type(protocol.get("charge")) is not int
+        or not -100 <= protocol["charge"] <= 100
+        or type(protocol.get("multiplicity")) is not int
+        or not 1 <= protocol["multiplicity"] <= 16
+        or protocol.get("energy_unit") != "eV"
+        or protocol.get("wavelength_unit") != "nm"
+        or protocol.get("oscillator_strength_unit") != "dimensionless"
         or not isinstance(provenance.get("geometry_hash"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", provenance["geometry_hash"]) is None
+        or len(indices) != len(set(indices))
+        or len(indices) > protocol["n_states"]
+        or any(index > protocol["n_states"] for index in indices)
     ):
         return None
     return result
@@ -323,6 +442,42 @@ def _matches_snapshot_best(
     )
 
 
+def _resolved_terminal_events(
+    records: list[StoredStageEvent],
+) -> tuple[StoredStageEvent, ...]:
+    resolved: dict[tuple[object, int], StoredStageEvent] = {}
+    for stored in sorted(records, key=lambda item: item.sequence):
+        event = stored.event
+        if event.event_type == "started":
+            continue
+        key = (event.stage, event.attempt)
+        current = resolved.get(key)
+        if (
+            current is None
+            or current.event.event_type == "interrupted"
+            or event.event_type != "interrupted"
+        ):
+            resolved[key] = stored
+    return tuple(sorted(resolved.values(), key=lambda item: item.sequence))
+
+
+def _last_stage_terminal(
+    terminals: tuple[StoredStageEvent, ...], stage_value: str
+):
+    return next(
+        (
+            stored.event
+            for stored in reversed(terminals)
+            if stored.event.stage.value == stage_value
+        ),
+        None,
+    )
+
+
+def _token_value(value: object) -> int:
+    return value if type(value) is int and value >= 0 else 0
+
+
 def _build_iteration(
     iteration_id: int,
     snapshot: Mapping[str, object],
@@ -352,13 +507,9 @@ def _build_iteration(
             for record in records
         ):
             submitted.add(particle)
-        last_terminal = next(
-            (
-                record.event
-                for record in reversed(records)
-                if record.event.event_type != "started"
-            ),
-            None,
+        resolved_terminals = _resolved_terminal_events(records)
+        last_terminal = (
+            None if not resolved_terminals else resolved_terminals[-1].event
         )
         if last_terminal is not None:
             primary = last_terminal.payload.get("primary_status")
@@ -372,25 +523,24 @@ def _build_iteration(
             invalid += primary == "INVALID" or (
                 primary is None and last_terminal.event_type == "invalid"
             )
-        final_by_stage = {}
-        for record in records:
-            if record.event.event_type != "started":
-                final_by_stage[record.event.stage] = record.event
-        for event in final_by_stage.values():
+        for stored in resolved_terminals:
+            event = stored.event
             payload = event.payload
             usage = _mapping(payload.get("usage"))
             metadata = _mapping(payload.get("provider_metadata"))
             if usage:
-                input_tokens += int(usage.get("input_tokens", 0))
-                output_tokens += int(usage.get("output_tokens", 0))
-                cached_tokens += int(usage.get("cached_input_tokens", 0))
-            if metadata and type(metadata.get("duration_ms")) in {int, float}:
-                agent_elapsed.append(float(metadata["duration_ms"]) / 1000)
-        hypothesis = final_by_stage.get(
-            next(
-                (stage for stage in final_by_stage if stage.value == "HYPOTHESIZING"),
-                None,
-            )
+                input_tokens += _token_value(usage.get("input_tokens"))
+                output_tokens += _token_value(usage.get("output_tokens"))
+                cached_tokens += _token_value(usage.get("cached_input_tokens"))
+            duration = metadata.get("duration_ms") if metadata else None
+            if (
+                type(duration) in {int, float}
+                and math.isfinite(float(duration))
+                and duration >= 0
+            ):
+                agent_elapsed.append(float(duration) / 1000)
+        hypothesis = _last_stage_terminal(
+            resolved_terminals, "HYPOTHESIZING"
         )
         if hypothesis:
             output = _mapping(hypothesis.payload.get("output"))
@@ -400,14 +550,7 @@ def _build_iteration(
                     evidence.add(
                         f"{ref.get('source_path')} [{ref.get('evidence_layer')}]"
                     )
-        executing = next(
-            (
-                event
-                for stage, event in final_by_stage.items()
-                if stage.value == "EXECUTING"
-            ),
-            None,
-        )
+        executing = _last_stage_terminal(resolved_terminals, "EXECUTING")
         if executing:
             result = _mapping(executing.payload.get("tool_result"))
             result_payload = _mapping(result.get("payload")) if result else None
@@ -415,14 +558,14 @@ def _build_iteration(
                 process = _mapping(result_payload.get("spectrum_process"))
                 if process and type(process.get("elapsed_seconds")) in {int, float}:
                     spectrum_elapsed.append(float(process["elapsed_seconds"]))
-            if result and result.get("status") == "SUCCESS" and result_payload:
+            if result_payload:
                 spectrum = _spectrum(result_payload.get("spectrum_result"))
                 cache_marker = result_payload.get("cache_hit")
                 hit = cache_marker is True
                 if spectrum is not None:
                     completed += 1
                 cache_hits += hit
-                if spectrum is not None and cache_marker is False:
+                if process is not None and cache_marker is False:
                     executions += 1
             candidate = _mapping(executing.payload.get("candidate"))
             if (
@@ -435,17 +578,14 @@ def _build_iteration(
             adherence = _mapping(executing.payload.get("adherence"))
             errors = adherence.get("absolute_error") if adherence else None
             if isinstance(errors, (list, tuple)) and errors:
-                adherence_errors.extend(
-                    float(value) for value in errors if type(value) in {int, float}
-                )
-        evaluating = next(
-            (
-                event
-                for stage, event in final_by_stage.items()
-                if stage.value == "EVALUATING"
-            ),
-            None,
-        )
+                values = [
+                    float(value)
+                    for value in errors
+                    if type(value) in {int, float} and math.isfinite(float(value))
+                ]
+                if values:
+                    adherence_errors.append(values)
+        evaluating = _last_stage_terminal(resolved_terminals, "EVALUATING")
         if evaluating and evaluating.event_type == "completed":
             try:
                 evaluation = Evaluation.model_validate(
@@ -489,6 +629,9 @@ def _build_iteration(
     pbest_changes = sum(
         value is not None and value != before.get(key) for key, value in current.items()
     )
+    flattened_adherence = [
+        value for record_values in adherence_errors for value in record_values
+    ]
     elapsed = agent_elapsed + spectrum_elapsed
     return IterationReport(
         iteration_id=iteration_id,
@@ -519,8 +662,8 @@ def _build_iteration(
         position_adherence_records=len(adherence_errors),
         mean_position_absolute_error=(
             None
-            if not adherence_errors
-            else sum(adherence_errors) / len(adherence_errors)
+            if not flattened_adherence
+            else sum(flattened_adherence) / len(flattened_adherence)
         ),
         wiki_evidence=tuple(sorted(evidence)),
         codex_input_tokens=input_tokens,
@@ -536,9 +679,34 @@ def _build_iteration(
     )
 
 
+def _validate_complete_swarm_result(source: SwarmRunResult) -> None:
+    generations = source.generations
+    snapshots = source.snapshots
+    if not generations:
+        raise ValueError(
+            "SwarmRunResult replay has no complete generation history; report from store"
+        )
+    expected_iterations = tuple(range(len(generations) + 1))
+    if tuple(snapshot.iteration_id for snapshot in snapshots) != expected_iterations:
+        raise ValueError(
+            "SwarmRunResult snapshots must be complete from iteration zero; report from store"
+        )
+    if source.final_snapshot != snapshots[-1]:
+        raise ValueError("SwarmRunResult final snapshot is inconsistent; report from store")
+    for expected, generation in enumerate(generations):
+        if (
+            generation.source_iteration != expected
+            or generation.snapshot != snapshots[expected + 1]
+        ):
+            raise ValueError(
+                "SwarmRunResult generations must be complete and continuous; report from store"
+            )
+
+
 def build_run_report(source: SwarmRunResult | RecordedRunEvidence) -> RunReport:
     reports = []
     if isinstance(source, SwarmRunResult):
+        _validate_complete_swarm_result(source)
         for generation in source.generations:
             previous = next(
                 (
@@ -574,7 +742,7 @@ def build_run_report(source: SwarmRunResult | RecordedRunEvidence) -> RunReport:
             source.snapshots, key=lambda value: int(value.get("iteration_id", -1))
         )
         events = defaultdict(list)
-        for event in source.events:
+        for event in _trusted_recorded_events(source):
             events[event.event.iteration_id].append(event)
         for iteration_id in sorted(events):
             snapshot = next(
@@ -636,7 +804,19 @@ def build_run_report(source: SwarmRunResult | RecordedRunEvidence) -> RunReport:
         claim = "No feasible red-absorption candidate was found."
     else:
         claim = "No completed evaluation evidence is available; the result is unknown."
-    return RunReport(run_id=run_id, iterations=tuple(reports), final_claim=claim)
+    aggregate_fields = ReportStatusCounts.model_fields
+    status_counts = ReportStatusCounts(
+        **{
+            field: sum(getattr(report, field) for report in reports)
+            for field in aggregate_fields
+        }
+    )
+    return RunReport(
+        run_id=run_id,
+        iterations=tuple(reports),
+        status_counts=status_counts,
+        final_claim=claim,
+    )
 
 
 def build_run_report_from_store(
@@ -650,11 +830,17 @@ def build_run_report_from_store(
     selected = run_id if run_id is not None else (run_ids[-1] if run_ids else None)
     if selected is None or selected not in run_ids:
         raise ValueError("requested run does not exist")
+    stage_events = store.list_run_stage_events(selected)
     return build_run_report(
         RecordedRunEvidence(
             selected,
             store.list_iteration_snapshots_json(selected),
-            store.list_run_stage_events(selected),
+            stage_events,
+            frozenset(
+                stored.sequence
+                for stored in stage_events
+                if stored.event.event_type != "started"
+            ),
         )
     )
 
@@ -696,6 +882,7 @@ __all__ = [
     "EvaluationEvidence",
     "IterationReport",
     "RecordedRunEvidence",
+    "ReportStatusCounts",
     "ReportRunStore",
     "RunReport",
     "build_run_report",

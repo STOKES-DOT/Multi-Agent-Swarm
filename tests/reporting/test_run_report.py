@@ -8,16 +8,23 @@ import pytest
 from multi_agent_pso.core import (
     AgentStage,
     EvaluationStatus,
+    IterationSnapshot,
     StageEvent,
     StoredStageEvent,
 )
+from multi_agent_pso.orchestration import GenerationResult, SwarmRunResult
 from multi_agent_pso.reporting import (
+    IterationReport,
     build_run_report,
     build_run_report_from_store,
     publish_run_report,
 )
 from multi_agent_pso.storage import FileArtifactStore, SQLiteRunStore
-from tests.fixtures.reports import recorded_evidence
+from tests.fixtures.reports import (
+    REPORT_CONFIG_HASH,
+    checkpoint_for_report_event,
+    recorded_evidence,
+)
 
 
 def test_report_derives_truth_metrics_and_safe_final_claim() -> None:
@@ -46,6 +53,13 @@ def test_report_derives_truth_metrics_and_safe_final_claim() -> None:
     )
     assert json.loads(report.canonical_json())["run_id"] == "report-run"
     assert report.to_markdown() == report.to_markdown()
+    assert report.scientific_claim == report.final_claim
+    assert report.status_counts.successful_evaluations == 2
+    markdown = report.to_markdown()
+    for field in ("schema_version", "run_id", "final_claim", "status_counts"):
+        assert f"- {field}:" in markdown
+    for field in IterationReport.model_fields:
+        assert f"- {field}:" in markdown
 
 
 def _rewrite_event(evidence, predicate, rewrite):
@@ -56,7 +70,13 @@ def _rewrite_event(evidence, predicate, rewrite):
             event = rewrite(event)
         if event is not None:
             events.append(StoredStageEvent(sequence=stored.sequence, event=event))
-    return type(evidence)(evidence.run_id, evidence.snapshots, tuple(events))
+    sequences = {stored.sequence for stored in events}
+    return type(evidence)(
+        evidence.run_id,
+        evidence.snapshots,
+        tuple(events),
+        evidence.committed_terminal_sequences & sequences,
+    )
 
 
 @pytest.mark.parametrize(
@@ -107,7 +127,12 @@ def test_positive_claim_requires_candidate_bound_recorded_evaluation(
             "candidate_hash": "f" * 64,
         }
         snapshots[-1] = final_snapshot
-        evidence = type(evidence)(evidence.run_id, tuple(snapshots), evidence.events)
+        evidence = type(evidence)(
+            evidence.run_id,
+            tuple(snapshots),
+            evidence.events,
+            evidence.committed_terminal_sequences,
+        )
     elif mutation in {"executing_not_completed", "evaluating_not_completed"}:
         stage = (
             AgentStage.EXECUTING
@@ -181,6 +206,7 @@ def test_final_claim_can_verify_carried_gbest_from_earlier_iteration() -> None:
             evidence.run_id,
             (*evidence.snapshots, final_snapshot),
             (*evidence.events, carry_event),
+            evidence.committed_terminal_sequences | {carry_event.sequence},
         )
     )
     assert report.iterations[-1].gbest_candidate_hash == "c" * 64
@@ -209,11 +235,182 @@ def test_report_claims_no_feasible_or_unknown_only_from_evaluation_evidence() ->
             event = event.model_copy(update={"payload": payload})
         events.append(StoredStageEvent(sequence=stored.sequence, event=event))
     no_feasible = build_run_report(
-        type(evidence)(evidence.run_id, tuple(snapshots), tuple(events))
+        type(evidence)(
+            evidence.run_id,
+            tuple(snapshots),
+            tuple(events),
+            evidence.committed_terminal_sequences,
+        )
     )
     assert no_feasible.final_claim == "No feasible red-absorption candidate was found."
     unknown = build_run_report(type(evidence)("empty", (), ()))
     assert "unknown" in unknown.final_claim
+
+
+def test_uncommitted_terminal_events_cannot_support_a_claim() -> None:
+    evidence = recorded_evidence()
+    untrusted = type(evidence)(
+        evidence.run_id,
+        evidence.snapshots,
+        evidence.events,
+        frozenset(),
+    )
+    report = build_run_report(untrusted)
+    assert all(item.evaluated == 0 for item in report.iterations)
+    assert "unknown" in report.final_claim
+
+
+def test_agent_attempt_usage_is_counted_once_per_resolved_attempt() -> None:
+    evidence = recorded_evidence()
+    events = []
+    for stored in evidence.events:
+        event = stored.event
+        if (
+            event.particle_id == "p0"
+            and event.stage is AgentStage.HYPOTHESIZING
+            and event.event_type == "completed"
+        ):
+            events.extend(
+                [
+                    event.model_copy(
+                        update={
+                            "event_type": "failed",
+                            "payload": {
+                                "usage": {
+                                    "input_tokens": 1,
+                                    "output_tokens": 2,
+                                    "cached_input_tokens": 3,
+                                },
+                                "provider_metadata": {"duration_ms": 200},
+                            },
+                        }
+                    ),
+                    event.model_copy(
+                        update={"attempt": 1, "event_type": "started", "payload": {}}
+                    ),
+                    event.model_copy(update={"attempt": 1}),
+                ]
+            )
+        else:
+            events.append(event)
+    stored = tuple(
+        StoredStageEvent(sequence=index, event=event)
+        for index, event in enumerate(events, start=1)
+    )
+    report = build_run_report(
+        type(evidence)(
+            evidence.run_id,
+            evidence.snapshots,
+            stored,
+            frozenset(
+                item.sequence
+                for item in stored
+                if item.event.event_type != "started"
+            ),
+        )
+    )
+    item = report.iterations[0]
+    assert item.codex_input_tokens == 21
+    assert item.codex_output_tokens == 10
+    assert item.codex_cached_input_tokens == 7
+    assert item.agent_elapsed_seconds == pytest.approx(0.4)
+    assert item.agent_elapsed_coverage == 3
+
+
+def test_failed_spectrum_process_is_an_execution_but_not_a_completed_calculation() -> None:
+    evidence = recorded_evidence()
+
+    def rewrite(event):
+        payload = event.model_dump(mode="json")["payload"]
+        return event.model_copy(
+            update={
+                "payload": {
+                    **payload,
+                    "tool_result": {
+                        "status": "FAILED",
+                        "payload": {
+                            "cache_hit": False,
+                            "spectrum_process": {
+                                "status": "PROCESS_ERROR",
+                                "exit_code": 1,
+                                "elapsed_seconds": 0.5,
+                            },
+                        },
+                    },
+                }
+            }
+        )
+
+    changed = _rewrite_event(
+        evidence,
+        lambda event: event.particle_id == "p0"
+        and event.stage is AgentStage.EXECUTING
+        and event.event_type == "completed",
+        rewrite,
+    )
+    item = build_run_report(changed).iterations[0]
+    assert item.spectrum_execution_count == 1
+    assert item.completed_calculation == 1
+    assert item.spectrum_elapsed_seconds == pytest.approx(0.5)
+
+
+def test_completed_calculation_requires_a_strict_spectrum_result() -> None:
+    evidence = recorded_evidence()
+
+    def rewrite(event):
+        payload = event.model_dump(mode="json")["payload"]
+        result = payload["tool_result"]
+        result_payload = dict(result["payload"])
+        spectrum = dict(result_payload["spectrum_result"])
+        states = [dict(state) for state in spectrum["states"]]
+        states[0]["wavelength_nm"] = 1.0
+        spectrum["states"] = states
+        result_payload["spectrum_result"] = spectrum
+        return event.model_copy(
+            update={
+                "payload": {
+                    **payload,
+                    "tool_result": {**result, "payload": result_payload},
+                }
+            }
+        )
+
+    changed = _rewrite_event(
+        evidence,
+        lambda event: event.particle_id == "p0"
+        and event.stage is AgentStage.EXECUTING
+        and event.event_type == "completed",
+        rewrite,
+    )
+    assert build_run_report(changed).iterations[0].completed_calculation == 1
+
+
+def test_position_adherence_counts_execution_records_not_dimensions() -> None:
+    item = build_run_report(recorded_evidence()).iterations[0]
+    assert item.position_adherence_records == 2
+    assert item.mean_position_absolute_error == pytest.approx(0.15)
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_swarm_result_replay_or_partial_history_requires_store_reporting(
+    partial: bool,
+) -> None:
+    evidence = recorded_evidence()
+    initial, final = (
+        IterationSnapshot.model_validate(snapshot) for snapshot in evidence.snapshots
+    )
+    generations = (
+        (GenerationResult(source_iteration=1, episodes=(), snapshot=final),)
+        if partial
+        else ()
+    )
+    result = SwarmRunResult(
+        final_snapshot=final,
+        snapshots=(initial, final),
+        generations=generations,
+    )
+    with pytest.raises(ValueError, match="store"):
+        build_run_report(result)
 
 
 def test_publish_is_deterministic_idempotent_and_conflict_safe(tmp_path: Path) -> None:
@@ -236,14 +433,19 @@ def test_sqlite_reporting_reads_runs_snapshots_and_events_in_order(
     evidence = recorded_evidence()
     sqlite = SQLiteRunStore(tmp_path / "runs.sqlite")
     sqlite.create_run("first", "a" * 64)
-    sqlite.create_run(evidence.run_id, "b" * 64)
+    sqlite.create_run(evidence.run_id, REPORT_CONFIG_HASH)
     for snapshot in evidence.snapshots:
         with sqlite.iteration_transaction(
             evidence.run_id, snapshot["iteration_id"]
         ) as transaction:
             transaction.put_snapshot_json(snapshot)
     for stored in evidence.events:
-        sqlite.append_stage_event(stored.event)
+        if stored.event.event_type == "started":
+            sqlite.append_stage_event(stored.event)
+        else:
+            sqlite.commit_stage_transition(
+                stored.event, checkpoint_for_report_event(stored.event)
+            )
     assert sqlite.list_run_ids() == ("first", evidence.run_id)
     report = build_run_report_from_store(sqlite)
     assert report.run_id == evidence.run_id and report.iterations[0].evaluated == 2

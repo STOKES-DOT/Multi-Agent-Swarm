@@ -25,6 +25,10 @@ class EpisodeClaimConflict(RuntimeError):
     """Another worker already owns the requested particle episode."""
 
 
+class RunStoreCorruptionError(RuntimeError):
+    """Persisted run evidence is malformed or internally inconsistent."""
+
+
 @runtime_checkable
 class IterationTransaction(Protocol):
     """The explicit, synchronous state writes belonging to one iteration."""
@@ -107,5 +111,6 @@ __all__ = [
     "ArtifactStore",
     "EpisodeClaimConflict",
     "IterationTransaction",
+    "RunStoreCorruptionError",
     "RunStore",
 ]

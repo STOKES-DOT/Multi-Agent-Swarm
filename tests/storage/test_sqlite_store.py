@@ -20,9 +20,220 @@ from multi_agent_pso.core import (
     StoredStageEvent,
 )
 from multi_agent_pso.protocols import ToolResult, ToolStatus
-from multi_agent_pso.storage import EpisodeClaimConflict, SQLiteRunStore
+from multi_agent_pso.storage import (
+    EpisodeClaimConflict,
+    RunStoreCorruptionError,
+    SQLiteRunStore,
+)
+import multi_agent_pso.storage as storage_module
 from multi_agent_pso.storage.sqlite_store import _SCHEMA
 import multi_agent_pso.storage.sqlite_store as sqlite_store_module
+from tests.fixtures.reports import recorded_evidence
+
+
+def test_storage_exports_explicit_run_store_corruption_error() -> None:
+    error_type = getattr(storage_module, "RunStoreCorruptionError", None)
+    assert isinstance(error_type, type)
+    assert issubclass(error_type, RuntimeError)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["not_json", "not_mapping", "run_id", "iteration_id", "model"],
+)
+def test_reporting_snapshot_rows_are_strictly_validated(
+    tmp_path: Path, corruption: str
+) -> None:
+    path = tmp_path / "runs.sqlite"
+    store = SQLiteRunStore(path)
+    store.create_run("report-run", "a" * 64)
+    payload = recorded_evidence().snapshots[0]
+    if corruption == "not_json":
+        serialized = "{"
+    elif corruption == "not_mapping":
+        serialized = "[]"
+    else:
+        payload = json.loads(json.dumps(payload))
+        if corruption == "run_id":
+            payload["run_id"] = "other"
+        elif corruption == "iteration_id":
+            payload["iteration_id"] = 1
+        else:
+            payload["particles"] = []
+        serialized = json.dumps(payload)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO iterations VALUES (?, ?, ?)",
+            ("report-run", 0, serialized),
+        )
+        connection.commit()
+
+    with pytest.raises(RunStoreCorruptionError, match="snapshot"):
+        store.list_iteration_snapshots_json("report-run")
+
+
+def test_reporting_events_ignore_orphan_terminal_and_keep_paired_terminal(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteRunStore(tmp_path / "runs.sqlite")
+    store.create_run("run-1", "a" * 64)
+    started = StageEvent(
+        run_id="run-1",
+        particle_id="p0",
+        iteration_id=0,
+        stage=AgentStage.EXECUTING,
+        attempt=0,
+        event_type="started",
+    )
+    orphan = started.model_copy(
+        update={"event_type": "completed", "payload": {"untrusted": True}}
+    )
+    trusted = StageEvent(
+        run_id="run-1",
+        particle_id="p0",
+        iteration_id=0,
+        stage=AgentStage.EVALUATING,
+        attempt=0,
+        event_type="completed",
+    )
+    store.append_stage_event(started)
+    store.append_stage_event(orphan)
+    store.commit_stage_transition(
+        trusted,
+        _checkpoint(
+            completed_stage=AgentStage.EVALUATING,
+            next_stage=AgentStage.REFLECTING,
+        ),
+    )
+
+    events = store.list_run_stage_events("run-1")
+    assert [(item.event.stage, item.event.event_type) for item in events] == [
+        (AgentStage.EXECUTING, "started"),
+        (AgentStage.EVALUATING, "completed"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "missing_event",
+        "event_identity",
+        "checkpoint_identity",
+        "duplicate",
+        "duplicate_resolution",
+    ],
+)
+def test_reporting_events_reject_checkpoint_corruption(
+    tmp_path: Path, corruption: str
+) -> None:
+    path = tmp_path / "runs.sqlite"
+    store = SQLiteRunStore(path)
+    store.create_run("run-1", "a" * 64)
+    event = StageEvent(
+        run_id="run-1",
+        particle_id="p0",
+        iteration_id=0,
+        stage=AgentStage.EXECUTING,
+        attempt=0,
+        event_type="completed",
+    )
+    store.commit_stage_transition(event, _checkpoint())
+    with sqlite3.connect(path) as connection:
+        if corruption == "missing_event":
+            connection.execute("DELETE FROM stage_events")
+        elif corruption == "event_identity":
+            connection.execute("UPDATE stage_events SET particle_id = 'p1'")
+        elif corruption == "checkpoint_identity":
+            value = json.loads(
+                connection.execute(
+                    "SELECT payload_json FROM thread_checkpoints"
+                ).fetchone()[0]
+            )
+            value["particle_id"] = "p1"
+            value["context"]["particle_id"] = "p1"
+            connection.execute(
+                "UPDATE thread_checkpoints SET payload_json = ?",
+                (json.dumps(value),),
+            )
+        elif corruption == "duplicate":
+            connection.execute(
+                """INSERT INTO thread_checkpoints
+                (run_id, particle_id, iteration_id, payload_json)
+                SELECT run_id, particle_id, iteration_id, payload_json
+                FROM thread_checkpoints"""
+            )
+        else:
+            sequence = connection.execute(
+                """INSERT INTO stage_events
+                (run_id, particle_id, iteration_id, stage, attempt, event_type,
+                payload_json) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                ("run-1", "p0", 0, "EXECUTING", 0, "completed", "{}"),
+            ).lastrowid
+            value = json.loads(
+                connection.execute(
+                    "SELECT payload_json FROM thread_checkpoints"
+                ).fetchone()[0]
+            )
+            value["terminal_event_sequence"] = sequence
+            connection.execute(
+                """INSERT INTO thread_checkpoints
+                (run_id, particle_id, iteration_id, payload_json)
+                VALUES (?, ?, ?, ?)""",
+                ("run-1", "p0", 0, json.dumps(value)),
+            )
+        connection.commit()
+
+    with pytest.raises(RunStoreCorruptionError, match="checkpoint"):
+        store.list_run_stage_events("run-1")
+
+
+def test_reporting_events_reject_invalid_authoritative_stage_payload(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runs.sqlite"
+    store = SQLiteRunStore(path)
+    store.create_run("run-1", "a" * 64)
+    event = StageEvent(
+        run_id="run-1",
+        particle_id="p0",
+        iteration_id=0,
+        stage=AgentStage.EXECUTING,
+        attempt=0,
+        event_type="completed",
+    )
+    store.commit_stage_transition(event, _checkpoint())
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE stage_events SET payload_json = '{'")
+        connection.commit()
+
+    with pytest.raises(RunStoreCorruptionError, match="stage"):
+        store.list_run_stage_events("run-1")
+
+
+def test_reporting_reads_enforce_row_and_payload_budgets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "runs.sqlite"
+    store = SQLiteRunStore(path)
+    store.create_run("report-run", "a" * 64)
+    snapshots = recorded_evidence().snapshots
+    with sqlite3.connect(path) as connection:
+        connection.executemany(
+            "INSERT INTO iterations VALUES (?, ?, ?)",
+            [
+                ("report-run", snapshot["iteration_id"], json.dumps(snapshot))
+                for snapshot in snapshots
+            ],
+        )
+        connection.commit()
+    monkeypatch.setattr(sqlite_store_module, "_REPORT_MAX_ROWS", 1)
+    with pytest.raises(RunStoreCorruptionError, match="too many"):
+        store.list_iteration_snapshots_json("report-run")
+
+    monkeypatch.setattr(sqlite_store_module, "_REPORT_MAX_ROWS", 100_000)
+    monkeypatch.setattr(sqlite_store_module, "_REPORT_JSON_MAX_UTF8_BYTES", 64)
+    with pytest.raises(RunStoreCorruptionError, match="snapshot"):
+        store.list_iteration_snapshots_json("report-run")
 
 
 def _checkpoint(

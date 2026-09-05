@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
@@ -10,7 +11,11 @@ from multi_agent_pso.benchmarks import (
     run_continuous_benchmark_async,
 )
 from multi_agent_pso.storage import SQLiteRunStore
-from tests.fixtures.reports import recorded_evidence
+from tests.fixtures.reports import (
+    REPORT_CONFIG_HASH,
+    checkpoint_for_report_event,
+    recorded_evidence,
+)
 
 
 def test_benchmark_cli_runs_sphere_and_writes_summary(tmp_path, capsys) -> None:
@@ -82,14 +87,19 @@ async def test_async_benchmark_api_is_required_inside_running_loop(tmp_path) -> 
 def test_report_cli_selects_latest_and_publishes_idempotently(tmp_path, capsys) -> None:
     evidence = recorded_evidence()
     store = SQLiteRunStore(tmp_path / "runs.sqlite")
-    store.create_run(evidence.run_id, "a" * 64)
+    store.create_run(evidence.run_id, REPORT_CONFIG_HASH)
     for snapshot in evidence.snapshots:
         with store.iteration_transaction(
             evidence.run_id, snapshot["iteration_id"]
         ) as transaction:
             transaction.put_snapshot_json(snapshot)
     for stored in evidence.events:
-        store.append_stage_event(stored.event)
+        if stored.event.event_type == "started":
+            store.append_stage_event(stored.event)
+        else:
+            store.commit_stage_transition(
+                stored.event, checkpoint_for_report_event(stored.event)
+            )
     args = ["report", "--runs-dir", str(tmp_path), "--latest", "--format", "markdown"]
     assert main(args) == 0
     output = json.loads(capsys.readouterr().out)
@@ -107,3 +117,19 @@ def test_report_cli_path_and_missing_run_errors_are_code_two(tmp_path, capsys) -
     assert "report error" in capsys.readouterr().err
     SQLiteRunStore(tmp_path / "runs.sqlite")
     assert main(["report", "--runs-dir", str(tmp_path), "--run-id", "missing"]) == 2
+
+
+def test_report_cli_converts_store_corruption_to_code_two_without_traceback(
+    tmp_path, capsys
+) -> None:
+    store = SQLiteRunStore(tmp_path / "runs.sqlite")
+    store.create_run("broken", "a" * 64)
+    with sqlite3.connect(tmp_path / "runs.sqlite") as connection:
+        connection.execute(
+            "INSERT INTO iterations VALUES (?, ?, ?)", ("broken", 0, "{}")
+        )
+        connection.commit()
+    assert main(["report", "--runs-dir", str(tmp_path), "--latest"]) == 2
+    captured = capsys.readouterr()
+    assert "report error:" in captured.err
+    assert "Traceback" not in captured.err

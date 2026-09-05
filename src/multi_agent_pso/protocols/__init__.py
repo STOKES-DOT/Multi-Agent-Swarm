@@ -12,6 +12,7 @@ from .storage import (
     ArtifactStore,
     EpisodeClaimConflict,
     IterationTransaction,
+    RunStoreCorruptionError,
     RunStore,
 )
 from .task_adapter import TaskAdapter
@@ -54,6 +55,7 @@ __all__ = [
     "Evaluator",
     "IterationTransaction",
     "ResourceManager",
+    "RunStoreCorruptionError",
     "RunStore",
     "StageRequest",
     "StageResponse",
