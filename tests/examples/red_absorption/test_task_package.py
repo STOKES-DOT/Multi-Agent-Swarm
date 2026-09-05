@@ -3,10 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 import time
 
+import pytest
 import yaml
 
 from multi_agent_pso.configuration import load_task_package
 import multi_agent_pso.configuration.loader as loader
+import multi_agent_pso.retrieval.local_wiki as local_wiki
 from multi_agent_pso.configuration.models import SnapshotConfig
 
 
@@ -72,7 +74,62 @@ def test_maintained_wiki_snapshot_tracks_markdown_not_raw(tmp_path: Path) -> Non
     assert entries() != first
     bad = tmp_path / "sources" / "bad.md"
     bad.symlink_to(raw)
-    import pytest
-
     with pytest.raises(ValueError):
         entries()
+
+
+@pytest.mark.parametrize(
+    ("limits", "expected_reads"),
+    [
+        (
+            SnapshotConfig(max_files=2, max_file_bytes=1024, max_total_bytes=1024),
+            {"AGENTS.md", "index.md"},
+        ),
+        (
+            SnapshotConfig(max_files=10, max_file_bytes=4, max_total_bytes=1024),
+            {"AGENTS.md", "index.md"},
+        ),
+        (
+            SnapshotConfig(max_files=10, max_file_bytes=1024, max_total_bytes=9),
+            {"AGENTS.md", "index.md"},
+        ),
+    ],
+)
+def test_maintained_snapshot_applies_builder_budget_before_file_read(
+    tmp_path: Path, monkeypatch, limits: SnapshotConfig, expected_reads: set[str]
+) -> None:
+    (tmp_path / "AGENTS.md").write_text("a", encoding="utf-8")
+    (tmp_path / "index.md").write_text("i", encoding="utf-8")
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "sources" / "large.md").write_text("0123456789", encoding="utf-8")
+    reads: list[str] = []
+    original = local_wiki._read_utf8_at
+
+    def tracked(*args, **kwargs):
+        reads.append(args[2])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(local_wiki, "_read_utf8_at", tracked)
+    builder = loader._ManifestBuilder(limits)
+    with pytest.raises(ValueError):
+        loader._add_maintained_wiki_entries(builder, tmp_path)
+    assert set(reads) <= expected_reads
+    assert "sources/large.md" not in reads
+
+
+def test_snapshot_config_can_allow_file_over_default_wiki_limit(tmp_path: Path) -> None:
+    (tmp_path / "AGENTS.md").write_text("a", encoding="utf-8")
+    (tmp_path / "index.md").write_text("i", encoding="utf-8")
+    (tmp_path / "sources").mkdir()
+    payload = "x" * (2 * 1024 * 1024 + 1)
+    (tmp_path / "sources" / "large.md").write_text(payload, encoding="utf-8")
+    builder = loader._ManifestBuilder(
+        SnapshotConfig(
+            max_files=10,
+            max_file_bytes=3 * 1024 * 1024,
+            max_total_bytes=4 * 1024 * 1024,
+        )
+    )
+    loader._add_maintained_wiki_entries(builder, tmp_path)
+    entry = next(entry for entry in builder.entries if entry.path == "sources/large.md")
+    assert entry.size_bytes == len(payload)

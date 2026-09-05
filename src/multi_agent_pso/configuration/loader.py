@@ -23,7 +23,12 @@ from yaml.resolver import BaseResolver
 
 from multi_agent_pso import __version__
 from multi_agent_pso.core import PositionSpace
-from multi_agent_pso.protocols import Evaluator, TaskAdapter, ToolProvider, validate_protocol_implementation
+from multi_agent_pso.protocols import (
+    Evaluator,
+    TaskAdapter,
+    ToolProvider,
+    validate_protocol_implementation,
+)
 
 from .models import RunSpec, SnapshotConfig
 
@@ -98,7 +103,9 @@ class _ManifestBuilder:
         if account and self._files + 1 > self.config.max_files:
             raise ValueError("snapshot max_files exceeded")
         total_remaining = (
-            self.config.max_total_bytes - self._total_bytes if account else self.config.max_total_bytes
+            self.config.max_total_bytes - self._total_bytes
+            if account
+            else self.config.max_total_bytes
         )
         if total_remaining < 0:
             raise ValueError("snapshot max_total_bytes exceeded")
@@ -110,7 +117,9 @@ class _ManifestBuilder:
                 while True:
                     file_remaining = self.config.max_file_bytes - size_bytes
                     total_remaining_now = total_remaining - size_bytes
-                    request_size = min(_HASH_CHUNK_BYTES, min(file_remaining, total_remaining_now) + 1)
+                    request_size = min(
+                        _HASH_CHUNK_BYTES, min(file_remaining, total_remaining_now) + 1
+                    )
                     if request_size <= 0:
                         if file_remaining <= 0:
                             raise ValueError("snapshot max_file_bytes exceeded")
@@ -134,18 +143,24 @@ class _ManifestBuilder:
         return result[0], result[1], None if retained is None else b"".join(retained)
 
     def digest_file(self, source: Path, *, force: bool = False) -> tuple[str, int]:
-        sha256, size_bytes, _ = self._read_bounded(source, retain=False, force=force, account=False)
+        sha256, size_bytes, _ = self._read_bounded(
+            source, retain=False, force=force, account=False
+        )
         return sha256, size_bytes
 
     def add_file(self, role: str, path: str, source: Path) -> SnapshotEntry:
-        sha256, size_bytes, _ = self._read_bounded(source, retain=False, force=False, account=True)
+        sha256, size_bytes, _ = self._read_bounded(
+            source, retain=False, force=False, account=True
+        )
         self._account(size_bytes)
         entry = SnapshotEntry(role, path, sha256, size_bytes)
         self.entries.append(entry)
         return entry
 
     def add_retained_file(self, role: str, path: str, source: Path) -> bytes:
-        sha256, size_bytes, contents = self._read_bounded(source, retain=True, force=False, account=True)
+        sha256, size_bytes, contents = self._read_bounded(
+            source, retain=True, force=False, account=True
+        )
         self._account(size_bytes)
         self.entries.append(SnapshotEntry(role, path, sha256, size_bytes))
         assert contents is not None
@@ -153,7 +168,9 @@ class _ManifestBuilder:
 
     def add_bytes(self, role: str, path: str, contents: bytes) -> SnapshotEntry:
         self._account(len(contents))
-        entry = SnapshotEntry(role, path, hashlib.sha256(contents).hexdigest(), len(contents))
+        entry = SnapshotEntry(
+            role, path, hashlib.sha256(contents).hexdigest(), len(contents)
+        )
         self.entries.append(entry)
         return entry
 
@@ -189,13 +206,18 @@ def _construct_unique_mapping(
                 raise ValueError(f"duplicate key in task configuration: {key!r}")
         except TypeError as error:
             raise yaml.constructor.ConstructorError(
-                "while constructing a mapping", node.start_mark, "unhashable mapping key", key_node.start_mark
+                "while constructing a mapping",
+                node.start_mark,
+                "unhashable mapping key",
+                key_node.start_mark,
             ) from error
         mapping[key] = loader.construct_object(value_node, deep=deep)
     return mapping
 
 
-_UniqueKeySafeLoader.add_constructor(BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping)
+_UniqueKeySafeLoader.add_constructor(
+    BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
+)
 
 
 def _resolved_path(value: object, root: Path) -> object:
@@ -203,7 +225,11 @@ def _resolved_path(value: object, root: Path) -> object:
         return value.resolve()
     if isinstance(value, str):
         candidate = Path(value)
-        return candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+        return (
+            candidate.resolve()
+            if candidate.is_absolute()
+            else (root / candidate).resolve()
+        )
     return value
 
 
@@ -222,16 +248,22 @@ def _prepared_config(raw: Mapping[str, Any], root: Path) -> dict[str, Any]:
     if isinstance(task, Mapping):
         copied = dict(task)
         if copied.get("prompt") is not None:
-            copied["prompt"] = _resolved_package_path(copied["prompt"], root, name="prompt")
+            copied["prompt"] = _resolved_package_path(
+                copied["prompt"], root, name="prompt"
+            )
         if isinstance(copied.get("schemas"), (list, tuple)):
-            copied["schemas"] = tuple(_resolved_package_path(value, root, name="schema") for value in copied["schemas"])
+            copied["schemas"] = tuple(
+                _resolved_package_path(value, root, name="schema")
+                for value in copied["schemas"]
+            )
         prepared["task"] = copied
     plugins = prepared.get("plugins")
     if isinstance(plugins, Mapping):
         copied = dict(plugins)
         if isinstance(copied.get("source_files"), (list, tuple)):
             copied["source_files"] = tuple(
-                _resolved_package_path(value, root, name="plugin source") for value in copied["source_files"]
+                _resolved_package_path(value, root, name="plugin source")
+                for value in copied["source_files"]
             )
         prepared["plugins"] = copied
     for section, field_name in (("storage", "runs_directory"), ("wiki", "path")):
@@ -245,7 +277,9 @@ def _prepared_config(raw: Mapping[str, Any], root: Path) -> dict[str, Any]:
     if isinstance(agent, Mapping):
         copied = dict(agent)
         if isinstance(copied.get("skills"), (list, tuple)):
-            copied["skills"] = tuple(_resolved_path(value, root) for value in copied["skills"])
+            copied["skills"] = tuple(
+                _resolved_path(value, root) for value in copied["skills"]
+            )
         prepared["agent"] = copied
     return prepared
 
@@ -257,6 +291,8 @@ def _require_package_file(value: Path, root: Path, *, name: str) -> None:
         raise ValueError(f"task {name} must resolve within the task package") from error
     if value.is_symlink() or not value.is_file():
         raise ValueError(f"task {name} must be an existing regular file: {value}")
+
+
 def _validate_prompt(contents: bytes, prompt: Path) -> None:
     try:
         contents.decode("utf-8")
@@ -265,7 +301,9 @@ def _validate_prompt(contents: bytes, prompt: Path) -> None:
 
 
 def _excluded(relative: Path) -> bool:
-    return any(part in _EXCLUDED_NAMES for part in relative.parts) or relative.name.endswith(".pyc")
+    return any(
+        part in _EXCLUDED_NAMES for part in relative.parts
+    ) or relative.name.endswith(".pyc")
 
 
 def _add_external_entries(builder: _ManifestBuilder, role: str, source: Path) -> None:
@@ -277,30 +315,57 @@ def _add_external_entries(builder: _ManifestBuilder, role: str, source: Path) ->
         builder.add_file(role, ".", source)
         return
     if not source.is_dir():
-        raise ValueError(f"configured {role} path is not a regular file or directory: {source}")
-    for current, directory_names, file_names in os.walk(source, topdown=True, followlinks=False):
+        raise ValueError(
+            f"configured {role} path is not a regular file or directory: {source}"
+        )
+    for current, directory_names, file_names in os.walk(
+        source, topdown=True, followlinks=False
+    ):
         current_path = Path(current)
         directory_names[:] = sorted(
-            name for name in directory_names if not _excluded((current_path / name).relative_to(source))
+            name
+            for name in directory_names
+            if not _excluded((current_path / name).relative_to(source))
         )
         for name in directory_names:
             child = current_path / name
             if child.is_symlink() or not child.is_dir():
-                raise ValueError(f"configured {role} contains a non-regular directory entry: {child}")
+                raise ValueError(
+                    f"configured {role} contains a non-regular directory entry: {child}"
+                )
         for name in sorted(file_names):
             child = current_path / name
             relative = child.relative_to(source)
             if _excluded(relative):
                 continue
             if child.is_symlink() or not child.is_file():
-                raise ValueError(f"configured {role} contains a non-regular file entry: {child}")
+                raise ValueError(
+                    f"configured {role} contains a non-regular file entry: {child}"
+                )
             builder.add_file(role, relative.as_posix(), child)
 
 
 def _add_maintained_wiki_entries(builder: _ManifestBuilder, source: Path) -> None:
-    from multi_agent_pso.retrieval import snapshot_maintained_wiki
+    from multi_agent_pso.retrieval import WikiIndexLimits, snapshot_maintained_wiki
 
-    for entry in snapshot_maintained_wiki(source):
+    remaining_files = builder.config.max_files - builder._files
+    remaining_total_bytes = builder.config.max_total_bytes - builder._total_bytes
+    if remaining_files < 1:
+        raise ValueError("snapshot max_files exceeded before Wiki snapshot")
+    if remaining_total_bytes < 1:
+        raise ValueError("snapshot max_total_bytes exceeded before Wiki snapshot")
+    defaults = WikiIndexLimits()
+    limits = WikiIndexLimits(
+        max_files=remaining_files,
+        max_file_bytes=builder.config.max_file_bytes,
+        max_total_bytes=remaining_total_bytes,
+        max_depth=defaults.max_depth,
+        max_sections=defaults.max_sections,
+        max_total_tokens=defaults.max_total_tokens,
+        max_entries=defaults.max_entries,
+        max_name_bytes=defaults.max_name_bytes,
+    )
+    for entry in snapshot_maintained_wiki(source, limits):
         builder.add_prehashed("wiki", entry.path, entry.sha256, entry.size_bytes)
 
 
@@ -336,32 +401,53 @@ def _instantiate_entrypoint(value: str) -> tuple[object, str, object]:
     try:
         factory = getattr(module, attribute_name)
     except AttributeError as error:
-        raise ValueError(f"plugin entrypoint attribute is missing: {value!r}") from error
+        raise ValueError(
+            f"plugin entrypoint attribute is missing: {value!r}"
+        ) from error
     if not callable(factory) or inspect.iscoroutinefunction(factory):
-        raise TypeError(f"plugin entrypoint must be a synchronous zero-argument factory or class: {value!r}")
+        raise TypeError(
+            f"plugin entrypoint must be a synchronous zero-argument factory or class: {value!r}"
+        )
     try:
         signature = inspect.signature(factory)
     except (TypeError, ValueError) as error:
-        raise TypeError(f"plugin entrypoint must expose an inspectable factory signature: {value!r}") from error
+        raise TypeError(
+            f"plugin entrypoint must expose an inspectable factory signature: {value!r}"
+        ) from error
     if any(
         parameter.default is inspect.Parameter.empty
-        and parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        and parameter.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
         for parameter in signature.parameters.values()
     ):
-        raise TypeError(f"plugin entrypoint factory must have no required arguments: {value!r}")
+        raise TypeError(
+            f"plugin entrypoint factory must have no required arguments: {value!r}"
+        )
     return factory(), module_name, module
 
 
-def _fingerprint(module_name: str, direct: tuple[str, int], declared: list[tuple[str, tuple[str, int]]]) -> str:
+def _fingerprint(
+    module_name: str,
+    direct: tuple[str, int],
+    declared: list[tuple[str, tuple[str, int]]],
+) -> str:
     payload = {
         "module": module_name,
         "direct": direct,
         "declared": declared,
     }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
-def _load_plugins(spec: RunSpec, root: Path, builder: _ManifestBuilder) -> LoadedPlugins:
+def _load_plugins(
+    spec: RunSpec, root: Path, builder: _ManifestBuilder
+) -> LoadedPlugins:
     entrypoints = (
         spec.plugins.position_space,
         spec.plugins.task_adapter,
@@ -370,34 +456,60 @@ def _load_plugins(spec: RunSpec, root: Path, builder: _ManifestBuilder) -> Loade
     )
     module_names = tuple(sorted({_parse_entrypoint(value)[0] for value in entrypoints}))
     declared_sources = list(spec.plugins.source_files)
-    direct_sources = {module_name: _module_source_before_import(module_name) for module_name in module_names}
+    direct_sources = {
+        module_name: _module_source_before_import(module_name)
+        for module_name in module_names
+    }
     for module_name, source in direct_sources.items():
         builder.add_file(f"plugin:{module_name}", source.name, source)
     for index, source in enumerate(declared_sources):
-        builder.add_file("plugin-source:" + str(index), source.relative_to(root).as_posix(), source)
+        builder.add_file(
+            "plugin-source:" + str(index), source.relative_to(root).as_posix(), source
+        )
     declared_digests = [
-        (source.relative_to(root).as_posix(), builder.digest_file(source)) for source in declared_sources
+        (source.relative_to(root).as_posix(), builder.digest_file(source))
+        for source in declared_sources
     ]
     planned = {
-        module_name: _fingerprint(module_name, builder.digest_file(source), declared_digests)
+        module_name: _fingerprint(
+            module_name, builder.digest_file(source), declared_digests
+        )
         for module_name, source in direct_sources.items()
     }
     for module_name, fingerprint in planned.items():
-        if (known := _MODULE_FINGERPRINTS.get(module_name)) is not None and known != fingerprint:
-            raise RuntimeError(f"plugin source changed; restart required: {module_name}")
+        if (
+            known := _MODULE_FINGERPRINTS.get(module_name)
+        ) is not None and known != fingerprint:
+            raise RuntimeError(
+                f"plugin source changed; restart required: {module_name}"
+            )
 
     loaded = [_instantiate_entrypoint(value) for value in entrypoints]
     for module_name, source in direct_sources.items():
-        loaded_module = next(module for _, name, module in loaded if name == module_name)
+        loaded_module = next(
+            module for _, name, module in loaded if name == module_name
+        )
         origin = getattr(getattr(loaded_module, "__spec__", None), "origin", None)
         if not isinstance(origin, str) or Path(origin).resolve() != source.resolve():
-            raise RuntimeError(f"plugin source changed; restart required: {module_name}")
+            raise RuntimeError(
+                f"plugin source changed; restart required: {module_name}"
+            )
         post_direct = builder.digest_file(source, force=True)
-        post_declared = [(path, builder.digest_file(root / path, force=True)) for path, _ in declared_digests]
-        if _fingerprint(module_name, post_direct, post_declared) != planned[module_name]:
-            raise RuntimeError(f"plugin source changed; restart required: {module_name}")
+        post_declared = [
+            (path, builder.digest_file(root / path, force=True))
+            for path, _ in declared_digests
+        ]
+        if (
+            _fingerprint(module_name, post_direct, post_declared)
+            != planned[module_name]
+        ):
+            raise RuntimeError(
+                f"plugin source changed; restart required: {module_name}"
+            )
 
-    position_space, task_adapter, evaluator, tool_provider = (item[0] for item in loaded)
+    position_space, task_adapter, evaluator, tool_provider = (
+        item[0] for item in loaded
+    )
     plugins = LoadedPlugins(
         position_space=cast(PositionSpace[Any, Any], position_space),
         task_adapter=cast(TaskAdapter[Any], task_adapter),
@@ -416,10 +528,16 @@ def _load_plugins(spec: RunSpec, root: Path, builder: _ManifestBuilder) -> Loade
 def _semantic_spec(spec: RunSpec, root: Path) -> dict[str, Any]:
     semantic = spec.model_dump(mode="json")
     semantic["task"]["prompt"] = spec.task.prompt.relative_to(root).as_posix()
-    semantic["task"]["schemas"] = [path.relative_to(root).as_posix() for path in spec.task.schemas]
-    semantic["plugins"]["source_files"] = [path.relative_to(root).as_posix() for path in spec.plugins.source_files]
+    semantic["task"]["schemas"] = [
+        path.relative_to(root).as_posix() for path in spec.task.schemas
+    ]
+    semantic["plugins"]["source_files"] = [
+        path.relative_to(root).as_posix() for path in spec.plugins.source_files
+    ]
     semantic["storage"].pop("runs_directory")
-    semantic["agent"]["skills"] = [f"skill:{index}" for index, _ in enumerate(spec.agent.skills)]
+    semantic["agent"]["skills"] = [
+        f"skill:{index}" for index, _ in enumerate(spec.agent.skills)
+    ]
     semantic["wiki"]["path"] = "wiki" if spec.wiki.path is not None else None
     return semantic
 
@@ -428,13 +546,20 @@ def _snapshot_hash(spec: RunSpec, root: Path, manifest: SnapshotManifest) -> str
     payload = {
         "framework_version": manifest.framework_version,
         "entries": [
-            {"role": entry.role, "path": entry.path, "sha256": entry.sha256, "size_bytes": entry.size_bytes}
+            {
+                "role": entry.role,
+                "path": entry.path,
+                "sha256": entry.sha256,
+                "size_bytes": entry.size_bytes,
+            }
             for entry in manifest.entries
         ],
         "spec": _semantic_spec(spec, root),
     }
     return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
     ).hexdigest()
 
 
@@ -453,21 +578,46 @@ def load_task_package(path: Path) -> TaskPackage:
     builder = _ManifestBuilder(spec.snapshot)
 
     _require_package_file(spec.task.prompt, root, name="prompt")
-    prompt_bytes = builder.add_retained_file("prompt", spec.task.prompt.relative_to(root).as_posix(), spec.task.prompt)
+    prompt_bytes = builder.add_retained_file(
+        "prompt", spec.task.prompt.relative_to(root).as_posix(), spec.task.prompt
+    )
     _validate_prompt(prompt_bytes, spec.task.prompt)
     schema_values: list[bytes] = []
     for index, schema in enumerate(spec.task.schemas):
         _require_package_file(schema, root, name="schema")
-        schema_values.append(builder.add_retained_file("schema:" + str(index), schema.relative_to(root).as_posix(), schema))
+        schema_values.append(
+            builder.add_retained_file(
+                "schema:" + str(index), schema.relative_to(root).as_posix(), schema
+            )
+        )
     schema_bytes = tuple(schema_values)
     if spec.wiki.path is not None:
-        if spec.wiki.snapshot_mode=="maintained_markdown": _add_maintained_wiki_entries(builder,spec.wiki.path)
-        else: _add_external_entries(builder, "wiki", spec.wiki.path)
+        if spec.wiki.snapshot_mode == "maintained_markdown":
+            _add_maintained_wiki_entries(builder, spec.wiki.path)
+        else:
+            _add_external_entries(builder, "wiki", spec.wiki.path)
     for index, skill in enumerate(spec.agent.skills):
         _add_external_entries(builder, "skill:" + str(index), skill)
     plugins = _load_plugins(spec, root, builder)
-    manifest = SnapshotManifest(tuple(sorted(builder.entries, key=lambda entry: (entry.role, entry.path))), __version__)
-    return TaskPackage(root, spec, _snapshot_hash(spec, root, manifest), plugins, prompt_bytes, schema_bytes, manifest)
+    manifest = SnapshotManifest(
+        tuple(sorted(builder.entries, key=lambda entry: (entry.role, entry.path))),
+        __version__,
+    )
+    return TaskPackage(
+        root,
+        spec,
+        _snapshot_hash(spec, root, manifest),
+        plugins,
+        prompt_bytes,
+        schema_bytes,
+        manifest,
+    )
 
 
-__all__ = ["LoadedPlugins", "SnapshotEntry", "SnapshotManifest", "TaskPackage", "load_task_package"]
+__all__ = [
+    "LoadedPlugins",
+    "SnapshotEntry",
+    "SnapshotManifest",
+    "TaskPackage",
+    "load_task_package",
+]

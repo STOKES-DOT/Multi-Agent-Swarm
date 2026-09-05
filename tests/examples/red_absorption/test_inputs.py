@@ -86,3 +86,35 @@ def test_parent_path_has_bounded_utf8_identity() -> None:
     }
     with pytest.raises(ValidationError):
         RedAbsorptionRunInputs.model_validate(values)
+
+
+def test_parent_path_is_canonical_and_parent_symlink_retarget_does_not_change_it(
+    tmp_path: Path,
+) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "parent.smi").write_text("CCO")
+    (second / "parent.smi").write_text("CCC")
+    alias = tmp_path / "alias"
+    alias.symlink_to(first, target_is_directory=True)
+    values = valid_values()
+    values["parent"] = {
+        "kind": "path",
+        "path": str(alias / "parent.smi"),
+        "format": "smiles",
+        "charge": 0,
+        "multiplicity": 1,
+        "protected_atom_ids": [],
+        "protected_smarts": [],
+    }
+    inputs = RedAbsorptionRunInputs.model_validate(values)
+    assert inputs.parent.path == str((first / "parent.smi").resolve())
+    alias.unlink()
+    alias.symlink_to(second, target_is_directory=True)
+    assert inputs.parent.path == str((first / "parent.smi").resolve())
+    final_link = tmp_path / "final-link.smi"
+    final_link.symlink_to(first / "parent.smi")
+    values["parent"]["path"] = str(final_link)
+    with pytest.raises(ValidationError):
+        RedAbsorptionRunInputs.model_validate(values)

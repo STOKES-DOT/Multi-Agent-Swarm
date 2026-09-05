@@ -112,13 +112,17 @@ class ParentSource(_StrictFrozenModel):
                     else None
                 )
                 candidate = Path(path_text) if path_text is not None else None
-                regular = (
-                    candidate is not None
-                    and candidate.is_absolute()
-                    and not candidate.is_symlink()
-                    and candidate.is_file()
-                )
-            except OSError as error:
+                if (
+                    candidate is None
+                    or not candidate.is_absolute()
+                    or candidate.is_symlink()
+                ):
+                    regular = False
+                    resolved = None
+                else:
+                    resolved = candidate.resolve(strict=True)
+                    regular = not resolved.is_symlink() and resolved.is_file()
+            except (OSError, RuntimeError) as error:
                 raise ValueError("path parent source could not be inspected") from error
             if (
                 self.value is not None
@@ -129,6 +133,7 @@ class ParentSource(_StrictFrozenModel):
                 or not regular
             ):
                 raise ValueError("path parent source is invalid")
+            object.__setattr__(self, "path", str(resolved))
         return self
 
 

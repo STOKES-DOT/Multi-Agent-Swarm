@@ -628,7 +628,7 @@ class RedAbsorptionTaskAdapter:
         total = sum(counts.values())
         weights = [counts[name] / total if total else 0.25 for name in _OPERATIONS]
         decoded = self.decode_position(target)
-        fragment = max(fragments, default=1)
+        fragment = sum(fragments) if fragments else 1
         return [
             min(1, max(0, (total - 1) / 2)),
             min(1, max(0, (fragment - 1) / 7)),

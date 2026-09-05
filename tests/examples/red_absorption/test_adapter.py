@@ -535,3 +535,59 @@ def test_adapter_preloads_assets_and_fresh_adapter_resumes_from_proposal(
         ).candidate_hash
         == HASH2
     )
+
+
+def test_realized_fragment_dimension_uses_transaction_total_heavy_atoms() -> None:
+    adapter = RedAbsorptionTaskAdapter()
+    target = [0.34, 0.375, 0, 0, 1, 0, 0.2, 0.8]
+    fragment = graph()
+    commands = [
+        {
+            "operation": "attach_fragment",
+            "anchor_atom_id": "a0001",
+            "fragment_graph": fragment,
+            "fragment_anchor_atom_id": "a0001",
+            "bond_type": "SINGLE",
+        },
+        {
+            "operation": "attach_fragment",
+            "anchor_atom_id": "a0002",
+            "fragment_graph": fragment,
+            "fragment_anchor_atom_id": "a0001",
+            "bond_type": "SINGLE",
+        },
+    ]
+    token = authorize(
+        adapter, AgentStage.PROPOSING_ACTION, context(target_position=target)
+    )
+    proposal = adapter.parse_stage_response(
+        AgentStage.PROPOSING_ACTION,
+        response(
+            {
+                "authorization_id": token,
+                "provider": "molecule_editor",
+                "operation": "edit",
+                "tool_payload": {"inspected_source_hash": HASH, "commands": commands},
+            }
+        ),
+    )
+    tool_context = ToolContext(
+        "r",
+        "p0",
+        0,
+        AgentStage.EXECUTING,
+        0,
+        Path.cwd().resolve(),
+        metadata={"proposal": proposal},
+    )
+    payload = {
+        "chemical_status": "VALID",
+        "state_hash": HASH,
+        "chemical_identity_hash": HASH2,
+        "parent_state_hash": HASH,
+        "committed_commands": commands,
+    }
+    candidate = adapter.candidate_from_tool_result(
+        ToolResult(ToolStatus.SUCCESS, payload), tool_context
+    )
+    assert adapter.realized_position(candidate)[1] == pytest.approx(3 / 7)
