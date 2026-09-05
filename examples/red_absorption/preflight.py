@@ -45,6 +45,7 @@ from .inputs import RedAbsorptionRunInputs
 from .models import SpectrumResult
 from .workflow import (
     _evaluated_geometry_from_payload,
+    _plain_json,
     _spectrum_matches_source_geometry,
 )
 
@@ -820,7 +821,7 @@ async def preflight_red_absorption(
             raise ValueError("preflight parent hashes are invalid")
         protocol = inputs.calculation_protocol
         command_payload = {
-            "candidate": inspection.payload,
+            "candidate": _plain_json(inspection.payload),
             "chemical_identity_hash": chemical_hash,
             "state_hash": state_hash,
             "geometry_hash": geometry_hash,

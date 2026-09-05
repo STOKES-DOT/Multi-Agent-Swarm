@@ -700,7 +700,7 @@ class RedAbsorptionWorkflowToolProvider:
                         if claim is BudgetClaimStatus.RESERVED:
                             try:
                                 command_payload = {
-                                    "candidate": payload,
+                                    "candidate": _plain_json(payload),
                                     "chemical_identity_hash": chemical_hash,
                                     "state_hash": state_hash,
                                     "geometry_hash": geometry_hash,
