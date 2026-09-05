@@ -298,15 +298,23 @@ def test_build_request_includes_template_schema_context_and_decoded_target() -> 
     assert "claimed reward" in request.prompt.lower()
 
 
-def test_proposal_response_schema_types_every_const_for_codex() -> None:
+def test_proposal_response_schema_uses_codex_supported_primitives() -> None:
     request = RedAbsorptionTaskAdapter().build_stage_request(
         AgentStage.PROPOSING_ACTION, context()
     )
 
     def assert_const_types(node: object) -> None:
         if isinstance(node, Mapping):
+            assert "oneOf" not in node
             if "const" in node:
                 assert node.get("type") == "string"
+            if node.get("type") == "array":
+                assert "items" in node
+            if node.get("type") == "object":
+                assert node.get("additionalProperties") is False
+                assert set(node.get("required", ())) == set(
+                    node.get("properties", {})
+                )
             for value in node.values():
                 assert_const_types(value)
         elif isinstance(node, list):
@@ -314,6 +322,42 @@ def test_proposal_response_schema_types_every_const_for_codex() -> None:
                 assert_const_types(value)
 
     assert_const_types(request.response_schema)
+
+
+def test_proposal_response_drops_nullable_optional_command_fields() -> None:
+    adapter = RedAbsorptionTaskAdapter()
+    proposal = {
+        "authorization_id": authorize(
+            adapter, AgentStage.PROPOSING_ACTION, context()
+        ),
+        "provider": "molecule_editor",
+        "operation": "edit",
+        "tool_payload": {
+            "inspected_source_hash": HASH,
+            "commands": [
+                {
+                    "operation": "replace_atom",
+                    "atom_id": "a0001",
+                    "atomic_number": 7,
+                    "isotope": None,
+                    "formal_charge": None,
+                    "chiral_tag": None,
+                    "explicit_h_count": None,
+                    "no_implicit": None,
+                    "aromatic": None,
+                    "atom_map": None,
+                }
+            ],
+        },
+    }
+
+    parsed = adapter.parse_stage_response(
+        AgentStage.PROPOSING_ACTION, response(proposal)
+    )
+
+    assert parsed["tool_payload"]["commands"] == [
+        {"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}
+    ]
 
 
 def test_candidate_realized_adherence_and_compare() -> None:

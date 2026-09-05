@@ -466,6 +466,9 @@ class RedAbsorptionTaskAdapter:
             ):
                 raise ValueError("edit command schema rejected")
             required, optional = _COMMAND_FIELDS[command["operation"]]
+            for key in optional:
+                if command.get(key) is None:
+                    command.pop(key, None)
             if not required <= set(command) or not set(command) <= required | optional:
                 raise ValueError("edit command schema rejected")
             if command["operation"] == "replace_atom" and (

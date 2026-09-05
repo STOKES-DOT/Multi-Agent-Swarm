@@ -41,7 +41,7 @@
         "parent_state_hash": {"type": ["string", "null"]},
         "next_atom_serial": {"type": "integer"}, "next_bond_serial": {"type": "integer"},
         "geometry_status": {"enum": ["NOT_REQUESTED", "READY", "FAILED"]},
-        "committed_commands": {"type": "array"}
+        "committed_commands": {"type": "array", "maxItems": 0, "items": {"type": "string"}}
       }
     }
   },
@@ -60,11 +60,11 @@
         "inspected_source_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "commands": {
           "type": "array", "minItems": 1, "maxItems": 3,
-          "items": {"oneOf": [
-            {"type": "object", "additionalProperties": false, "required": ["operation", "atom_id", "atomic_number"], "properties": {"operation": {"type": "string", "const": "replace_atom"}, "atom_id": {"type": "string"}, "atomic_number": {"type": "integer"}, "isotope": {"type": "integer"}, "formal_charge": {"type": "integer"}, "chiral_tag": {"type": "string"}, "explicit_h_count": {"type": "integer"}, "no_implicit": {"type": "boolean"}, "aromatic": {"type": "boolean"}, "atom_map": {"type": ["integer", "null"]}}},
-            {"type": "object", "additionalProperties": false, "required": ["operation", "bond_id", "bond_type"], "properties": {"operation": {"type": "string", "const": "change_bond"}, "bond_id": {"type": "string"}, "bond_type": {"type": "string"}, "aromatic": {"type": "boolean"}, "conjugated": {"type": "boolean"}, "stereo": {"type": "string"}, "stereo_atom_ids": {"type": "array", "items": {"type": "string"}}, "bond_direction": {"type": "string"}}},
-            {"type": "object", "additionalProperties": false, "required": ["operation", "anchor_atom_id", "fragment_graph", "fragment_anchor_atom_id", "bond_type"], "properties": {"operation": {"type": "string", "const": "attach_fragment"}, "anchor_atom_id": {"type": "string"}, "fragment_graph": {"$ref": "#/$defs/chemicalGraph"}, "fragment_anchor_atom_id": {"type": "string"}, "bond_type": {"type": "string"}, "client_ref": {"type": "string"}}},
-            {"type": "object", "additionalProperties": false, "required": ["operation", "bond_id", "retained_atom_id", "fragment_graph", "fragment_anchor_atom_id", "bond_type"], "properties": {"operation": {"type": "string", "const": "substitute_fragment"}, "bond_id": {"type": "string"}, "retained_atom_id": {"type": "string"}, "fragment_graph": {"$ref": "#/$defs/chemicalGraph"}, "fragment_anchor_atom_id": {"type": "string"}, "bond_type": {"type": "string"}, "client_ref": {"type": "string"}}}
+          "items": {"anyOf": [
+            {"type": "object", "additionalProperties": false, "required": ["operation", "atom_id", "atomic_number", "isotope", "formal_charge", "chiral_tag", "explicit_h_count", "no_implicit", "aromatic", "atom_map"], "properties": {"operation": {"type": "string", "const": "replace_atom"}, "atom_id": {"type": "string"}, "atomic_number": {"type": "integer"}, "isotope": {"type": ["integer", "null"]}, "formal_charge": {"type": ["integer", "null"]}, "chiral_tag": {"type": ["string", "null"]}, "explicit_h_count": {"type": ["integer", "null"]}, "no_implicit": {"type": ["boolean", "null"]}, "aromatic": {"type": ["boolean", "null"]}, "atom_map": {"type": ["integer", "null"]}}},
+            {"type": "object", "additionalProperties": false, "required": ["operation", "bond_id", "bond_type", "aromatic", "conjugated", "stereo", "stereo_atom_ids", "bond_direction"], "properties": {"operation": {"type": "string", "const": "change_bond"}, "bond_id": {"type": "string"}, "bond_type": {"type": "string"}, "aromatic": {"type": ["boolean", "null"]}, "conjugated": {"type": ["boolean", "null"]}, "stereo": {"type": ["string", "null"]}, "stereo_atom_ids": {"type": ["array", "null"], "items": {"type": "string"}}, "bond_direction": {"type": ["string", "null"]}}},
+            {"type": "object", "additionalProperties": false, "required": ["operation", "anchor_atom_id", "fragment_graph", "fragment_anchor_atom_id", "bond_type", "client_ref"], "properties": {"operation": {"type": "string", "const": "attach_fragment"}, "anchor_atom_id": {"type": "string"}, "fragment_graph": {"$ref": "#/$defs/chemicalGraph"}, "fragment_anchor_atom_id": {"type": "string"}, "bond_type": {"type": "string"}, "client_ref": {"type": ["string", "null"]}}},
+            {"type": "object", "additionalProperties": false, "required": ["operation", "bond_id", "retained_atom_id", "fragment_graph", "fragment_anchor_atom_id", "bond_type", "client_ref"], "properties": {"operation": {"type": "string", "const": "substitute_fragment"}, "bond_id": {"type": "string"}, "retained_atom_id": {"type": "string"}, "fragment_graph": {"$ref": "#/$defs/chemicalGraph"}, "fragment_anchor_atom_id": {"type": "string"}, "bond_type": {"type": "string"}, "client_ref": {"type": ["string", "null"]}}}
           ]}
         }
       }
