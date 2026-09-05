@@ -139,6 +139,17 @@ def test_energy_wavelength_product_rejects_subnormal_and_overflow() -> None:
 
 
 @pytest.mark.parametrize(
+    "field",
+    ["energy_ev", "wavelength_nm", "oscillator_strength"],
+)
+def test_huge_json_integers_are_wrapped_as_validation_errors(field: str) -> None:
+    values = state().model_dump(mode="python")
+    values[field] = 10**400
+    with pytest.raises(ValidationError):
+        ExcitedState(**values)
+
+
+@pytest.mark.parametrize(
     "factory",
     [
         lambda: protocol(backend="\ud800"),

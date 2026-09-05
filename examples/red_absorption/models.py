@@ -151,7 +151,10 @@ class ExcitedState(_StrictFrozenModel):
     def validate_positive_finite(cls, value: object) -> float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError("energy and wavelength must be real numbers")
-        normalized = float(value)
+        try:
+            normalized = float(value)
+        except OverflowError as error:
+            raise ValueError("energy and wavelength must fit a finite float") from error
         if not math.isfinite(normalized) or normalized <= 0:
             raise ValueError("energy and wavelength must be finite and positive")
         return normalized
@@ -161,7 +164,10 @@ class ExcitedState(_StrictFrozenModel):
     def validate_finite_strength(cls, value: object) -> float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError("oscillator strength must be a real number")
-        normalized = float(value)
+        try:
+            normalized = float(value)
+        except OverflowError as error:
+            raise ValueError("oscillator strength must fit a finite float") from error
         if not math.isfinite(normalized) or normalized < 0:
             raise ValueError("oscillator strength must be finite and nonnegative")
         return normalized
