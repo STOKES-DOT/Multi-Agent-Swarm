@@ -262,3 +262,74 @@ async def test_cancelled_close_continues_and_close_failure_can_retry(tmp_path):
         await retry.aclose()
     await retry.aclose()
     assert failing.close_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_execute_double_cancel_cannot_leak_active_marker_while_state_lock_is_held(
+    tmp_path,
+):
+    inputs = inputs_with_concurrency(tmp_path, 1)
+    spectrum = DelayedSpectrum()
+    resources = RedAbsorptionWorkflowResources.from_inputs(inputs)
+    tool = RedAbsorptionWorkflowToolProvider.bind(
+        inputs, VariableEditor([], parent_graph()), resources, spectrum=spectrum
+    )
+    request, context = authorized_request_context(
+        [{"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}],
+        tmp_path.resolve(),
+    )
+    execution = asyncio.create_task(tool.execute(request, context))
+    while spectrum.active == 0:
+        await asyncio.sleep(0)
+    markers = tuple(tool._active)
+    await tool._state_lock.acquire()
+    try:
+        execution.cancel("first")
+        await asyncio.sleep(0)
+        execution.cancel("second")
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await execution
+        assert captured.value.args == ("first",)
+        assert not tool._active and all(marker.is_set() for marker in markers)
+    finally:
+        tool._state_lock.release()
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_observes_background_failure_and_retries_from_retained_task(
+    tmp_path,
+):
+    inputs = inputs_with_concurrency(tmp_path, 1)
+    spectrum = ControlledCloseSpectrum(fail_first=True)
+    spectrum.release.clear()
+    tool = RedAbsorptionWorkflowToolProvider.bind(
+        inputs,
+        VariableEditor([], parent_graph()),
+        RedAbsorptionWorkflowResources.from_inputs(inputs),
+        spectrum=spectrum,
+        own_spectrum=True,
+    )
+    loop = asyncio.get_running_loop()
+    observed = []
+    original = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: observed.append(context))
+    try:
+        caller = asyncio.create_task(tool.aclose())
+        await spectrum.started.wait()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        spectrum.release.set()
+        while tool._close_task is not None and not tool._close_task.done():
+            await asyncio.sleep(0)
+        assert tool._close_task is not None and isinstance(
+            tool._close_task.exception(), RuntimeError
+        )
+        assert not tool._closed
+        await tool.aclose()
+        assert tool._closed and spectrum.close_calls == 2
+        await asyncio.sleep(0)
+        assert not observed
+    finally:
+        loop.set_exception_handler(original)

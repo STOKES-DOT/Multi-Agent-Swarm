@@ -191,8 +191,7 @@ class RedAbsorptionWorkflowToolProvider:
         try:
             return await self._execute_active(request, context)
         finally:
-            async with self._state_lock:
-                self._active.discard(active)
+            self._active.discard(active)
             active.set()
 
     async def _execute_active(
@@ -405,11 +404,26 @@ class RedAbsorptionWorkflowToolProvider:
         async with self._state_lock:
             if self._closed:
                 return
-            if self._close_task is None:
+            previous = self._close_task
+            retry = previous is None or (
+                previous.done()
+                and (previous.cancelled() or previous.exception() is not None)
+            )
+            if retry:
                 self._closing = True
                 self._close_task = asyncio.create_task(self._close_active())
+                self._close_task.add_done_callback(self._observe_close_task)
             close_task = self._close_task
         await asyncio.shield(close_task)
+
+    @staticmethod
+    def _observe_close_task(task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            return
 
     async def _close_active(self) -> None:
         try:
@@ -420,9 +434,7 @@ class RedAbsorptionWorkflowToolProvider:
             if self._own_spectrum and self._spectrum is not None:
                 await self._spectrum.aclose()
         except BaseException:
-            async with self._state_lock:
-                self._closing = False
-                self._close_task = None
+            self._closing = False
             raise
         async with self._state_lock:
             self._closed = True
