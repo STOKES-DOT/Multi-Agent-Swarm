@@ -201,6 +201,15 @@ async def test_stage_context_provider_additions_are_persisted_and_cannot_overwri
         if event.stage is AgentStage.HYPOTHESIZING and event.event_type == "started"
     )
     assert hypothesis_started.payload["context"]["prepared_hypothesizing"] is True
+    hypothesis_completed = next(
+        event
+        for event in dependencies["run_store"].events
+        if event.stage is AgentStage.HYPOTHESIZING and event.event_type == "completed"
+    )
+    assert (
+        hypothesis_started.payload["context_additions"]
+        == hypothesis_completed.payload["context_additions"]
+    )
 
     class Malicious:
         async def prepare(self, stage, context, tool_context):
@@ -213,6 +222,109 @@ async def test_stage_context_provider_additions_are_persisted_and_cannot_overwri
     failed = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)
     assert failed.status is EpisodeStatus.FAILED
     assert dependencies["runtime"].stages == []
+
+
+@pytest.mark.asyncio
+async def test_failed_stage_context_additions_are_audited_and_tamper_rejected(tmp_path):
+    class Provider:
+        async def prepare(self, stage, context, tool_context):
+            return {"prepared_failure": {"source": "fixture"}}
+
+    dependencies = make_fake_dependencies(
+        tmp_path, stage_exceptions={AgentStage.HYPOTHESIZING: RuntimeError("boom")}
+    )
+    dependencies["stage_context_provider"] = Provider()
+    loop = AgentLoop(**dependencies)
+    episode = await loop.run_particle("run-1", "p0", 0)
+    assert episode.status is EpisodeStatus.FAILED
+    evidence = [
+        event
+        for event in dependencies["run_store"].events
+        if event.stage is AgentStage.HYPOTHESIZING
+    ]
+    assert (
+        evidence[-2].payload["context_additions"]
+        == evidence[-1].payload["context_additions"]
+    )
+    store = dependencies["run_store"]
+    store.checkpoints[("run-1", "p0", 0)][-1]["context"]["prepared_failure"] = {
+        "tampered": True
+    }
+    checkpoint = EpisodeCheckpoint.model_validate(
+        store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    )
+    with pytest.raises(IncompatibleCheckpointError, match="addition"):
+        await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tamper", ["hypothesis", "proposal", "missing_evidence", "truncated"]
+)
+async def test_resume_cross_validates_generic_stage_context_addition_evidence(
+    tmp_path, tamper
+):
+    class Provider:
+        async def prepare(self, stage, context, tool_context):
+            if stage is AgentStage.HYPOTHESIZING:
+                return {"prepared_wiki": {"path": "sources/a.md"}}
+            if stage is AgentStage.PROPOSING_ACTION:
+                return {"prepared_inspection": {"state_hash": "a" * 64}}
+            return {}
+
+    dependencies = make_fake_dependencies(
+        tmp_path, interrupt_after_transition=(AgentStage.PROPOSING_ACTION, "completed")
+    )
+    dependencies["stage_context_provider"] = Provider()
+    loop = AgentLoop(**dependencies)
+    with pytest.raises(KeyboardInterrupt):
+        await loop.run_particle("run-1", "p0", 0)
+    store = dependencies["run_store"]
+    if tamper in {"hypothesis", "proposal"}:
+        key = "prepared_wiki" if tamper == "hypothesis" else "prepared_inspection"
+        store.checkpoints[("run-1", "p0", 0)][-1]["context"][key] = {"tampered": True}
+    else:
+        index = next(
+            index
+            for index, stored in enumerate(store.stored_events)
+            if stored.event.stage is AgentStage.PROPOSING_ACTION
+            and stored.event.event_type == "completed"
+        )
+        stored = store.stored_events[index]
+        payload = stored.event.model_dump(mode="json")["payload"]
+        if tamper == "missing_evidence":
+            payload.pop("context_additions")
+        else:
+            payload = {"truncated": True}
+        store.stored_events[index] = StoredStageEvent(
+            sequence=stored.sequence,
+            event=stored.event.model_copy(update={"payload": payload}),
+        )
+    checkpoint = EpisodeCheckpoint.model_validate(
+        store.get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    )
+    with pytest.raises(IncompatibleCheckpointError, match="addition|evidence"):
+        await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+
+@pytest.mark.asyncio
+async def test_resume_accepts_untampered_generic_stage_context_additions(tmp_path):
+    class Provider:
+        async def prepare(self, stage, context, tool_context):
+            return {f"prepared_{stage.value.lower()}": True}
+
+    dependencies = make_fake_dependencies(
+        tmp_path, interrupt_after_transition=(AgentStage.PROPOSING_ACTION, "completed")
+    )
+    dependencies["stage_context_provider"] = Provider()
+    loop = AgentLoop(**dependencies)
+    with pytest.raises(KeyboardInterrupt):
+        await loop.run_particle("run-1", "p0", 0)
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json("run-1", "p0", 0)
+    )
+    episode = await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+    assert episode.status is EpisodeStatus.COMPLETED
 
 
 @pytest.mark.asyncio

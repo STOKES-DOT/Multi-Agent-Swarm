@@ -12,11 +12,9 @@ from examples.red_absorption.adapter import (
     create_position_space,
 )
 from examples.red_absorption.evaluator import RedAbsorptionEvaluator
-from examples.red_absorption.inputs import RedAbsorptionRunInputs
 from examples.red_absorption.models import SpectrumResult
 from examples.red_absorption.stage_context import RedAbsorptionStageContextProvider
 from examples.red_absorption.workflow import RedAbsorptionWorkflowToolProvider
-from multi_agent_pso.configuration import load_run_inputs
 from multi_agent_pso.core import AgentStage, EpisodeStatus, EvaluationStatus
 from multi_agent_pso.core.topology import RingTopology
 from multi_agent_pso.core.update_rule import ConstrictedUpdateRule
@@ -38,6 +36,7 @@ from multi_agent_pso.tools import (
     JsonCommandStatus,
     validate_commands,
 )
+from tests.fixtures.red_absorption import load_valid_inputs
 from tests.orchestration.fakes import FakeArtifactStore, FakeResources, FakeRunStore
 
 
@@ -46,7 +45,6 @@ PARENT_HASH = "b" * 64
 CANDIDATE_HASH = "c" * 64
 GEOMETRY_HASH = "d" * 64
 PARENT_GEOMETRY_HASH = "e" * 64
-INPUTS = Path("tests/fixtures/red_absorption/valid-inputs.yaml")
 
 
 def parent_graph() -> dict[str, object]:
@@ -283,7 +281,7 @@ def authorized_request_context(commands, workspace: Path):
 
 
 def make_runner(tmp_path: Path):
-    inputs = load_run_inputs(INPUTS, RedAbsorptionRunInputs).value
+    inputs = load_valid_inputs(tmp_path)
     order = []
     graph = parent_graph()
     wiki = FakeWiki(order)
@@ -352,10 +350,7 @@ async def test_three_by_two_red_absorption_flow_is_audited_and_cached(tmp_path: 
     assert tool.cache_hit_count == 5
     assert editor.calls == 12 and editor.edit_calls == 6
     assert all(
-        config
-        == load_run_inputs(INPUTS, RedAbsorptionRunInputs).value.geometry.model_dump(
-            mode="json"
-        )
+        config == load_valid_inputs(tmp_path).geometry.model_dump(mode="json")
         for config in editor.geometry_configs
     )
     cache_hits = []
@@ -399,7 +394,7 @@ async def test_three_by_two_red_absorption_flow_is_audited_and_cached(tmp_path: 
 async def test_illegal_edit_never_runs_spectrum_and_failed_spectrum_has_no_fitness(
     tmp_path: Path,
 ):
-    inputs = load_run_inputs(INPUTS, RedAbsorptionRunInputs).value
+    inputs = load_valid_inputs(tmp_path)
     editor = FakeEditor([], parent_graph())
     spectrum = RecordingSpectrum(inputs.spectrum_argv, [])
     tool = RedAbsorptionWorkflowToolProvider.bind(
@@ -426,7 +421,7 @@ async def test_illegal_edit_never_runs_spectrum_and_failed_spectrum_has_no_fitne
 async def test_unready_editor_results_never_start_spectrum(
     tmp_path: Path, mode: str, status: ToolStatus
 ):
-    inputs = load_run_inputs(INPUTS, RedAbsorptionRunInputs).value
+    inputs = load_valid_inputs(tmp_path)
     order = []
     editor = FakeEditor(order, parent_graph(), edit_mode=mode)
     tool = RedAbsorptionWorkflowToolProvider.bind(
@@ -450,7 +445,7 @@ async def test_unready_editor_results_never_start_spectrum(
 
 @pytest.mark.asyncio
 async def test_spectrum_cache_key_requires_all_four_identity_components(tmp_path: Path):
-    inputs = load_run_inputs(INPUTS, RedAbsorptionRunInputs).value
+    inputs = load_valid_inputs(tmp_path)
     cache = {}
     editor = FakeEditor([], parent_graph())
     spectrum = RecordingSpectrum(inputs.spectrum_argv, [])
@@ -487,7 +482,7 @@ async def test_spectrum_cache_key_requires_all_four_identity_components(tmp_path
 async def test_workflow_maps_spectrum_process_boundaries(
     tmp_path: Path, spectrum: ResultSpectrum, expected: ToolStatus
 ):
-    inputs = load_run_inputs(INPUTS, RedAbsorptionRunInputs).value
+    inputs = load_valid_inputs(tmp_path)
     tool = RedAbsorptionWorkflowToolProvider.bind(
         inputs, FakeEditor([], parent_graph()), spectrum=spectrum
     )

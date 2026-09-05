@@ -54,6 +54,7 @@ from .failure_policy import (
 _ACTIVE_STAGE_CONTEXT = "_active_stage_context"
 _ACTIVE_STAGE_REQUEST = "_active_stage_request"
 _ACTIVE_STAGE_ATTEMPT = "_active_stage_attempt"
+_ACTIVE_STAGE_ADDITIONS = "_active_stage_additions"
 V1_JSON_MAX_UTF8_BYTES = 256 * 1024
 V1_JSON_MAX_DEPTH = 32
 V1_JSON_MAX_NODES = 10_000
@@ -1015,13 +1016,13 @@ class AgentLoop:
             stored_events = self._store.list_stage_events(
                 run_id, particle_id, iteration_id
             )
-            events = self._validated_resume_events(latest, stored_events)
+            events, audit_events = self._validated_resume_events(latest, stored_events)
             context_value = self._copy_json(latest.context)
             if not isinstance(context_value, dict):
                 raise IncompatibleCheckpointError(
                     "checkpoint context must be a JSON object"
                 )
-            self._validate_resume_context(latest, context_value, events)
+            self._validate_resume_context(latest, context_value, events, audit_events)
         except ArtifactIntegrityError:
             raise
         except IncompatibleCheckpointError:
@@ -1041,7 +1042,7 @@ class AgentLoop:
 
     def _validated_resume_events(
         self, checkpoint: EpisodeCheckpoint, stored_events: object
-    ) -> list[StageEvent]:
+    ) -> tuple[list[StageEvent], list[StageEvent]]:
         if not isinstance(stored_events, tuple):
             raise IncompatibleCheckpointError(
                 "stored stage events must be returned as a tuple"
@@ -1050,6 +1051,7 @@ class AgentLoop:
         terminals: dict[tuple[AgentStage, int], dict[str, int]] = {}
         selected: StageEvent | None = None
         restored: list[StageEvent] = []
+        audit_events: list[StageEvent] = []
         latest_terminal_sequence = 0
         for stored in stored_events:
             sequence = getattr(stored, "sequence", None)
@@ -1073,6 +1075,7 @@ class AgentLoop:
                     "stored stage event identity is incompatible"
                 )
             previous_sequence = sequence
+            audit_events.append(event)
             if event.event_type == "started":
                 continue
             if event.event_type not in {
@@ -1129,13 +1132,14 @@ class AgentLoop:
             raise IncompatibleCheckpointError(
                 "checkpoint terminal event does not match its sequence"
             )
-        return restored
+        return restored, audit_events
 
     def _validate_resume_context(
         self,
         checkpoint: EpisodeCheckpoint,
         context: dict[str, JsonValue],
         events: list[StageEvent],
+        audit_events: list[StageEvent],
     ) -> None:
         required_identity = {
             "run_id": checkpoint.run_id,
@@ -1205,7 +1209,9 @@ class AgentLoop:
                 raise IncompatibleCheckpointError(
                     "checkpoint finalization differs from stage evidence"
                 )
-        self._validate_context_evidence(checkpoint, context, events, authority)
+        self._validate_context_evidence(
+            checkpoint, context, events, audit_events, authority
+        )
         if checkpoint.next_stage is None:
             self._terminal_fields_from_context(context)
             return
@@ -1246,11 +1252,12 @@ class AgentLoop:
         checkpoint: EpisodeCheckpoint,
         context: Mapping[str, JsonValue],
         events: list[StageEvent],
+        audit_events: list[StageEvent],
         authority: tuple[EpisodeStatus, EpisodeStatus, str] | None,
     ) -> None:
         completed_indices: list[int] = []
         completed_stages: set[AgentStage] = set()
-        for event in events:
+        for event in audit_events:
             if event.event_type != "completed" or event.stage in {
                 AgentStage.PENDING,
                 AgentStage.COMPLETED,
@@ -1332,6 +1339,78 @@ class AgentLoop:
             ):
                 raise IncompatibleCheckpointError(
                     f"checkpoint {context_key} differs from stage evidence"
+                )
+
+        started_additions: dict[tuple[AgentStage, int], Mapping[str, JsonValue]] = {}
+        terminal_additions: dict[str, JsonValue] = {}
+        for event in audit_events:
+            additions = event.payload.get("context_additions")
+            if additions is None:
+                continue
+            if event.payload.get("truncated") is True or not isinstance(
+                additions, Mapping
+            ):
+                raise IncompatibleCheckpointError(
+                    "stage context additions have no trustworthy evidence"
+                )
+            identity = (event.stage, event.attempt)
+            if event.event_type == "started":
+                started_additions[identity] = additions
+                continue
+            started = started_additions.get(identity)
+            if started is None or self._canonical_json(started) != self._canonical_json(
+                additions
+            ):
+                raise IncompatibleCheckpointError(
+                    "stage context additions lack paired started evidence"
+                )
+            for key, value in additions.items():
+                if key in terminal_additions and self._canonical_json(
+                    terminal_additions[key]
+                ) != self._canonical_json(value):
+                    raise IncompatibleCheckpointError(
+                        "stage context addition evidence conflicts across attempts"
+                    )
+                terminal_additions[key] = value
+
+        core_context_keys = {
+            "run_id",
+            "particle_id",
+            "iteration_id",
+            "protocol_snapshot_hash",
+            "target_position",
+            "hypothesis",
+            "proposal",
+            "tool_request",
+            "tool_result",
+            "candidate",
+            "realized_position",
+            "evaluated_position",
+            "adherence",
+            "evaluation",
+            "reflection",
+            "correction",
+            "episode_status",
+            "primary_status",
+            "finalization",
+            "episode_rebuild_unavailable",
+            "candidate_reference",
+            "candidate_hash",
+            "hypothesis_reference",
+            "evaluation_reference",
+            "checkpoint_truncated",
+            "thread_logical_id",
+            "thread_generation",
+        }
+        checkpoint_addition_keys = set(context) - core_context_keys
+        if checkpoint_addition_keys != set(terminal_additions):
+            raise IncompatibleCheckpointError(
+                "checkpoint stage context additions differ from event evidence"
+            )
+        for key, value in terminal_additions.items():
+            if self._canonical_json(context[key]) != self._canonical_json(value):
+                raise IncompatibleCheckpointError(
+                    "checkpoint stage context addition was tampered"
                 )
 
         reference_keys = (
@@ -2048,6 +2127,7 @@ class AgentLoop:
                 "checkpoint agent-stage attempt must be between zero and two"
             )
         for attempt in range(start_attempt, 3):
+            context_additions: Mapping[str, JsonValue] = {}
             try:
                 stage_context = self._copy_json(context)
             except _JsonBoundaryError as error:
@@ -2072,6 +2152,7 @@ class AgentLoop:
                     thread,
                     owner,
                 )
+            context[_ACTIVE_STAGE_ADDITIONS] = {}
             if self._stage_context_provider is not None:
                 try:
                     additions = await self._stage_context_provider.prepare(
@@ -2088,6 +2169,7 @@ class AgentLoop:
                     )
                     if not isinstance(additions, Mapping):
                         raise TypeError("stage context additions must be a mapping")
+                    context_additions = additions
                     additions = self._copy_json(additions)
                     if not isinstance(additions, Mapping):
                         raise TypeError("stage context additions must be a mapping")
@@ -2107,9 +2189,22 @@ class AgentLoop:
                         "adherence",
                         "evaluation",
                         "reflection",
+                        "correction",
+                        "episode_status",
+                        "primary_status",
+                        "finalization",
+                        "episode_rebuild_unavailable",
+                        "candidate_reference",
+                        "candidate_hash",
+                        "hypothesis_reference",
+                        "evaluation_reference",
+                        "checkpoint_truncated",
+                        "thread_logical_id",
+                        "thread_generation",
                         _ACTIVE_STAGE_CONTEXT,
                         _ACTIVE_STAGE_REQUEST,
                         _ACTIVE_STAGE_ATTEMPT,
+                        _ACTIVE_STAGE_ADDITIONS,
                     }
                     pending_additions: dict[str, JsonValue] = {}
                     for key, value in additions.items():
@@ -2157,6 +2252,7 @@ class AgentLoop:
                         thread,
                         owner,
                     )
+            context[_ACTIVE_STAGE_ADDITIONS] = self._copy_json(context_additions)
             context[_ACTIVE_STAGE_CONTEXT] = stage_context
             context[_ACTIVE_STAGE_ATTEMPT] = attempt
             try:
@@ -2164,7 +2260,9 @@ class AgentLoop:
                     stage, self._copy_json(stage_context)
                 )
             except asyncio.CancelledError as error:
-                self._record_cancelled_build(stage, attempt, stage_context, error)
+                self._record_cancelled_build(
+                    stage, attempt, stage_context, error, context_additions
+                )
                 raise
             except TimeoutError as error:
                 self._raise_recorded_build_failure(
@@ -2178,6 +2276,7 @@ class AgentLoop:
                     "timeout",
                     thread,
                     owner,
+                    context_additions,
                 )
             except Exception as error:
                 self._raise_recorded_build_failure(
@@ -2191,9 +2290,12 @@ class AgentLoop:
                     "failed",
                     thread,
                     owner,
+                    context_additions,
                 )
             except (SystemExit, KeyboardInterrupt) as error:
-                self._record_cancelled_build(stage, attempt, stage_context, error)
+                self._record_cancelled_build(
+                    stage, attempt, stage_context, error, context_additions
+                )
                 raise
             request_payload: Mapping[str, JsonValue]
             if isinstance(request, StageRequest):
@@ -2211,6 +2313,7 @@ class AgentLoop:
                         "failed",
                         thread,
                         owner,
+                        context_additions,
                     )
                 if not isinstance(copied_request, Mapping):
                     raise AssertionError("StageRequest JSON must be an object")
@@ -2227,6 +2330,7 @@ class AgentLoop:
                     "attempt": attempt,
                     "context": stage_context,
                     "request": request_payload,
+                    "context_additions": dict(context_additions),
                 },
             )
             context[_ACTIVE_STAGE_REQUEST] = request_payload
@@ -2262,6 +2366,7 @@ class AgentLoop:
                     "output": parsed,
                     "usage": response.usage.to_json(),
                     "provider_metadata": provider_metadata,
+                    "context_additions": dict(context_additions),
                 }
                 preview_event = self._stage_event(
                     str(context["run_id"]),
@@ -2286,6 +2391,7 @@ class AgentLoop:
                     "request": request_payload,
                     "response_excerpt": _safe_utf8_text(response.raw_text, 1024),
                     "response_sha256": _streaming_text_sha256(response.raw_text),
+                    "context_additions": dict(context_additions),
                 }
                 context["correction"] = diagnostic
                 if attempt == 2:
@@ -2351,6 +2457,7 @@ class AgentLoop:
         attempt: int,
         stage_context: JsonValue,
         error: BaseException,
+        context_additions: Mapping[str, JsonValue] | None = None,
     ) -> None:
         diagnostic = self._request_error(error)
         try:
@@ -2364,6 +2471,7 @@ class AgentLoop:
                     "attempt": attempt,
                     "context": stage_context,
                     "request_error": diagnostic,
+                    "context_additions": dict(context_additions or {}),
                 },
             )
         except BaseException as audit_error:
@@ -2382,17 +2490,20 @@ class AgentLoop:
         terminal_type: str,
         thread: ThreadRef,
         owner: _ThreadOwner,
+        context_additions: Mapping[str, JsonValue] | None = None,
     ) -> None:
         diagnostic = self._request_error(error)
         started_payload: dict[str, JsonValue] = {
             "attempt": attempt,
             "context": stage_context,
             "request_error": diagnostic,
+            "context_additions": dict(context_additions or {}),
         }
         terminal_payload: dict[str, JsonValue] = {
             **diagnostic,
             "context": stage_context,
             "request_error": diagnostic,
+            "context_additions": dict(context_additions or {}),
         }
         failure = _RecordedStageFailure(error, status, evaluation_status)
         try:
@@ -2772,11 +2883,14 @@ class AgentLoop:
         payload = self._request_error(error)
         stage_context = context.pop(_ACTIVE_STAGE_CONTEXT, None)
         stage_request = context.pop(_ACTIVE_STAGE_REQUEST, None)
+        stage_additions = context.pop(_ACTIVE_STAGE_ADDITIONS, None)
         context.pop(_ACTIVE_STAGE_ATTEMPT, None)
         if stage_context is not None:
             payload["context"] = self._copy_json(stage_context)
         if stage_request is not None:
             payload["request"] = self._copy_json(stage_request)
+        if stage_additions is not None:
+            payload["context_additions"] = self._copy_json(stage_additions)
         return payload
 
     @staticmethod
@@ -2784,6 +2898,7 @@ class AgentLoop:
         context.pop(_ACTIVE_STAGE_CONTEXT, None)
         context.pop(_ACTIVE_STAGE_REQUEST, None)
         context.pop(_ACTIVE_STAGE_ATTEMPT, None)
+        context.pop(_ACTIVE_STAGE_ADDITIONS, None)
 
     @staticmethod
     def _active_attempt(context: Mapping[str, JsonValue]) -> int:
@@ -2802,6 +2917,7 @@ class AgentLoop:
                 _ACTIVE_STAGE_CONTEXT,
                 _ACTIVE_STAGE_REQUEST,
                 _ACTIVE_STAGE_ATTEMPT,
+                _ACTIVE_STAGE_ADDITIONS,
             }
         }
 

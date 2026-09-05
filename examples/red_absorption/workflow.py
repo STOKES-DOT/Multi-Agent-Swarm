@@ -65,11 +65,14 @@ class RedAbsorptionWorkflowToolProvider:
         self._cache: MutableMapping[CacheKey, SpectrumResult] = {}
         self._locks: dict[CacheKey, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
+        self._spectrum_slots = asyncio.Semaphore(1)
+        self._state_lock = asyncio.Lock()
+        self._active: set[asyncio.Event] = set()
+        self._closing = False
         self._execution_count = 0
         self._cache_hit_count = 0
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
-        self._evaluator_version = EVALUATOR_VERSION
 
     @classmethod
     def bind(
@@ -78,7 +81,6 @@ class RedAbsorptionWorkflowToolProvider:
         molecule_editor: MoleculeEditorLike,
         *,
         spectrum: JsonCommandProvider | None = None,
-        evaluator_version: str = EVALUATOR_VERSION,
         cache: MutableMapping[CacheKey, SpectrumResult] | None = None,
         own_spectrum: bool | None = None,
     ) -> "RedAbsorptionWorkflowToolProvider":
@@ -89,11 +91,10 @@ class RedAbsorptionWorkflowToolProvider:
             getattr(molecule_editor, "edit", None)
         ):
             raise TypeError("molecule_editor must provide inspect and edit")
-        if not isinstance(evaluator_version, str) or not evaluator_version:
-            raise ValueError("evaluator_version must be nonempty")
         instance = cls()
         instance._inputs = inputs
         instance._editor = molecule_editor
+        instance._spectrum_slots = asyncio.Semaphore(inputs.evaluation_concurrency)
         if spectrum is None:
             instance._spectrum = JsonCommandProvider(inputs.spectrum_argv)
             instance._own_spectrum = True
@@ -110,7 +111,6 @@ class RedAbsorptionWorkflowToolProvider:
             raise TypeError("cache must be a mutable mapping")
         if cache is not None:
             instance._cache = cache
-        instance._evaluator_version = evaluator_version
         return instance
 
     @property
@@ -126,8 +126,23 @@ class RedAbsorptionWorkflowToolProvider:
             return self._locks.setdefault(key, asyncio.Lock())
 
     async def execute(self, request: ToolRequest, context: ToolContext) -> ToolResult:
-        if self._closed:
-            raise RuntimeError("red-absorption workflow provider is closed")
+        active = asyncio.Event()
+        async with self._state_lock:
+            if self._closing or self._closed:
+                raise RuntimeError(
+                    "red-absorption workflow provider is closing or closed"
+                )
+            self._active.add(active)
+        try:
+            return await self._execute_active(request, context)
+        finally:
+            async with self._state_lock:
+                self._active.discard(active)
+            active.set()
+
+    async def _execute_active(
+        self, request: ToolRequest, context: ToolContext
+    ) -> ToolResult:
         if self._inputs is None or self._editor is None or self._spectrum is None:
             return ToolResult(
                 ToolStatus.REJECTED,
@@ -244,54 +259,63 @@ class RedAbsorptionWorkflowToolProvider:
             chemical_hash,
             geometry_hash,
             inputs.calculation_protocol.protocol_hash,
-            self._evaluator_version,
+            EVALUATOR_VERSION,
         )
         lock = await self._lock_for(key)
         async with lock:
             spectrum_result = self._cache.get(key)
             if spectrum_result is None:
-                self._execution_count += 1
-                command_result = await self._spectrum.execute_json(
-                    {
-                        "candidate": payload,
-                        "chemical_identity_hash": chemical_hash,
-                        "state_hash": state_hash,
-                        "geometry_hash": geometry_hash,
-                        "protocol": inputs.calculation_protocol.model_dump(mode="json"),
-                    },
-                    cwd=context.workspace,
-                    timeout_seconds=inputs.spectrum_timeout_seconds,
-                )
-                if command_result.status is JsonCommandStatus.TIMEOUT:
-                    return ToolResult(
-                        ToolStatus.TIMEOUT, error="spectrum command timed out"
-                    )
-                if (
-                    command_result.status is not JsonCommandStatus.SUCCESS
-                    or command_result.stdout_text is None
-                ):
-                    return ToolResult(
-                        ToolStatus.FAILED,
-                        error=f"spectrum command failed: {command_result.status.value}",
-                    )
-                try:
-                    spectrum_result = SpectrumResult.model_validate_json(
-                        command_result.stdout_text
-                    )
-                except (TypeError, ValueError) as error:
-                    return ToolResult(
-                        ToolStatus.FAILED,
-                        error=f"invalid spectrum result: {type(error).__name__}",
-                    )
-                if (
-                    spectrum_result.provenance.protocol != inputs.calculation_protocol
-                    or spectrum_result.provenance.geometry_hash != geometry_hash
-                ):
-                    return ToolResult(
-                        ToolStatus.FAILED, error="spectrum provenance mismatch"
-                    )
-                self._cache[key] = spectrum_result
-                cache_hit = False
+                async with self._spectrum_slots:
+                    spectrum_result = self._cache.get(key)
+                    if spectrum_result is not None:
+                        self._cache_hit_count += 1
+                        cache_hit = True
+                    else:
+                        self._execution_count += 1
+                        command_result = await self._spectrum.execute_json(
+                            {
+                                "candidate": payload,
+                                "chemical_identity_hash": chemical_hash,
+                                "state_hash": state_hash,
+                                "geometry_hash": geometry_hash,
+                                "protocol": inputs.calculation_protocol.model_dump(
+                                    mode="json"
+                                ),
+                            },
+                            cwd=context.workspace,
+                            timeout_seconds=inputs.spectrum_timeout_seconds,
+                        )
+                        if command_result.status is JsonCommandStatus.TIMEOUT:
+                            return ToolResult(
+                                ToolStatus.TIMEOUT, error="spectrum command timed out"
+                            )
+                        if (
+                            command_result.status is not JsonCommandStatus.SUCCESS
+                            or command_result.stdout_text is None
+                        ):
+                            return ToolResult(
+                                ToolStatus.FAILED,
+                                error=f"spectrum command failed: {command_result.status.value}",
+                            )
+                        try:
+                            spectrum_result = SpectrumResult.model_validate_json(
+                                command_result.stdout_text
+                            )
+                        except (TypeError, ValueError) as error:
+                            return ToolResult(
+                                ToolStatus.FAILED,
+                                error=f"invalid spectrum result: {type(error).__name__}",
+                            )
+                        if (
+                            spectrum_result.provenance.protocol
+                            != inputs.calculation_protocol
+                            or spectrum_result.provenance.geometry_hash != geometry_hash
+                        ):
+                            return ToolResult(
+                                ToolStatus.FAILED, error="spectrum provenance mismatch"
+                            )
+                        self._cache[key] = spectrum_result
+                        cache_hit = False
             else:
                 if (
                     not isinstance(spectrum_result, SpectrumResult)
@@ -315,15 +339,31 @@ class RedAbsorptionWorkflowToolProvider:
         return ToolResult(ToolStatus.SUCCESS, result_payload)
 
     async def aclose(self) -> None:
-        if self._closed:
-            return
-        if self._own_spectrum and self._spectrum is not None:
-            if self._close_task is None or (
-                self._close_task.done() and self._close_task.exception() is not None
-            ):
-                self._close_task = asyncio.create_task(self._spectrum.aclose())
-            await asyncio.shield(self._close_task)
-        self._closed = True
+        async with self._state_lock:
+            if self._closed:
+                return
+            if self._close_task is None:
+                self._closing = True
+                self._close_task = asyncio.create_task(self._close_active())
+            close_task = self._close_task
+        await asyncio.shield(close_task)
+
+    async def _close_active(self) -> None:
+        try:
+            async with self._state_lock:
+                active = tuple(self._active)
+            if active:
+                await asyncio.gather(*(event.wait() for event in active))
+            if self._own_spectrum and self._spectrum is not None:
+                await self._spectrum.aclose()
+        except BaseException:
+            async with self._state_lock:
+                self._closing = False
+                self._close_task = None
+            raise
+        async with self._state_lock:
+            self._closed = True
+            self._closing = False
 
 
 __all__ = ["CacheKey", "RedAbsorptionWorkflowToolProvider"]

@@ -6,8 +6,8 @@ parent:
   protected_atom_ids: []
   protected_smarts: []
 spectrum_argv:
-  - /opt/anaconda3/envs/multi-agent-pso/bin/python
-  - /Users/jiaoyuan/Documents/GitHub/Multi-Agent-PSO/.worktrees/stage-b-red-absorption/tests/fixtures/tools/fake_spectrum.py
+  - __PYTHON_EXECUTABLE__
+  - __FAKE_SPECTRUM_SCRIPT__
 calculation_protocol:
   geometry_workflow: vertical_from_molecule_editor
   backend: fake-spectrum
