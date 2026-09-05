@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import FrozenInstanceError
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
+from multi_agent_pso.tools import JsonCommandStatus
 
 from multi_agent_pso.tools.molecule_editor import (
     MAX_EDIT_ATTEMPTS,
@@ -12,6 +19,7 @@ from multi_agent_pso.tools.molecule_editor import (
 
 
 HASH = "a" * 64
+HASH2 = "b" * 64
 
 
 def _graph(geometry_status="NOT_REQUESTED"):
@@ -27,20 +35,48 @@ def _graph(geometry_status="NOT_REQUESTED"):
     }
 
 
-def _valid(**updates):
-    value = {
-        "chemical_status": "VALID",
-        "geometry_status": "NOT_REQUESTED",
-        "artifact_status": "NOT_REQUESTED",
-        "ready_for_evaluator": False,
-        "canonical_isomeric_smiles": "CC",
-        "chemical_identity_hash": HASH,
-        "state_hash": HASH,
-        "total_charge": 0,
-        "multiplicity": 1,
-        "graph": _graph(),
-        "committed_commands": [],
+def _real_graph(geometry_status="NOT_REQUESTED"):
+    return {
+        "schema_version": "molecule-editor:chemical-graph:v1",
+        "atoms": [
+            {"atom_id":"a0001","atomic_number":6,"isotope":0,"formal_charge":0,"radical_electrons":0,"chiral_tag":"CHI_UNSPECIFIED","chiral_neighbor_atom_ids":[],"explicit_h_count":0,"no_implicit":False,"aromatic":False,"atom_map":None},
+            {"atom_id":"a0002","atomic_number":8,"isotope":0,"formal_charge":0,"radical_electrons":0,"chiral_tag":"CHI_UNSPECIFIED","chiral_neighbor_atom_ids":[],"explicit_h_count":0,"no_implicit":False,"aromatic":False,"atom_map":None},
+        ],
+        "bonds": [{"bond_id":"b0001","begin_atom_id":"a0001","end_atom_id":"a0002","bond_type":"SINGLE","aromatic":False,"conjugated":False,"stereo":"STEREONONE","stereo_atom_ids":[],"bond_direction":"NONE"}],
+        "total_charge":0,"multiplicity":1,"chemical_identity_hash":HASH,"state_hash":HASH,"parent_state_hash":None,"next_atom_serial":3,"next_bond_serial":2,"geometry_status":geometry_status,"committed_commands":[],
     }
+
+
+def _geometry_placeholder(status="NOT_REQUESTED"):
+    full = {"status":status,"geometry_hash":None,"force_field":None,"coordinate_order":[],"selected_conformer_id":None,"conformers":[],"protocol":{},"errors":[],"warnings":[]}
+    compact = {"status":status,"force_field":None,"selected_conformer_id":None,"conformers":[],"protocol":{},"errors":[],"warnings":[]}
+    return full, compact
+
+
+def _real_payload():
+    full, compact = _geometry_placeholder()
+    graph = _real_graph()
+    return {"mode":"inspect","chemical_status":"VALID","geometry_status":"NOT_REQUESTED","artifact_status":"NOT_REQUESTED","ready_for_evaluator":False,"canonical_isomeric_smiles":"CO","parent_state_hash":None,"state_hash":HASH,"chemical_identity_hash":HASH,"total_charge":0,"multiplicity":1,"atom_id_mapping":{},"bond_id_mapping":{},"coordinate_order":[],"committed_commands":[],"graph":graph,"atom_table":[],"bond_table":[],"topology":None,"geometry_hash":None,"geometry_result":full,"geometry":compact,"artifacts":{"paths":[],"planned_paths":[],"partial_uncommitted_paths":[],"commit_marker":None,"planned_commit_marker":"result.json"}}
+
+
+def _ready_payload():
+    data = _real_payload(); data["geometry_status"]="READY"; data["ready_for_evaluator"]=True
+    order=["a0001","a0002"]; coords=[{"atom_id":"a0001","atomic_number":6,"x_angstrom":0.0,"y_angstrom":0.0,"z_angstrom":0.0},{"atom_id":"a0002","atomic_number":8,"x_angstrom":1.0,"y_angstrom":0.0,"z_angstrom":0.0}]
+    data["coordinate_order"]=order; data["geometry_hash"]=HASH
+    data["geometry_result"]={"status":"READY","geometry_hash":HASH,"force_field":"MMFF94s","coordinate_order":order,"selected_conformer_id":0,"conformers":[{"conformer_id":0,"energy_kcal_mol":1.25,"coordinates":coords}],"protocol":{"seed":42},"errors":[],"warnings":[]}
+    data["geometry"]={"status":"READY","force_field":"MMFF94s","selected_conformer_id":0,"conformers":[{"conformer_id":0,"energy_kcal_mol":1.25}],"protocol":{"seed":42},"errors":[],"warnings":[]}
+    data["graph"]["geometry_status"]="READY"
+    return data
+
+
+def _invalid_payload(mode="inspect"):
+    data=_real_payload(); data.update({"mode":mode,"chemical_status":"INVALID","canonical_isomeric_smiles":None,"state_hash":None,"chemical_identity_hash":None,"graph":None,"ready_for_evaluator":False,"atom_id_mapping":{},"bond_id_mapping":{},"committed_commands":[],"atom_table":[],"bond_table":[],"topology":None})
+    if mode=="edit": data.update({"transaction_status":"ROLLED_BACK","parent_state_hash":HASH,"parent_graph":_real_graph(),"rollback":{"preserved":True,"parent_state_hash":HASH}})
+    return data
+
+
+def _valid(**updates):
+    value = _real_payload()
     value.update(updates)
     return value
 
@@ -93,7 +129,7 @@ def test_rolled_back_edit_has_no_candidate() -> None:
         "transaction_status": "ROLLED_BACK",
         "rollback": {"preserved": True, "parent_state_hash": HASH},
         "parent_state_hash": HASH,
-        "parent_graph": _graph(),
+        "parent_graph": _real_graph(),
         "state_hash": None,
         "committed_commands": [],
     }
@@ -102,6 +138,77 @@ def test_rolled_back_edit_has_no_candidate() -> None:
 
 def test_attempt_cap_is_explicit() -> None:
     assert MAX_EDIT_ATTEMPTS == 3
+
+
+def test_real_not_requested_and_ready_shapes_are_accepted() -> None:
+    assert MoleculeEditorResult.from_process(exit_code=0, payload=_real_payload()).candidate
+    ready = MoleculeEditorResult.from_process(exit_code=0, payload=_ready_payload())
+    assert ready.ready_for_evaluator is True
+
+
+@pytest.mark.parametrize("mutation", ["selected_bool","bad_force","summary_energy","coordinate_order","ready_errors"])
+def test_ready_geometry_attack_cases_are_rejected(mutation) -> None:
+    data=_ready_payload()
+    if mutation=="selected_bool": data["geometry_result"]["selected_conformer_id"]=False
+    elif mutation=="bad_force": data["geometry_result"]["force_field"]="DFT"
+    elif mutation=="summary_energy": data["geometry"]["conformers"][0]["energy_kcal_mol"]=2.0
+    elif mutation=="coordinate_order": data["geometry_result"]["conformers"][0]["coordinates"].reverse()
+    else: data["geometry_result"]["errors"]=[{"code":"BAD","message":"bad","details":{}}]
+    with pytest.raises(ValueError): MoleculeEditorResult.from_process(exit_code=0,payload=data)
+
+
+@pytest.mark.parametrize("status",["NOT_REQUESTED","FAILED"])
+@pytest.mark.parametrize("field",["geometry_hash","force_field","selected_conformer_id","coordinate_order","conformers"])
+def test_unready_geometry_rejects_each_stale_ready_field(status,field) -> None:
+    data=_real_payload(); data["geometry_status"]=status; data["graph"]["geometry_status"]=status
+    full,compact=_geometry_placeholder(status); data["geometry_result"]=full; data["geometry"]=compact
+    if field=="geometry_hash": data["geometry_hash"]=HASH; full[field]=HASH
+    elif field=="coordinate_order": data[field]=["a0001"]; full[field]=["a0001"]
+    elif field=="conformers": full[field]=[{"conformer_id":0}]
+    else: full[field]=0 if field=="selected_conformer_id" else "UFF"; compact[field]=full[field]
+    with pytest.raises(ValueError): MoleculeEditorResult.from_process(exit_code=0,payload=data)
+
+
+def test_invalid_inspect_and_edit_rollback_real_placeholders_are_accepted() -> None:
+    assert MoleculeEditorResult.from_process(exit_code=0,payload=_invalid_payload()).candidate is None
+    assert MoleculeEditorResult.from_process(exit_code=0,payload=_invalid_payload("edit")).candidate is None
+
+
+@pytest.mark.parametrize("field,value",[("graph",{}),("state_hash",HASH),("chemical_identity_hash",HASH),("canonical_isomeric_smiles","C"),("committed_commands",[{}]),("coordinate_order",["a0001"]),("atom_id_mapping",{"a":"b"}),("topology",{})])
+def test_invalid_payload_rejects_nonempty_child_fields(field,value) -> None:
+    data=_invalid_payload(); data[field]=value
+    with pytest.raises(ValueError): MoleculeEditorResult.from_process(exit_code=0,payload=data)
+
+
+def test_artifact_publication_matrix_is_ordered_and_strict() -> None:
+    data=_real_payload(); data["artifact_status"]="READY"; expected=["molecule.chemical-graph.json","result.json"]; data["artifacts"]={"paths":expected.copy(),"planned_paths":expected.copy(),"partial_uncommitted_paths":[],"commit_marker":"result.json","planned_commit_marker":"result.json"}
+    assert MoleculeEditorResult.from_process(exit_code=0,payload=data).artifact_status=="READY"
+    bad=deepcopy(data); bad["artifacts"]["paths"].reverse()
+    with pytest.raises(ValueError): MoleculeEditorResult.from_process(exit_code=0,payload=bad)
+    ready=_ready_payload(); files=["conformers.sdf","molecule.chemical-graph.json","molecule.sdf","molecule.xyz","result.json"]; ready["artifact_status"]="READY"; ready["artifacts"]={"paths":files.copy(),"planned_paths":files.copy(),"partial_uncommitted_paths":[],"commit_marker":"result.json","planned_commit_marker":"result.json"}
+    assert MoleculeEditorResult.from_process(exit_code=0,payload=ready).ready_for_evaluator
+    bad=deepcopy(ready); bad["artifacts"]["planned_paths"].reverse()
+    with pytest.raises(ValueError): MoleculeEditorResult.from_process(exit_code=0,payload=bad)
+
+
+def test_failed_geometry_and_artifact_keep_only_structured_diagnostics() -> None:
+    data=_real_payload(); data["geometry_status"]="FAILED"; data["artifact_status"]="FAILED"; data["graph"]["geometry_status"]="FAILED"
+    error={"code":"GEOMETRY_OPTIMIZATION_FAILED","message":"failed","details":{}}
+    full,compact=_geometry_placeholder("FAILED"); full["errors"]=[error]; compact["errors"]=[error]; data["geometry_result"]=full; data["geometry"]=compact
+    data["artifacts"]={"paths":[],"planned_paths":["molecule.chemical-graph.json","result.json"],"partial_uncommitted_paths":["partial.tmp"],"commit_marker":None,"planned_commit_marker":"result.json"}
+    result=MoleculeEditorResult.from_process(exit_code=0,payload=data)
+    assert result.geometry_status==result.artifact_status=="FAILED"
+
+
+@pytest.mark.parametrize("mutation",["duplicate_atom","bad_element","missing_endpoint","bad_direction","serial_bool"])
+def test_graph_schema_attack_cases_are_rejected(mutation) -> None:
+    data=_real_payload(); graph=data["graph"]
+    if mutation=="duplicate_atom": graph["atoms"].append(deepcopy(graph["atoms"][0]))
+    elif mutation=="bad_element": graph["atoms"][0]["atomic_number"]=True
+    elif mutation=="missing_endpoint": graph["bonds"][0]["end_atom_id"]="a9999"
+    elif mutation=="bad_direction": graph["bonds"][0]["bond_direction"]="SIDEWAYS"
+    else: graph["next_atom_serial"]=True
+    with pytest.raises(ValueError): MoleculeEditorResult.from_process(exit_code=0,payload=data)
 
 
 @pytest.mark.parametrize(
@@ -116,7 +223,7 @@ def test_attempt_cap_is_explicit() -> None:
 )
 def test_command_preflight_rejects_unknown_forward_duplicate_and_bad_fields(commands) -> None:
     with pytest.raises(ValueError):
-        MoleculeEditorProvider._commands(commands, _graph())
+        MoleculeEditorProvider._commands(commands, _real_graph())
 
 
 def test_command_preflight_accepts_transaction_local_creation_order() -> None:
@@ -125,4 +232,82 @@ def test_command_preflight_accepts_transaction_local_creation_order() -> None:
         {"operation": "add_bond", "begin": "a0001", "end": "@new", "bond_type": "SINGLE", "client_ref": "@joined"},
         {"operation": "change_bond", "bond_id": "@joined", "bond_type": "DOUBLE"},
     ]
-    assert MoleculeEditorProvider._commands(commands, _graph()) == commands
+    assert MoleculeEditorProvider._commands(commands, _real_graph()) == commands
+
+
+@pytest.mark.parametrize("commands",[[{"operation":"add_atom","client_ref":"@x","atomic_number":True}],[{"operation":"add_atom","client_ref":"@x","atomic_number":6,"isotope":-1}],[{"operation":"add_bond","begin":"a0001","end":"a0002","bond_type":"SINGLE","bond_direction":"BAD"}]])
+def test_command_type_and_enum_attacks_reject_before_spawn(commands) -> None:
+    with pytest.raises(ValueError): MoleculeEditorProvider._commands(commands,_real_graph())
+
+
+@pytest.mark.parametrize("value",[{"kind":"smiles","value":"C","extra":1},{"kind":"path","path":"relative","format":"smiles"},{"kind":"smiles","value":{"bad":1}}])
+def test_source_schema_is_exact(value) -> None:
+    with pytest.raises((TypeError,ValueError)): MoleculeEditorProvider._source(value)
+
+
+@pytest.mark.parametrize("value",[{"num_conformers":True},{"random_seed":-1},{"rmsd_threshold_angstrom":float("nan")},{"extra":1}])
+def test_geometry_input_schema_is_strict(value) -> None:
+    with pytest.raises(ValueError): MoleculeEditorProvider._geometry(value)
+
+
+class _FakeJsonProvider:
+    def __init__(self, argv, response):
+        self.argv=tuple(argv); self.response=response; self.calls=[]; self.close_calls=0; self.close_error=None
+    async def execute_json(self,payload,*,cwd,timeout_seconds):
+        self.calls.append((deepcopy(payload),cwd,timeout_seconds)); return self.response
+    async def aclose(self):
+        self.close_calls+=1
+        if self.close_error is not None: raise self.close_error
+
+
+def _fake_editor(tmp_path: Path):
+    python=tmp_path/"python"; script=tmp_path/"editor.py"; python.write_text(""); script.write_text("")
+    providers=[]
+    def factory(argv):
+        payload=_real_payload() if argv[-1]=="inspect" else None
+        response=SimpleNamespace(status=JsonCommandStatus.SUCCESS if payload else JsonCommandStatus.PROCESS_ERROR,exit_code=0 if payload else 1,payload=payload)
+        item=_FakeJsonProvider(argv,response); providers.append(item); return item
+    return MoleculeEditorProvider(python=python.resolve(),script=script.resolve(),provider_factory=factory),providers
+
+
+@pytest.mark.asyncio
+async def test_async_provider_exact_argv_lineage_and_full_graph_stdin(tmp_path) -> None:
+    editor,providers=_fake_editor(tmp_path)
+    inspection=await editor.inspect({"kind":"smiles","value":"CO"},cwd=tmp_path.resolve(),timeout=9)
+    await editor.edit(inspection,[{"operation":"remove_bond","bond_id":"b0001"}],cwd=tmp_path.resolve(),attempt=3)
+    assert providers[0].argv==(str((tmp_path/"python").resolve()),str((tmp_path/"editor.py").resolve()),"inspect")
+    assert providers[1].argv[-1]=="edit"
+    assert providers[0].calls[0][0]=={"source":{"kind":"smiles","value":"CO"}}
+    edit_payload=providers[1].calls[0][0]
+    assert edit_payload["source"]=={"kind":"chemical_graph","value":_plain_for_test(inspection.candidate)}
+    assert edit_payload["commands"]==[{"operation":"remove_bond","bond_id":"b0001"}]
+
+
+def _plain_for_test(value):
+    if isinstance(value, Mapping): return {k:_plain_for_test(v) for k,v in value.items()}
+    if isinstance(value,tuple): return [_plain_for_test(v) for v in value]
+    return value
+
+
+@pytest.mark.asyncio
+async def test_forged_cross_provider_and_closed_inspections_never_call_edit(tmp_path) -> None:
+    left,left_p=_fake_editor(tmp_path); right,right_p=_fake_editor(tmp_path)
+    inspection=await left.inspect({"kind":"smiles","value":"CO"},cwd=tmp_path.resolve())
+    forged=MoleculeEditorResult.from_process(exit_code=0,payload=_real_payload())
+    for editor,value in ((left,forged),(right,inspection)):
+        with pytest.raises(ValueError): await editor.edit(value,[{"operation":"remove_bond","bond_id":"b0001"}],cwd=tmp_path.resolve())
+    assert not left_p[1].calls and not right_p[1].calls
+    await left.aclose()
+    with pytest.raises(RuntimeError): await left.edit(inspection,[{"operation":"remove_bond","bond_id":"b0001"}],cwd=tmp_path.resolve())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("errors",[(RuntimeError("first"),RuntimeError("second")),(asyncio.CancelledError("first"),asyncio.CancelledError("second"))])
+async def test_close_drains_both_and_preserves_first_with_secondary_note(tmp_path,errors) -> None:
+    editor,providers=_fake_editor(tmp_path); providers[0].close_error,providers[1].close_error=errors
+    with pytest.raises(type(errors[0])) as raised: await editor.aclose()
+    assert raised.value is errors[0]
+    assert providers[0].close_calls==providers[1].close_calls==1
+    assert any("second" in note for note in getattr(raised.value,"__notes__",()))
+    await editor.aclose()
+    assert providers[0].close_calls==providers[1].close_calls==1
