@@ -131,6 +131,86 @@ def test_excited_state_energy_wavelength_consistency_is_relative_one_percent() -
         state(wavelength_nm=expected * 1.01001)
 
 
+def test_energy_wavelength_product_rejects_subnormal_and_overflow() -> None:
+    with pytest.raises(ValidationError):
+        state(energy_ev=5e-324, wavelength_nm=float.fromhex("0x1.fffffffffffffp+1023"))
+    with pytest.raises(ValidationError):
+        state(energy_ev=1e308, wavelength_nm=1e308)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: protocol(backend="\ud800"),
+        lambda: protocol(backend_version="\udfff"),
+        lambda: state(root_character="root \ud800"),
+        lambda: SpectrumError(code="\ud800", message="failed", details={}),
+        lambda: SpectrumError(code="FAIL", message="\udfff", details={}),
+        lambda: provenance(command_metadata={"\ud800": "value"}),
+        lambda: provenance(command_metadata={"key": "\udfff"}),
+    ],
+)
+def test_unpaired_surrogates_fail_during_model_construction(factory) -> None:
+    with pytest.raises(ValidationError):
+        factory()
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: protocol(charge=101),
+        lambda: protocol(charge=-101),
+        lambda: protocol(charge=10**5000),
+        lambda: protocol(multiplicity=17),
+        lambda: state(index=513),
+        lambda: provenance(command_metadata={"integer": 2**63}),
+        lambda: provenance(command_metadata={"integer": -(2**63) - 1}),
+    ],
+)
+def test_integer_domains_are_bounded_before_serialization(factory) -> None:
+    with pytest.raises(ValidationError):
+        factory()
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: protocol(backend="b" * 257),
+        lambda: protocol(backend_version="v" * 257),
+        lambda: state(root_character="r" * 4097),
+        lambda: SpectrumError(code="C" * 129, message="failed", details={}),
+        lambda: SpectrumError(code="FAIL", message="m" * 4097, details={}),
+    ],
+)
+def test_free_text_fields_have_utf8_byte_limits(factory) -> None:
+    with pytest.raises(ValidationError):
+        factory()
+
+
+def test_spectrum_states_must_fit_declared_protocol_roots() -> None:
+    narrow = provenance(protocol=protocol(n_states=1))
+    with pytest.raises(ValidationError):
+        SpectrumResult(status="SUCCESS", states=(state(index=2),), provenance=narrow)
+
+
+def test_valid_unicode_models_have_stable_canonical_utf8_hashes() -> None:
+    unicode_protocol = protocol(backend="量化后端", backend_version="版本-1")
+    unicode_provenance = provenance(
+        protocol=unicode_protocol,
+        command_metadata={"命令": ["计算", "🧪"]},
+    )
+    result = SpectrumResult(
+        status="SUCCESS",
+        states=(state(root_character="π→π*"),),
+        provenance=unicode_provenance,
+    )
+    encoded = result.canonical_json().encode("utf-8")
+    assert encoded
+    assert result.spectrum_hash == SpectrumResult.model_validate_json(
+        result.model_dump_json()
+    ).spectrum_hash
+
+
 def test_spectrum_result_enforces_status_state_and_error_invariants() -> None:
     success = SpectrumResult(status="SUCCESS", states=(state(),), provenance=provenance())
     assert success.error is None
@@ -181,6 +261,9 @@ def test_provenance_and_error_metadata_are_finite_deeply_frozen_json() -> None:
     error = SpectrumError(code="X", message="failure", details={"nested": [1, 2]})
     with pytest.raises(TypeError):
         error.details["nested"] = []  # type: ignore[index]
+    default_error = SpectrumError(code="X", message="failure")
+    with pytest.raises(TypeError):
+        default_error.details["mutated"] = True  # type: ignore[index]
 
 
 def test_models_are_frozen_serializable_and_hash_stable() -> None:

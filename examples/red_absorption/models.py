@@ -14,6 +14,7 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
+    ValidationInfo,
     field_serializer,
     field_validator,
     model_validator,
@@ -21,6 +22,14 @@ from pydantic import (
 
 
 HC_EV_NM = 1239.841984
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+_MAX_METADATA_KEY_BYTES = 1024
+_MAX_METADATA_STRING_BYTES = 65_536
+_MAX_BACKEND_TEXT_BYTES = 256
+_MAX_ROOT_CHARACTER_BYTES = 4096
+_MAX_ERROR_CODE_BYTES = 128
+_MAX_ERROR_MESSAGE_BYTES = 4096
 
 
 class _FrozenDict(Mapping[str, object]):
@@ -42,9 +51,37 @@ class _FrozenDict(Mapping[str, object]):
         return len(self._values)
 
 
+def _utf8_text(
+    value: str,
+    name: str,
+    *,
+    max_bytes: int,
+    nonblank: bool = False,
+) -> str:
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError(f"{name} must be valid UTF-8") from error
+    if nonblank and not value.strip():
+        raise ValueError(f"{name} must be nonblank")
+    if len(encoded) > max_bytes:
+        raise ValueError(f"{name} exceeds its UTF-8 byte limit")
+    return value
+
+
 def _plain_finite_json(value: object) -> JsonValue:
-    if value is None or type(value) in {str, bool, int}:
+    if value is None or type(value) is bool:
         return value  # type: ignore[return-value]
+    if type(value) is str:
+        return _utf8_text(
+            value,
+            "metadata string",
+            max_bytes=_MAX_METADATA_STRING_BYTES,
+        )
+    if type(value) is int:
+        if not _INT64_MIN <= value <= _INT64_MAX:
+            raise ValueError("metadata integers must fit signed 64-bit")
+        return value
     if type(value) is float:
         if not math.isfinite(value):
             raise ValueError("metadata must contain finite JSON")
@@ -52,7 +89,14 @@ def _plain_finite_json(value: object) -> JsonValue:
     if isinstance(value, Mapping):
         if any(type(key) is not str for key in value):
             raise ValueError("metadata JSON object keys must be strings")
-        return {key: _plain_finite_json(nested) for key, nested in value.items()}
+        return {
+            _utf8_text(
+                key,
+                "metadata key",
+                max_bytes=_MAX_METADATA_KEY_BYTES,
+            ): _plain_finite_json(nested)
+            for key, nested in value.items()
+        }
     if isinstance(value, (list, tuple)):
         return [_plain_finite_json(nested) for nested in value]
     raise ValueError("metadata must contain only JSON values")
@@ -85,11 +129,17 @@ def _canonical_json(value: object) -> str:
 
 
 class _StrictFrozenModel(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True, allow_inf_nan=False)
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        strict=True,
+        allow_inf_nan=False,
+        validate_default=True,
+    )
 
 
 class ExcitedState(_StrictFrozenModel):
-    state_index: int = Field(ge=1)
+    state_index: int = Field(ge=1, le=512)
     energy_ev: float
     wavelength_nm: float
     oscillator_strength: float
@@ -119,14 +169,23 @@ class ExcitedState(_StrictFrozenModel):
     @field_validator("root_character")
     @classmethod
     def validate_root_character(cls, value: str | None) -> str | None:
-        if value is not None and not value.strip():
-            raise ValueError("root_character must be nonblank")
-        return value
+        if value is None:
+            return None
+        return _utf8_text(
+            value,
+            "root_character",
+            max_bytes=_MAX_ROOT_CHARACTER_BYTES,
+            nonblank=True,
+        )
 
     @model_validator(mode="after")
     def validate_energy_wavelength_relation(self) -> "ExcitedState":
-        expected = HC_EV_NM / self.energy_ev
-        if abs(self.wavelength_nm - expected) / expected > 0.01 + 1e-12:
+        product = self.energy_ev * self.wavelength_nm
+        if (
+            not math.isfinite(product)
+            or product <= 0
+            or abs(product - HC_EV_NM) / HC_EV_NM > 0.01 + 1e-12
+        ):
             raise ValueError("energy and wavelength differ by more than one percent")
         return self
 
@@ -141,8 +200,8 @@ class CalculationProtocol(_StrictFrozenModel):
     backend: str
     backend_version: str
     n_states: int = Field(ge=1, le=512)
-    charge: int
-    multiplicity: int = Field(ge=1)
+    charge: int = Field(ge=-100, le=100)
+    multiplicity: int = Field(ge=1, le=16)
     energy_unit: Literal["eV"] = "eV"
     wavelength_unit: Literal["nm"] = "nm"
     oscillator_strength_unit: Literal["dimensionless"] = "dimensionless"
@@ -150,9 +209,12 @@ class CalculationProtocol(_StrictFrozenModel):
     @field_validator("backend", "backend_version")
     @classmethod
     def validate_nonblank_text(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("backend identity must be nonblank")
-        return value
+        return _utf8_text(
+            value,
+            "backend identity",
+            max_bytes=_MAX_BACKEND_TEXT_BYTES,
+            nonblank=True,
+        )
 
     def canonical_json(self) -> str:
         return _canonical_json(self.model_dump(mode="json"))
@@ -169,10 +231,18 @@ class SpectrumError(_StrictFrozenModel):
 
     @field_validator("code", "message")
     @classmethod
-    def validate_nonblank_text(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("spectrum error code and message must be nonblank")
-        return value
+    def validate_nonblank_text(cls, value: str, info: ValidationInfo) -> str:
+        limit = (
+            _MAX_ERROR_CODE_BYTES
+            if info.field_name == "code"
+            else _MAX_ERROR_MESSAGE_BYTES
+        )
+        return _utf8_text(
+            value,
+            f"spectrum error {info.field_name}",
+            max_bytes=limit,
+            nonblank=True,
+        )
 
     @field_validator("details", mode="before")
     @classmethod
@@ -240,6 +310,9 @@ class SpectrumResult(_StrictFrozenModel):
         indices = [state.state_index for state in self.states]
         if len(indices) != len(set(indices)):
             raise ValueError("excited-state indices must be unique")
+        n_states = self.provenance.protocol.n_states
+        if len(self.states) > n_states or any(index > n_states for index in indices):
+            raise ValueError("spectrum states exceed the declared protocol roots")
         if self.status == "SUCCESS":
             if not self.states or self.error is not None:
                 raise ValueError("successful spectra require states and no error")
