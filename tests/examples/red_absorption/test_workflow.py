@@ -226,6 +226,28 @@ async def test_protected_smarts_fail_closed_before_edit(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_detach_cannot_indirectly_delete_protected_component(tmp_path):
+    inputs = inputs_with_concurrency(tmp_path, 1)
+    parent = inputs.parent.model_copy(update={"protected_atom_ids": ("a0002",)})
+    inputs = inputs.model_copy(update={"parent": parent})
+    spectrum = DelayedSpectrum()
+    editor = VariableEditor([], parent_graph())
+    tool = RedAbsorptionWorkflowToolProvider.bind(
+        inputs,
+        editor,
+        RedAbsorptionWorkflowResources.from_inputs(inputs),
+        spectrum=spectrum,
+    )
+    request, context = authorized_request_context(
+        [{"operation": "detach_fragment", "bond_id": "b0001", "retained_atom_id": "a0001"}],
+        tmp_path.resolve(),
+    )
+    result = await tool.execute(request, context)
+    assert result.status.value == "REJECTED"
+    assert editor.edit_calls == spectrum.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_different_run_resources_are_independent(tmp_path):
     inputs = inputs_with_concurrency(tmp_path, 1)
     spectrum = DelayedSpectrum()
