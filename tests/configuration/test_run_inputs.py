@@ -13,7 +13,11 @@ import pytest
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_serializer
 
-from multi_agent_pso.configuration import LoadedRunInputs, load_run_inputs
+from multi_agent_pso.configuration import (
+    LoadedRunInputs,
+    MAX_RUN_INPUT_BYTES,
+    load_run_inputs,
+)
 import multi_agent_pso.configuration.loader as configuration_loader
 import multi_agent_pso.configuration.run_inputs as run_inputs_module
 
@@ -122,6 +126,24 @@ def test_max_bytes_must_be_a_positive_strict_integer(
     path = _write_inputs(tmp_path / "inputs.yaml")
     with pytest.raises((TypeError, ValueError), match="max_bytes"):
         load_run_inputs(path, FixtureInputs, max_bytes=max_bytes)  # type: ignore[arg-type]
+
+
+def test_max_bytes_has_a_non_overridable_hard_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_inputs(tmp_path / "inputs.yaml")
+    monkeypatch.setattr(
+        run_inputs_module.os,
+        "read",
+        lambda *_: pytest.fail("hard-ceiling rejection must happen before read"),
+    )
+
+    with pytest.raises(ValueError, match="max_bytes"):
+        load_run_inputs(
+            path,
+            FixtureInputs,
+            max_bytes=MAX_RUN_INPUT_BYTES + 1,
+        )
 
 
 def test_oversize_and_sparse_files_are_rejected_before_read_allocation(

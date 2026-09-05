@@ -15,13 +15,14 @@ from .models import (
     TopologyConfig,
     WikiConfig,
 )
-from .run_inputs import LoadedRunInputs, load_run_inputs
+from .run_inputs import LoadedRunInputs, MAX_RUN_INPUT_BYTES, load_run_inputs
 
 __all__ = [
     "AgentConfig",
     "ConcurrencyConfig",
     "LoadedPlugins",
     "LoadedRunInputs",
+    "MAX_RUN_INPUT_BYTES",
     "PluginConfig",
     "PsoConfig",
     "RetryConfig",

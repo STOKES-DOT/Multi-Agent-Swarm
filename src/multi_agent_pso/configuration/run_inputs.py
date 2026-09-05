@@ -18,6 +18,7 @@ from .loader import _UniqueKeySafeLoader
 
 
 _DEFAULT_MAX_BYTES = 1024 * 1024
+MAX_RUN_INPUT_BYTES = 64 * 1024 * 1024
 _READ_CHUNK_BYTES = 64 * 1024
 _HAS_OPEN_DIR_FD = os.open in os.supports_dir_fd
 _HAS_STAT_DIR_FD = os.stat in os.supports_dir_fd
@@ -213,8 +214,10 @@ def load_run_inputs(
         raise TypeError("model_type must be a concrete Pydantic BaseModel subclass")
     if type(max_bytes) is not int:
         raise TypeError("max_bytes must be an integer")
-    if max_bytes <= 0:
-        raise ValueError("max_bytes must be positive")
+    if not 1 <= max_bytes <= MAX_RUN_INPUT_BYTES:
+        raise ValueError(
+            f"max_bytes must be between 1 and {MAX_RUN_INPUT_BYTES}"
+        )
     resolved, initial_snapshot = _resolved_input_path(path)
     try:
         contents, raw_sha256 = _read_snapshot(
@@ -244,4 +247,4 @@ def load_run_inputs(
     )
 
 
-__all__ = ["LoadedRunInputs", "load_run_inputs"]
+__all__ = ["LoadedRunInputs", "MAX_RUN_INPUT_BYTES", "load_run_inputs"]
