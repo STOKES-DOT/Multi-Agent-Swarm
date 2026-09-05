@@ -51,13 +51,14 @@ def _validate_storage_target(runs_dir: Path) -> None:
         metadata = os.lstat(runs_dir)
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
             raise ValueError("runs_dir must be a regular directory namespace")
-        database = runs_dir / "runs.sqlite"
-        if database.exists() or database.is_symlink():
-            database_metadata = os.lstat(database)
-            if stat.S_ISLNK(database_metadata.st_mode) or not stat.S_ISREG(
-                database_metadata.st_mode
-            ):
-                raise ValueError("runs.sqlite target is unsafe")
+        for name in ("runs.sqlite", "evaluation_budget.sqlite"):
+            database = runs_dir / name
+            if database.exists() or database.is_symlink():
+                database_metadata = os.lstat(database)
+                if stat.S_ISLNK(database_metadata.st_mode) or not stat.S_ISREG(
+                    database_metadata.st_mode
+                ):
+                    raise ValueError(f"{name} target is unsafe")
     if not all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW")):
         raise RuntimeError("run storage claims require POSIX no-follow support")
 
@@ -96,6 +97,7 @@ def _contract_identity(
     passed: bool,
     authentication_method: str,
     backend_hardware: str,
+    authorized_fields_hash: str,
 ) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -109,6 +111,7 @@ def _contract_identity(
                 "passed": passed,
                 "authentication_method": authentication_method,
                 "backend_hardware": backend_hardware,
+                "authorized_fields_hash": authorized_fields_hash,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -121,6 +124,7 @@ class PreflightRecord(BaseModel):
 
     identity: str = Field(pattern=r"^[0-9a-f]{64}$")
     base_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    authorized_fields_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     task_snapshot_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     input_raw_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     input_semantic_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -178,6 +182,24 @@ class PreflightRecord(BaseModel):
             self.versions,
             self.max_new_evaluations,
         )
+        displayed = {
+            "protected_atom_ids": self.protected_atom_ids,
+            "protected_smarts": self.protected_smarts,
+            "protocol_functional": self.protocol_functional,
+            "protocol_basis": self.protocol_basis,
+            "protocol_method": self.protocol_method,
+            "protocol_backend": self.protocol_backend,
+            "protocol_backend_version": self.protocol_backend_version,
+            "geometry_workflow": self.geometry_workflow,
+            "spectrum_timeout_seconds": self.spectrum_timeout_seconds,
+            "evaluation_concurrency": self.evaluation_concurrency,
+            "versions": dict(self.versions),
+            "authentication_method": self.authentication_method,
+            "backend_hardware": self.backend_hardware,
+        }
+        displayed_hash = hashlib.sha256(
+            json.dumps(displayed, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
         expected = _contract_identity(
             expected_base,
             self.parent_state_hash,
@@ -188,8 +210,13 @@ class PreflightRecord(BaseModel):
             self.passed,
             self.authentication_method,
             self.backend_hardware,
+            displayed_hash,
         )
-        if self.base_identity != expected_base or self.identity != expected:
+        if (
+            self.base_identity != expected_base
+            or self.authorized_fields_hash != displayed_hash
+            or self.identity != expected
+        ):
             raise ValueError("preflight identity does not match its contract fields")
         return self
 
@@ -335,12 +362,20 @@ async def _default_auth_probe() -> Mapping[str, object]:
         text = (stdout + stderr).decode("utf-8").casefold()
     except UnicodeDecodeError as error:
         raise RuntimeError("Codex authentication status is not UTF-8") from error
-    if not any(marker in text for marker in ("logged in", "authenticated")):
+    method = _parse_auth_status(text)
+    return {"authenticated": True, "method": method}
+
+
+def _parse_auth_status(text: str) -> str:
+    normalized = text.casefold().strip()
+    if any(
+        marker in normalized
+        for marker in ("not logged in", "not authenticated", "unauthenticated")
+    ):
+        raise RuntimeError("Codex authentication status is explicitly negative")
+    if not any(marker in normalized for marker in ("logged in", "authenticated")):
         raise RuntimeError("Codex status did not confirm authentication")
-    return {
-        "authenticated": True,
-        "method": "chatgpt" if "chatgpt" in text else "codex-login",
-    }
+    return "chatgpt" if "chatgpt" in normalized else "codex-login"
 
 
 async def _resolve_probe(value: object) -> object:
@@ -465,6 +500,24 @@ async def preflight_red_absorption(
         if not isinstance(hardware, str) or not hardware.strip():
             hardware = "not-recorded"
         base_identity = _identity(task, loaded, versions)
+        displayed = {
+            "protected_atom_ids": inputs.parent.protected_atom_ids,
+            "protected_smarts": inputs.parent.protected_smarts,
+            "protocol_functional": protocol.functional,
+            "protocol_basis": protocol.basis,
+            "protocol_method": protocol.excited_state_method,
+            "protocol_backend": protocol.backend,
+            "protocol_backend_version": protocol.backend_version,
+            "geometry_workflow": protocol.geometry_workflow,
+            "spectrum_timeout_seconds": inputs.spectrum_timeout_seconds,
+            "evaluation_concurrency": inputs.evaluation_concurrency,
+            "versions": versions,
+            "authentication_method": method,
+            "backend_hardware": hardware,
+        }
+        displayed_hash = hashlib.sha256(
+            json.dumps(displayed, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
         identity = _contract_identity(
             base_identity,
             state_hash,
@@ -475,10 +528,12 @@ async def preflight_red_absorption(
             True,
             method,
             hardware,
+            displayed_hash,
         )
         record = PreflightRecord(
             identity=identity,
             base_identity=base_identity,
+            authorized_fields_hash=displayed_hash,
             task_snapshot_hash=task.snapshot_hash,
             input_raw_hash=loaded.raw_sha256,
             input_semantic_hash=loaded.semantic_sha256,

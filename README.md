@@ -8,8 +8,8 @@ conda run -n multi-agent-pso python -m pip install -e '.[dev]'
 conda run -n multi-agent-pso pytest -q
 ```
 
-> 状态：Stage A 已实现
-> 当前范围：可复现的通用 PSO core、持久化、checkpoint recovery 与 deterministic continuous benchmarks。分子设计、Codex、RDKit、MoleculeEditor、TDDFT 与 MOMAP 属于后续 Stage B 愿景，不会由 Stage A 执行。
+> 状态：Stage A 通用 core 已实现；Stage B 已加入带显式 preflight/预算确认的本地 red-absorption 集成。
+> 默认测试与 benchmark 仍不执行 Codex、MoleculeEditor 或量化计算；这些生产集成只有在提供真实 run-input、通过 preflight 并显式确认最大新 evaluation 数后才会启动。
 
 ## Stage A benchmarks
 

@@ -42,6 +42,17 @@ def test_particle_workspace_rejects_symlink_without_chmod_target(tmp_path) -> No
     assert outside.stat().st_mode & 0o777 == 0o755
 
 
+@pytest.mark.parametrize(
+    ("run_id", "particle_id"),
+    [("../run", "p0"), ("run/one", "p0"), ("run", ".."), ("run", ""), ("run", "p\x00")],
+)
+def test_particle_workspace_rejects_unsafe_single_components(
+    tmp_path, run_id, particle_id
+) -> None:
+    with pytest.raises(ValueError, match="unsafe"):
+        _particle_workspace(tmp_path, run_id, particle_id)
+
+
 def test_sqlite_budget_reservation_is_atomic_persistent_and_cache_reopenable(tmp_path):
     import threading
 
@@ -66,6 +77,21 @@ def test_sqlite_budget_reservation_is_atomic_persistent_and_cache_reopenable(tmp
     reopened = SQLiteBudgetLedger(path)
     assert reopened.get("run-1", key) == {"spectrum": "cached"}
     assert not reopened.reserve("run-1", "overflow", 25)
+
+
+def test_sqlite_budget_ledger_rejects_symlink_and_hostile_payload(tmp_path):
+    target = tmp_path / "target.sqlite"
+    target.write_bytes(b"unchanged")
+    link = tmp_path / "budget.sqlite"
+    link.symlink_to(target)
+    with pytest.raises(ValueError, match="symlink|regular"):
+        SQLiteBudgetLedger(link)
+    assert target.read_bytes() == b"unchanged"
+
+    ledger = SQLiteBudgetLedger(tmp_path / "safe.sqlite")
+    assert ledger.reserve("run", "key", 1)
+    with pytest.raises((TypeError, ValueError)):
+        ledger.commit("run", "key", {"bad": float("nan")})
 
 
 def task_file(tmp_path):

@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 import json
+import os
 from pathlib import Path
 import sqlite3
+import stat
 from typing import AsyncIterator
 
 
@@ -49,25 +51,57 @@ class SQLiteBudgetLedger:
         if not isinstance(path, Path):
             raise TypeError("path must be a Path")
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._path = path.resolve(strict=False)
+        if path.is_symlink():
+            raise ValueError("budget database must not be a symlink")
+        if path.exists() and not stat.S_ISREG(os.lstat(path).st_mode):
+            raise ValueError("budget database must be a regular file")
+        self._path = path.absolute()
         with self._connect() as connection:
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS budget_entries (
                 run_id TEXT NOT NULL, item_key TEXT NOT NULL,
                 payload_json TEXT, PRIMARY KEY (run_id, item_key))"""
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS budget_limits (
+                run_id TEXT PRIMARY KEY, item_limit INTEGER NOT NULL CHECK(item_limit > 0))"""
+            )
 
     def _connect(self) -> sqlite3.Connection:
+        if self._path.is_symlink() or (
+            self._path.exists() and not stat.S_ISREG(os.lstat(self._path).st_mode)
+        ):
+            raise ValueError("budget database must remain a regular non-symlink file")
         connection = sqlite3.connect(self._path, timeout=10)
         connection.execute("PRAGMA journal_mode=WAL")
         return connection
 
     def reserve(self, run_id: str, item_key: str, limit: int) -> bool:
-        if not run_id or not item_key or type(limit) is not int or limit <= 0:
+        if (
+            not isinstance(run_id, str)
+            or not isinstance(item_key, str)
+            or not run_id
+            or not item_key
+            or "\x00" in run_id
+            or "\x00" in item_key
+            or len(run_id.encode("utf-8")) > 512
+            or len(item_key.encode("utf-8")) > 512
+            or type(limit) is not int
+            or limit <= 0
+        ):
             raise ValueError("run_id, item_key, and positive limit are required")
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            existing_limit = connection.execute(
+                "SELECT item_limit FROM budget_limits WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if existing_limit is None:
+                connection.execute(
+                    "INSERT INTO budget_limits VALUES (?, ?)", (run_id, limit)
+                )
+            elif existing_limit[0] != limit:
+                raise ValueError("budget limit is immutable for a run")
             if connection.execute(
                 "SELECT 1 FROM budget_entries WHERE run_id = ? AND item_key = ?",
                 (run_id, item_key),
@@ -113,11 +147,24 @@ class SQLiteBudgetLedger:
     def get(self, run_id: str, item_key: str) -> object | None:
         with self._connect() as connection:
             row = connection.execute(
-                """SELECT payload_json FROM budget_entries
+                """SELECT payload_json, length(CAST(payload_json AS BLOB))
+                FROM budget_entries
                 WHERE run_id = ? AND item_key = ?""",
                 (run_id, item_key),
             ).fetchone()
-        return None if row is None or row[0] is None else json.loads(row[0])
+        if row is None or row[0] is None:
+            return None
+        if row[1] > 1024 * 1024:
+            raise ValueError("budget cache payload exceeds 1 MiB")
+        value = json.loads(
+            row[0],
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"invalid JSON constant: {token}")
+            ),
+        )
+        if not isinstance(value, dict):
+            raise ValueError("budget cache payload must be a JSON object")
+        return value
 
     def count(self, run_id: str) -> int:
         with self._connect() as connection:

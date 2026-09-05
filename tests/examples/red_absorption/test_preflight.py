@@ -11,6 +11,7 @@ from examples.red_absorption.preflight import (
     preflight_red_absorption,
     verify_red_absorption_preflight,
     verify_current_parent,
+    _parse_auth_status,
 )
 from examples.red_absorption.search import run_red_absorption_search
 from multi_agent_pso.configuration import LoadedRunInputs
@@ -64,6 +65,16 @@ class ClosingEditor(FakeEditor):
 
     async def aclose(self):
         self.close_calls += 1
+
+
+@pytest.mark.parametrize("text", ["not logged in", "unauthenticated", "not authenticated"])
+def test_auth_status_explicit_negative_markers_are_rejected(text):
+    with pytest.raises(RuntimeError, match="authentication"):
+        _parse_auth_status(text)
+
+
+def test_auth_status_requires_explicit_positive_and_reports_chatgpt():
+    assert _parse_auth_status("Logged in using ChatGPT") == "chatgpt"
 
 
 @pytest.mark.asyncio

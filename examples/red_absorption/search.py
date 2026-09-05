@@ -47,8 +47,17 @@ def _config_hash(task: TaskPackage, inputs: LoadedRunInputs, record: PreflightRe
 
 
 def _particle_workspace(root: Path, run_id: str, particle_id: str) -> Path:
-    if not particle_id or "/" in particle_id or "\\" in particle_id or ".." in particle_id:
-        raise ValueError("particle_id is unsafe for a workspace")
+    for name, value in (("run_id", run_id), ("particle_id", particle_id)):
+        if (
+            not isinstance(value, str)
+            or not value
+            or value in {".", ".."}
+            or "/" in value
+            or "\\" in value
+            or "\x00" in value
+            or len(value.encode("utf-8")) > 512
+        ):
+            raise ValueError(f"{name} is unsafe for a workspace")
     if root.is_symlink() or not root.is_dir():
         raise ValueError("workspace root is unsafe")
     root = root.resolve(strict=True)
@@ -60,8 +69,11 @@ def _particle_workspace(root: Path, run_id: str, particle_id: str) -> Path:
             try:
                 child_fd = os.open(part, flags, dir_fd=parent_fd)
             except FileNotFoundError:
-                os.mkdir(part, mode=0o700, dir_fd=parent_fd)
-                os.fsync(parent_fd)
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+                except FileExistsError:
+                    pass
                 child_fd = os.open(part, flags, dir_fd=parent_fd)
             except OSError as error:
                 raise ValueError(
@@ -96,6 +108,14 @@ async def run_red_absorption_search(
     runs_dir: Path,
     molecule_editor: object | None = None,
 ) -> dict[str, object]:
+    if runs_dir.is_symlink():
+        raise ValueError("runs_dir must not be a symlink")
+    budget_target = runs_dir / "evaluation_budget.sqlite"
+    if budget_target.is_symlink() or (
+        budget_target.exists()
+        and not stat.S_ISREG(os.lstat(budget_target).st_mode)
+    ):
+        raise ValueError("evaluation budget database target is unsafe")
     verified = verify_red_absorption_preflight(
         task, loaded, runs_dir, versions=preflight.versions
     )
