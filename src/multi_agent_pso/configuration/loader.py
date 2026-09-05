@@ -281,6 +281,30 @@ def _add_external_entries(builder: _ManifestBuilder, role: str, source: Path) ->
             builder.add_file(role, relative.as_posix(), child)
 
 
+def _add_maintained_wiki_entries(builder: _ManifestBuilder, source: Path) -> None:
+    if source.is_symlink() or not source.is_dir():
+        raise ValueError(f"configured wiki path must be a regular directory: {source}")
+    for anchor in ("AGENTS.md","index.md"):
+        child=source/anchor
+        if child.is_symlink() or not child.is_file(): raise ValueError(f"maintained wiki anchor must be a regular file: {child}")
+        builder.add_file("wiki",anchor,child)
+    for namespace in ("mocs","sources","entities","syntheses","questions"):
+        root=source/namespace
+        if not root.exists(): continue
+        if root.is_symlink() or not root.is_dir(): raise ValueError(f"maintained wiki namespace must be a regular directory: {root}")
+        for current,directory_names,file_names in os.walk(root,topdown=True,followlinks=False):
+            current_path=Path(current)
+            directory_names[:]=sorted(directory_names)
+            for name in directory_names:
+                child=current_path/name
+                if child.is_symlink() or not child.is_dir(): raise ValueError(f"maintained wiki contains a non-regular directory: {child}")
+            for name in sorted(file_names):
+                if not name.endswith(".md"): continue
+                child=current_path/name
+                if child.is_symlink() or not child.is_file(): raise ValueError(f"maintained wiki Markdown must be a regular file: {child}")
+                builder.add_file("wiki",child.relative_to(source).as_posix(),child)
+
+
 def _parse_entrypoint(value: str) -> tuple[str, str]:
     if value.count(":") != 1:
         raise ValueError(f"invalid plugin entrypoint: {value!r}")
@@ -438,7 +462,8 @@ def load_task_package(path: Path) -> TaskPackage:
         schema_values.append(builder.add_retained_file("schema:" + str(index), schema.relative_to(root).as_posix(), schema))
     schema_bytes = tuple(schema_values)
     if spec.wiki.path is not None:
-        _add_external_entries(builder, "wiki", spec.wiki.path)
+        if spec.wiki.snapshot_mode=="maintained_markdown": _add_maintained_wiki_entries(builder,spec.wiki.path)
+        else: _add_external_entries(builder, "wiki", spec.wiki.path)
     for index, skill in enumerate(spec.agent.skills):
         _add_external_entries(builder, "skill:" + str(index), skill)
     plugins = _load_plugins(spec, root, builder)

@@ -1,0 +1,1 @@
+Using the successful MoleculeEditor inspection and its stable AtomId/BondId values, propose one complete `molecule_editor` `edit` transaction within the decoded command and fragment budgets. Do not guess identifiers, create disconnected intermediates, execute a spectrum or other scientific tool, or claim reward, fitness, or Evaluation authority. Return only schema-valid JSON.

@@ -39,6 +39,7 @@ class WikiConfig(StrictFrozenModel):
     path: Path | None = None
     read_only: Annotated[bool, Field(strict=True)] = True
     max_results: Annotated[int, Field(strict=True, ge=1, le=100)] = 10
+    snapshot_mode: Literal["all", "maintained_markdown"] = "all"
 
     @field_validator("read_only")
     @classmethod
