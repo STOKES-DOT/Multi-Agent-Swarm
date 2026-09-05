@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
+import sys
 
 import pytest
 
@@ -17,6 +19,23 @@ from tests.fixtures.reports import (
     checkpoint_for_report_event,
     recorded_evidence,
 )
+
+
+def test_installed_cli_can_import_local_example_adapter_from_isolated_cwd(
+    tmp_path,
+) -> None:
+    process = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            "import multi_agent_pso.cli; import examples.red_absorption",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        check=False,
+    )
+    assert process.returncode == 0, process.stderr.decode("utf-8", errors="replace")
 
 
 def test_benchmark_cli_runs_sphere_and_writes_summary(tmp_path, capsys) -> None:

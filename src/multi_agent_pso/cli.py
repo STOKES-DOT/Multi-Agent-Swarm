@@ -10,6 +10,10 @@ import sys
 from pathlib import Path
 import yaml
 
+_LOCAL_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if (_LOCAL_PROJECT_ROOT / "examples" / "red_absorption").is_dir():
+    sys.path.insert(0, str(_LOCAL_PROJECT_ROOT))
+
 from .configuration.loader import _UniqueKeySafeLoader
 
 from . import __version__
