@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 from examples.red_absorption.backends.pyscf_spectrum import (
     BACKEND_VERSION,
+    PySCFEngine,
     QuantumFailure,
-    _configure_thread_environment,
     run_calculation,
 )
 from examples.red_absorption.geometry import (
@@ -23,7 +25,7 @@ from examples.red_absorption.models import CalculationProtocol, ExcitedState
 SOURCE_HASH = "a" * 64
 
 
-def test_backend_forces_all_supported_cpu_thread_controls_to_one(monkeypatch) -> None:
+def test_backend_leaves_cpu_thread_controls_to_runtime(monkeypatch) -> None:
     names = (
         "OMP_NUM_THREADS",
         "MKL_NUM_THREADS",
@@ -33,8 +35,25 @@ def test_backend_forces_all_supported_cpu_thread_controls_to_one(monkeypatch) ->
     )
     for name in names:
         monkeypatch.setenv(name, "8")
-    _configure_thread_environment()
-    assert all(__import__("os").environ[name] == "1" for name in names)
+    calls = []
+    fake_lib = SimpleNamespace(
+        einsum=None, num_threads=lambda *args: calls.append(args)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "pyscf",
+        SimpleNamespace(__version__="2.9.0", lib=fake_lib),
+    )
+    monkeypatch.setitem(
+        sys.modules, "geometric", SimpleNamespace(__version__="1.1.1")
+    )
+
+    engine = PySCFEngine()
+
+    assert calls == []
+    assert all(os.environ[name] == "8" for name in names)
+    assert engine.metadata()["thread_control"] == "runtime_default"
+    assert "threads" not in engine.metadata()
 
 
 def geometry(z: float = 0.0) -> EvaluatedGeometry:

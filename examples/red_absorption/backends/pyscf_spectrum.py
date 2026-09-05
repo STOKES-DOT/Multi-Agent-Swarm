@@ -1,10 +1,9 @@
-"""Gas-phase B3LYP/STO-3G optimization followed by 20-root TDDFT."""
+"""Gas-phase B3LYP/STO-3G spectra using the configured geometry workflow."""
 
 from __future__ import annotations
 
 import json
 import math
-import os
 import platform
 import sys
 import traceback
@@ -35,18 +34,6 @@ BACKEND_VERSION = "pyscf-2.9.0+geometric-1.1.1"
 HC_EV_NM = 1239.841984
 HARTREE_TO_EV = 27.211386245988
 MAX_INPUT_BYTES = 1024 * 1024
-_THREAD_ENVIRONMENT = (
-    "OMP_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "VECLIB_MAXIMUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-)
-
-
-def _configure_thread_environment() -> None:
-    for name in _THREAD_ENVIRONMENT:
-        os.environ[name] = "1"
 
 
 class BackendRequest(BaseModel):
@@ -188,7 +175,6 @@ def run_calculation(
 
 class PySCFEngine:
     def __init__(self) -> None:
-        _configure_thread_environment()
         try:
             import numpy as np
             import geometric
@@ -198,7 +184,6 @@ class PySCFEngine:
             raise RuntimeError("PySCF backend dependencies are unavailable") from error
         if pyscf.__version__ != "2.9.0" or geometric.__version__ != "1.1.1":
             raise RuntimeError("PySCF backend dependency versions do not match")
-        lib.num_threads(1)
         # PySCF 2.9's multi-operand einsum_path adapter predates NumPy 2.5's
         # contraction tuple shape. NumPy's implementation is algebraically
         # equivalent and avoids that compatibility-only failure.
@@ -415,7 +400,7 @@ class PySCFEngine:
             "platform": platform.platform(),
             "machine": platform.machine(),
             "hardware": f"{platform.system()}-{platform.machine()}-cpu",
-            "threads": 1,
+            "thread_control": "runtime_default",
             "max_memory_mb": 4096,
             "einsum_backend": "numpy.einsum",
             "b3lyp_vwn_variant": "VWN-RPA",
