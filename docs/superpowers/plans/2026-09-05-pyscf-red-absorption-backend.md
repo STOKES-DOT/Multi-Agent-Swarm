@@ -214,7 +214,7 @@ calculation_protocol:
   n_states: 20
 spectrum_argv:
   - /opt/anaconda3/envs/multi-agent-pso/bin/python
-  - /Users/jiaoyuan/Documents/GitHub/Multi-Agent-PSO/.worktrees/stage-b-red-absorption/examples/red_absorption/backends/pyscf_spectrum.py
+  - /Users/jiaoyuan/Documents/GitHub/Multi-Agent-PSO/examples/red_absorption/backends/pyscf_spectrum.py
 spectrum_timeout_seconds: 3600
 evaluation_concurrency: 1
 ```

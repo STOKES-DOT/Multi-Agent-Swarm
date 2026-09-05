@@ -7,7 +7,7 @@ parent:
   protected_smarts: []
 spectrum_argv:
   - /opt/anaconda3/envs/multi-agent-pso/bin/python
-  - /Users/jiaoyuan/Documents/GitHub/Multi-Agent-PSO/.worktrees/stage-b-red-absorption/examples/red_absorption/backends/pyscf_spectrum.py
+  - /Users/jiaoyuan/Documents/GitHub/Multi-Agent-PSO/examples/red_absorption/backends/pyscf_spectrum.py
 calculation_protocol:
   geometry_workflow: b3lyp_sto3g_optimized
   environment: gas_phase
