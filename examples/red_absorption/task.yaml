@@ -32,6 +32,8 @@ plugins:
     - inputs.py
     - stage_context.py
     - workflow.py
+    - preflight.py
+    - search.py
     - models.py
     - evaluator.py
     - prompts/hypothesize.md

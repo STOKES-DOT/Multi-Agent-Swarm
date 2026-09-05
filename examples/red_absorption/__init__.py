@@ -12,6 +12,8 @@ from .models import (
     SpectrumProvenance,
     SpectrumResult,
 )
+from .preflight import PreflightRecord, preflight_red_absorption
+from .search import run_red_absorption_search
 
 __all__ = [
     "CalculationProtocol",
@@ -19,6 +21,7 @@ __all__ = [
     "ExcitedState",
     "MoleculeEditorGeometryConfig",
     "ParentSource",
+    "PreflightRecord",
     "RedAbsorptionEvaluator",
     "RedAbsorptionRunInputs",
     "RedAbsorptionTaskAdapter",
@@ -28,4 +31,6 @@ __all__ = [
     "SpectrumError",
     "SpectrumProvenance",
     "SpectrumResult",
+    "preflight_red_absorption",
+    "run_red_absorption_search",
 ]

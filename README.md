@@ -24,6 +24,25 @@ conda run -n multi-agent-pso multi-agent-pso benchmark rastrigin --runs-dir /pri
 
 在已有 Python event loop 中，请使用 `await run_continuous_benchmark_async(...)`；同步 `run_continuous_benchmark(...)` 会明确拒绝在 active loop 内运行，避免嵌套 event loop。
 
+## Stage B red-absorption run gate
+
+Red-absorption 搜索必须先用显式 task 和 run-input 文件完成一次独立
+preflight；preflight 只执行母体 MoleculeEditor inspection 和一次 spectrum
+calculation，不创建 swarm run database：
+
+```bash
+multi-agent-pso preflight examples/red_absorption/task.yaml --inputs /absolute/path/red-inputs.yaml --runs-dir /absolute/path/red-run
+multi-agent-pso run examples/red_absorption/task.yaml --inputs /absolute/path/red-inputs.yaml --runs-dir /absolute/path/red-run --confirm-max-new-evaluations 25
+```
+
+v1 固定为 5 particles × 5 iterations，因此搜索阶段最多新增 25 次 spectrum
+evaluation；preflight 的一次计算单独记录，不占这 25 次。run-input 必须显式提供母体、
+backend/version，以及 `vertical_from_molecule_editor` 或
+`b3lyp_sto3g_optimized` geometry workflow，不存在隐式默认母体或计算后端。
+
+本提交只运行 deterministic/non-live tests；未运行真实 Codex、MoleculeEditor、
+spectrum command 或 5×5 搜索。真实 preflight 仍需用户提供输入并显式执行上述命令。
+
 ## 1. 目标
 
 本项目讨论一种用于功能分子设计的 Multi-Agent PSO 架构。

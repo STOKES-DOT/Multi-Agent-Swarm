@@ -1,12 +1,53 @@
 """Command-line entry point for the package."""
 
 import argparse
+import asyncio
 import json
 import sqlite3
 import sys
 from pathlib import Path
+import yaml
+
+from .configuration.loader import _UniqueKeySafeLoader
 
 from . import __version__
+
+
+def _expected_red_evaluations(task_path: Path) -> int:
+    if not isinstance(task_path, Path) or task_path.is_symlink() or not task_path.is_file():
+        raise ValueError("task must be an existing regular file")
+    data = task_path.read_bytes()
+    if len(data) > 1024 * 1024:
+        raise ValueError("task file exceeds guard byte limit")
+    raw = yaml.load(data.decode("utf-8"), Loader=_UniqueKeySafeLoader)
+    try:
+        population = raw["pso"]["population_size"]
+        iterations = raw["pso"]["iterations"]
+    except (KeyError, TypeError) as error:
+        raise ValueError("task PSO budget is missing") from error
+    if type(population) is not int or type(iterations) is not int:
+        raise ValueError("task PSO budget must use integers")
+    return population * iterations
+
+
+def _load_verified_red_preflight(task: Path, inputs: Path, runs_dir: Path):
+    from examples.red_absorption.preflight import load_verified_red_absorption_preflight
+
+    return load_verified_red_absorption_preflight(task, inputs, runs_dir)
+
+
+def _launch_red_absorption_search(task, inputs, record, runs_dir: Path):
+    from examples.red_absorption.search import run_red_absorption_search
+
+    return asyncio.run(
+        run_red_absorption_search(task, inputs, record, runs_dir=runs_dir)
+    )
+
+
+def _execute_red_preflight(task: Path, inputs: Path, runs_dir: Path):
+    from examples.red_absorption.preflight import preflight_red_absorption
+
+    return asyncio.run(preflight_red_absorption(task, inputs, runs_dir))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -26,7 +67,16 @@ def main(argv: list[str] | None = None) -> int:
     selection.add_argument("--latest", action="store_true")
     selection.add_argument("--run-id")
     report.add_argument("--format", choices=("json", "markdown"), default="json")
-    for name in ("run", "resume", "status"):
+    preflight = subcommands.add_parser("preflight")
+    preflight.add_argument("task", type=Path)
+    preflight.add_argument("--inputs", type=Path, required=True)
+    preflight.add_argument("--runs-dir", type=Path, required=True)
+    run = subcommands.add_parser("run")
+    run.add_argument("task", type=Path)
+    run.add_argument("--inputs", type=Path, required=True)
+    run.add_argument("--runs-dir", type=Path, required=True)
+    run.add_argument("--confirm-max-new-evaluations", type=int)
+    for name in ("resume", "status"):
         subcommands.add_parser(name)
     args = parser.parse_args(argv)
     if args.version:
@@ -93,7 +143,44 @@ def main(argv: list[str] | None = None) -> int:
         except (ValueError, TypeError, RuntimeError, sqlite3.Error, OSError) as error:
             print(f"report error: {error}", file=sys.stderr)
             return 2
-    if args.command in {"run", "resume", "status"}:
+    if args.command == "preflight":
+        try:
+            record = _execute_red_preflight(args.task, args.inputs, args.runs_dir)
+            print(
+                json.dumps(
+                    {
+                        "identity": record.identity,
+                        "max_new_evaluations": record.max_new_evaluations,
+                        "passed": record.passed,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            return 0
+        except (ValueError, TypeError, RuntimeError, OSError) as error:
+            print(f"preflight error: {error}", file=sys.stderr)
+            return 2
+    if args.command == "run":
+        try:
+            expected = _expected_red_evaluations(args.task)
+            if args.confirm_max_new_evaluations != expected:
+                raise ValueError(
+                    f"explicit confirmation required: --confirm-max-new-evaluations {expected}"
+                )
+            task, loaded, record = _load_verified_red_preflight(
+                args.task, args.inputs, args.runs_dir
+            )
+            print(f"Launching with exact upper bound: {expected} new evaluations")
+            result = _launch_red_absorption_search(
+                task, loaded, record, args.runs_dir
+            )
+            print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+            return 0
+        except (ValueError, TypeError, RuntimeError, OSError) as error:
+            print(f"run error: {error}", file=sys.stderr)
+            return 2
+    if args.command in {"resume", "status"}:
         print(f"{args.command} is not implemented in Stage A", file=sys.stderr)
         return 2
     return 0

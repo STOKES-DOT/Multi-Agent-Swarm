@@ -41,7 +41,7 @@ def test_benchmark_cli_runs_sphere_and_writes_summary(tmp_path, capsys) -> None:
 
 
 def test_stage_a_unimplemented_commands_fail_nonzero(capsys) -> None:
-    assert main(["run"]) != 0
+    assert main(["resume"]) != 0
     assert "not implemented in Stage A" in capsys.readouterr().err
 
 

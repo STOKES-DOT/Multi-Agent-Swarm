@@ -155,6 +155,33 @@ async def test_same_key_is_single_flight_across_providers(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_workflow_hard_evaluation_budget_never_overruns(tmp_path):
+    inputs = inputs_with_concurrency(tmp_path, 2)
+    spectrum = DelayedSpectrum()
+    resources = RedAbsorptionWorkflowResources.from_inputs(
+        inputs, max_new_evaluations=1
+    )
+    tools = [
+        RedAbsorptionWorkflowToolProvider.bind(
+            inputs, VariableEditor([], parent_graph()), resources, spectrum=spectrum
+        )
+        for _ in range(2)
+    ]
+    pairs = [
+        authorized_request_context(
+            [{"operation": "replace_atom", "atom_id": "a0001", "atomic_number": n}],
+            tmp_path.resolve(),
+        )
+        for n in (7, 8)
+    ]
+    results = await asyncio.gather(
+        *(tool.execute(*pair) for tool, pair in zip(tools, pairs, strict=True))
+    )
+    assert resources.execution_count == spectrum.calls == 1
+    assert sorted(result.status.value for result in results) == ["REJECTED", "SUCCESS"]
+
+
+@pytest.mark.asyncio
 async def test_different_run_resources_are_independent(tmp_path):
     inputs = inputs_with_concurrency(tmp_path, 1)
     spectrum = DelayedSpectrum()

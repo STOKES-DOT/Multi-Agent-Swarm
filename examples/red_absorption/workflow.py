@@ -53,6 +53,7 @@ class RedAbsorptionWorkflowResources:
         self,
         inputs: RedAbsorptionRunInputs,
         cache: MutableMapping[CacheKey, SpectrumResult],
+        max_new_evaluations: int,
     ):
         self._concurrency = inputs.evaluation_concurrency
         self._protocol_hash = inputs.calculation_protocol.protocol_hash
@@ -62,6 +63,8 @@ class RedAbsorptionWorkflowResources:
         self._spectrum_slots = asyncio.Semaphore(self._concurrency)
         self._execution_count = 0
         self._cache_hit_count = 0
+        self._max_new_evaluations = max_new_evaluations
+        self._budget_lock = asyncio.Lock()
         self._loop = None
         self._loop_guard = threading.Lock()
 
@@ -70,12 +73,16 @@ class RedAbsorptionWorkflowResources:
         cls,
         inputs: RedAbsorptionRunInputs,
         cache: MutableMapping[CacheKey, SpectrumResult] | None = None,
+        *,
+        max_new_evaluations: int = 25,
     ) -> "RedAbsorptionWorkflowResources":
         if not isinstance(inputs, RedAbsorptionRunInputs):
             raise TypeError("inputs must be RedAbsorptionRunInputs")
         if cache is not None and not isinstance(cache, MutableMapping):
             raise TypeError("cache must be a mutable mapping")
-        return cls(inputs, {} if cache is None else cache)
+        if type(max_new_evaluations) is not int or max_new_evaluations <= 0:
+            raise ValueError("max_new_evaluations must be a positive integer")
+        return cls(inputs, {} if cache is None else cache, max_new_evaluations)
 
     @property
     def concurrency(self) -> int:
@@ -102,6 +109,13 @@ class RedAbsorptionWorkflowResources:
     async def _lock_for(self, key: CacheKey) -> asyncio.Lock:
         async with self._locks_guard:
             return self._locks.setdefault(key, asyncio.Lock())
+
+    async def _reserve_execution(self) -> bool:
+        async with self._budget_lock:
+            if self._execution_count >= self._max_new_evaluations:
+                return False
+            self._execution_count += 1
+            return True
 
 
 def _parent_source(inputs: RedAbsorptionRunInputs) -> dict[str, object]:
@@ -332,7 +346,12 @@ class RedAbsorptionWorkflowToolProvider:
                         resources._cache_hit_count += 1
                         cache_hit = True
                     else:
-                        resources._execution_count += 1
+                        if not await resources._reserve_execution():
+                            return ToolResult(
+                                ToolStatus.REJECTED,
+                                {"cache_key": list(key), "cache_hit": False},
+                                error="maximum new evaluation budget exhausted",
+                            )
                         command_result = await self._spectrum.execute_json(
                             {
                                 "candidate": payload,

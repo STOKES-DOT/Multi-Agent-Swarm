@@ -321,6 +321,21 @@ async def test_initial_snapshot_commit_precedes_episode_calls(tmp_path) -> None:
     assert runner.store.get_latest_committed_snapshot_json("run-1") is None
 
 
+@pytest.mark.asyncio
+async def test_runner_particle_factory_receives_stable_particle_identity(tmp_path) -> None:
+    runner = make_fake_runner(tmp_path, delays={}, seed=10)
+    seen = []
+    original = runner.episode_factory
+
+    def particle_factory(particle_id, target):
+        seen.append(particle_id)
+        return original(target)
+
+    runner.particle_episode_factory = particle_factory
+    await runner.run(iterations=1)
+    assert seen == list(runner.particle_ids)
+
+
 async def test_no_success_generation_commits_pause_and_stops(tmp_path) -> None:
     runner = make_fake_runner(tmp_path, delays={}, seed=12, succeed=False)
     initial = runner.ensure_initial_snapshot()
