@@ -71,11 +71,13 @@ def _ready_payload():
 
 
 def _stereo_graph(include_center=True):
-    graph=_real_graph(); graph["atoms"].extend([deepcopy(graph["atoms"][0]),deepcopy(graph["atoms"][0])]); graph["atoms"][2]["atom_id"]="a0003"; graph["atoms"][3]["atom_id"]="a0004"; graph["next_atom_serial"]=5
+    graph=_real_graph(); graph["atoms"][1]["atomic_number"]=6; graph["atoms"].extend([deepcopy(graph["atoms"][0]),deepcopy(graph["atoms"][0])]); graph["atoms"][2]["atom_id"]="a0003"; graph["atoms"][3]["atom_id"]="a0004"; graph["next_atom_serial"]=5
     center=graph["bonds"][0]; graph["bonds"]=[]; serial=1
     if include_center: center.update({"bond_id":"b0001","bond_type":"DOUBLE","stereo":"STEREOE","stereo_atom_ids":["a0003","a0004"],"bond_direction":"NONE"}); graph["bonds"].append(center); serial=2
     for begin,end in (("a0003","a0001"),("a0002","a0004")):
         bond=deepcopy(_real_graph()["bonds"][0]); bond.update({"bond_id":f"b{serial:04d}","begin_atom_id":begin,"end_atom_id":end}); graph["bonds"].append(bond); serial+=1
+    if not include_center:
+        bond=deepcopy(_real_graph()["bonds"][0]); bond.update({"bond_id":f"b{serial:04d}","begin_atom_id":"a0001","end_atom_id":"a0004"}); graph["bonds"].append(bond); serial+=1
     graph["next_bond_serial"]=serial
     return graph
 
@@ -83,7 +85,17 @@ def _stereo_graph(include_center=True):
 def _payload_with_graph(graph):
     data=_real_payload(); data["graph"]=graph; data["atom_table"]=deepcopy(graph["atoms"]); data["bond_table"]=deepcopy(graph["bonds"]); atom_ids=[a["atom_id"] for a in graph["atoms"]]; bond_ids=[b["bond_id"] for b in graph["bonds"]]; data["atom_id_mapping"]={v:v for v in atom_ids}; data["bond_id_mapping"]={v:v for v in bond_ids}; degrees={v:0 for v in atom_ids}
     for bond in graph["bonds"]: degrees[bond["begin_atom_id"]]+=1; degrees[bond["end_atom_id"]]+=1
-    data["topology"]={"atom_count":len(atom_ids),"bond_count":len(bond_ids),"component_count":1,"component_sizes":[len(atom_ids)],"bridge_bond_ids":sorted(bond_ids),"cycle_atom_ids":[],"degree_by_atom_id":degrees,"symmetry_class_by_atom_id":{v:i for i,v in enumerate(atom_ids)}}
+    symmetry={"a0001":2,"a0002":2,"a0003":0,"a0004":0} if atom_ids==["a0001","a0002","a0003","a0004"] else {v:i for i,v in enumerate(atom_ids)}
+    data["topology"]={"atom_count":len(atom_ids),"bond_count":len(bond_ids),"component_count":1,"component_sizes":[len(atom_ids)],"bridge_bond_ids":sorted(bond_ids),"cycle_atom_ids":[],"degree_by_atom_id":degrees,"symmetry_class_by_atom_id":symmetry}
+    return data
+
+
+def _benzene_payload():
+    data=_real_payload(); graph=_real_graph(); template=deepcopy(graph["atoms"][0]); graph["atoms"]=[]
+    for index in range(1,7): atom=deepcopy(template); atom.update({"atom_id":f"a{index:04d}","aromatic":True}); graph["atoms"].append(atom)
+    graph["bonds"]=[]
+    for index in range(1,7): bond=deepcopy(_real_graph()["bonds"][0]); bond.update({"bond_id":f"b{index:04d}","begin_atom_id":f"a{index:04d}","end_atom_id":f"a{index%6+1:04d}","bond_type":"AROMATIC","aromatic":True,"conjugated":True}); graph["bonds"].append(bond)
+    graph["next_atom_serial"]=7; graph["next_bond_serial"]=7; data["graph"]=graph; data["atom_table"]=deepcopy(graph["atoms"]); data["bond_table"]=deepcopy(graph["bonds"]); data["atom_id_mapping"]={f"a{i:04d}":f"a{i:04d}" for i in range(1,7)}; data["bond_id_mapping"]={f"b{i:04d}":f"b{i:04d}" for i in range(1,7)}; data["canonical_isomeric_smiles"]="c1ccccc1"; data["topology"]={"atom_count":6,"bond_count":6,"component_count":1,"component_sizes":[6],"bridge_bond_ids":[],"cycle_atom_ids":[[f"a{i:04d}" for i in range(1,7)]],"degree_by_atom_id":{f"a{i:04d}":2 for i in range(1,7)},"symmetry_class_by_atom_id":{f"a{i:04d}":0 for i in range(1,7)}}
     return data
 
 
@@ -247,6 +259,46 @@ def test_diagnostics_and_failed_artifact_attacks_are_rejected(mutation) -> None:
     with pytest.raises(ValueError): MoleculeEditorResult.from_process(exit_code=0,payload=data)
 
 
+def test_symmetry_classes_match_rdkit_canonical_ranks() -> None:
+    asymmetric=_real_payload(); assert MoleculeEditorResult.from_process(exit_code=0,payload=asymmetric).candidate
+    tampered=deepcopy(asymmetric); tampered["topology"]["symmetry_class_by_atom_id"]={"a0001":99,"a0002":42}
+    with pytest.raises(ValueError): MoleculeEditorResult.from_process(exit_code=0,payload=tampered)
+    symmetric=_real_payload(); symmetric["graph"]["atoms"][1]["atomic_number"]=6; symmetric["atom_table"]=deepcopy(symmetric["graph"]["atoms"]); symmetric["canonical_isomeric_smiles"]="CC"; symmetric["topology"]["symmetry_class_by_atom_id"]={"a0001":0,"a0002":0}
+    assert MoleculeEditorResult.from_process(exit_code=0,payload=symmetric).candidate
+
+
+def test_disconnected_graph_is_rejected_even_with_consistent_topology_view() -> None:
+    data=_real_payload(); atom=deepcopy(data["graph"]["atoms"][0]); atom["atom_id"]="a0003"; data["graph"]["atoms"].append(atom); data["graph"]["next_atom_serial"]=4; data["atom_table"]=deepcopy(data["graph"]["atoms"]); data["atom_id_mapping"]["a0003"]="a0003"; data["topology"].update({"atom_count":3,"component_count":2,"component_sizes":[2,1],"degree_by_atom_id":{"a0001":1,"a0002":1,"a0003":0},"symmetry_class_by_atom_id":{"a0001":0,"a0002":2,"a0003":1}})
+    with pytest.raises(ValueError): MoleculeEditorResult.from_process(exit_code=0,payload=data)
+
+
+def _valid_edit_payload():
+    data=_real_payload(); data["mode"]="edit"; data["transaction_status"]="COMMITTED"; data["rollback"]=None; data["parent_graph"]=_real_graph(); data["parent_state_hash"]=HASH; data["graph"]["parent_state_hash"]=HASH
+    return data
+
+
+@pytest.mark.parametrize("mutation",["status","rollback","parent_none","parent_hash","inspect_fields"])
+def test_valid_mode_transaction_lineage_is_strict(mutation) -> None:
+    data=_valid_edit_payload() if mutation!="inspect_fields" else _real_payload()
+    if mutation=="status": data["transaction_status"]="ROLLED_BACK"
+    elif mutation=="rollback": data["rollback"]={"preserved":True}
+    elif mutation=="parent_none": data["parent_graph"]=None
+    elif mutation=="parent_hash": data["parent_graph"]["state_hash"]=HASH2
+    else: data["transaction_status"]="COMMITTED"
+    with pytest.raises(ValueError): MoleculeEditorResult.from_process(exit_code=0,payload=data)
+    assert MoleculeEditorResult.from_process(exit_code=0,payload=_valid_edit_payload()).candidate
+
+
+@pytest.mark.parametrize("operation",["detach_fragment","substitute_fragment"])
+def test_fragment_removal_prunes_old_ids_and_preserves_retained_component(operation) -> None:
+    graph=_stereo_graph(); command={"operation":operation,"bond_id":"b0001","retained_atom_id":"a0001"}
+    if operation=="substitute_fragment": command.update({"fragment_graph":_real_graph(),"fragment_anchor_atom_id":"a0001","bond_type":"SINGLE","client_ref":"@join"})
+    with pytest.raises(ValueError): MoleculeEditorProvider._commands([command,{"operation":"change_bond","bond_id":"b0003","bond_type":"SINGLE"}],graph)
+    with pytest.raises(ValueError): MoleculeEditorProvider._commands([command,{"operation":"replace_atom","atom_id":"a0002","atomic_number":6}],graph)
+    valid=[command,{"operation":"replace_atom","atom_id":"a0003","atomic_number":6}]
+    assert MoleculeEditorProvider._commands(valid,graph)==valid
+
+
 @pytest.mark.parametrize("mutation",["duplicate_atom","bad_element","missing_endpoint","bad_direction","serial_bool"])
 def test_graph_schema_attack_cases_are_rejected(mutation) -> None:
     data=_real_payload(); graph=data["graph"]
@@ -298,7 +350,7 @@ def test_ready_coordinates_accept_explicit_graph_hydrogens_and_geometry_hydrogen
     data=_ready_payload(); graph=data["graph"]
     hydrogen={"atom_id":"a0003","atomic_number":1,"isotope":0,"formal_charge":0,"radical_electrons":0,"chiral_tag":"CHI_UNSPECIFIED","chiral_neighbor_atom_ids":[],"explicit_h_count":0,"no_implicit":False,"aromatic":False,"atom_map":None}
     graph["atoms"].append(hydrogen); graph["next_atom_serial"]=4; bond=deepcopy(graph["bonds"][0]); bond.update({"bond_id":"b0002","begin_atom_id":"a0001","end_atom_id":"a0003"}); graph["bonds"].append(bond); graph["next_bond_serial"]=3
-    data["atom_table"]=deepcopy(graph["atoms"]); data["bond_table"]=deepcopy(graph["bonds"]); data["atom_id_mapping"]["a0003"]="a0003"; data["bond_id_mapping"]["b0002"]="b0002"; data["topology"].update({"atom_count":3,"bond_count":2,"component_sizes":[3],"bridge_bond_ids":["b0001","b0002"],"degree_by_atom_id":{"a0001":2,"a0002":1,"a0003":1},"symmetry_class_by_atom_id":{"a0001":0,"a0002":1,"a0003":2}})
+    data["atom_table"]=deepcopy(graph["atoms"]); data["bond_table"]=deepcopy(graph["bonds"]); data["atom_id_mapping"]["a0003"]="a0003"; data["bond_id_mapping"]["b0002"]="b0002"; data["topology"].update({"atom_count":3,"bond_count":2,"component_sizes":[3],"bridge_bond_ids":["b0001","b0002"],"degree_by_atom_id":{"a0001":2,"a0002":1,"a0003":1},"symmetry_class_by_atom_id":{"a0001":2,"a0002":1,"a0003":0}})
     order=data["coordinate_order"]; order.extend(["a0003","h:a0001:1"])
     coords=data["geometry_result"]["conformers"][0]["coordinates"]; coords.extend([{"atom_id":value,"atomic_number":1,"x_angstrom":0.0,"y_angstrom":1.0,"z_angstrom":0.0} for value in order[-2:]])
     data["geometry_result"]["coordinate_order"]=order
@@ -309,9 +361,11 @@ def test_ready_coordinates_accept_explicit_graph_hydrogens_and_geometry_hydrogen
 def test_non_double_graph_bond_requires_empty_stereo_atom_ids(bond_type) -> None:
     data=_real_payload(); bond=data["graph"]["bonds"][0]; bond.update({"bond_type":bond_type,"stereo":"STEREONONE","stereo_atom_ids":["a0001","a0002"],"bond_direction":"NONE"})
     with pytest.raises(ValueError): MoleculeEditorResult.from_process(exit_code=0,payload=data)
-    bond["stereo_atom_ids"]=[]
-    bond["aromatic"] = bond_type == "AROMATIC"
-    data["bond_table"]=deepcopy(data["graph"]["bonds"])
+    if bond_type=="AROMATIC": data=_benzene_payload()
+    else:
+        bond["stereo_atom_ids"]=[]
+        if bond_type=="TRIPLE": data["graph"]["atoms"][1]["atomic_number"]=7; data["atom_table"]=deepcopy(data["graph"]["atoms"]); data["canonical_isomeric_smiles"]="C#N"
+        data["bond_table"]=deepcopy(data["graph"]["bonds"])
     assert MoleculeEditorResult.from_process(exit_code=0,payload=data).candidate
 
 

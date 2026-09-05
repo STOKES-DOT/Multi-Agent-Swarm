@@ -8,6 +8,7 @@ import re
 import sys
 import weakref
 import networkx as nx
+from rdkit import Chem
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -137,6 +138,8 @@ def _validate_graph(value: object) -> dict[str, object]:
     adjacency={atom:set() for atom in atom_ids}
     for bond in bonds:
         adjacency[bond["begin_atom_id"]].add(bond["end_atom_id"]); adjacency[bond["end_atom_id"]].add(bond["begin_atom_id"])
+    connectivity=nx.Graph(); connectivity.add_nodes_from(atom_ids); connectivity.add_edges_from((bond["begin_atom_id"],bond["end_atom_id"]) for bond in bonds)
+    if not atom_ids or not nx.is_connected(connectivity): raise ValueError("ChemicalGraph must be nonempty and connected")
     for bond in bonds:
         _validate_bond_stereo_refs(bond["bond_type"],bond["stereo"],bond["stereo_atom_ids"],bond["begin_atom_id"],bond["end_atom_id"],adjacency)
     return value
@@ -176,6 +179,25 @@ def _validate_views(data: dict[str, object], graph: dict[str, object]) -> None:
     if any(topology.get(k)!=v for k,v in expected.items()): raise ValueError("topology does not match graph")
     symmetry=topology["symmetry_class_by_atom_id"]
     if not isinstance(symmetry,dict) or set(symmetry)!=atom_ids or any(type(v) is not int or v<0 for v in symmetry.values()): raise ValueError("symmetry classes invalid")
+    if symmetry != _rdkit_symmetry_classes(graph): raise ValueError("symmetry classes do not match graph")
+
+
+def _rdkit_symmetry_classes(graph: dict[str, object]) -> dict[str,int]:
+    try:
+        editable=Chem.RWMol(); indices={}; chiral={"CHI_UNSPECIFIED":Chem.ChiralType.CHI_UNSPECIFIED,"CHI_TETRAHEDRAL_CW":Chem.ChiralType.CHI_TETRAHEDRAL_CW,"CHI_TETRAHEDRAL_CCW":Chem.ChiralType.CHI_TETRAHEDRAL_CCW}
+        for record in graph["atoms"]:
+            atom=Chem.Atom(record["atomic_number"]); atom.SetIsotope(record["isotope"]); atom.SetFormalCharge(record["formal_charge"]); atom.SetNumRadicalElectrons(record["radical_electrons"]); atom.SetChiralTag(chiral[record["chiral_tag"]]); atom.SetNumExplicitHs(record["explicit_h_count"]); atom.SetNoImplicit(record["no_implicit"]); atom.SetIsAromatic(record["aromatic"])
+            if record["atom_map"] is not None: atom.SetAtomMapNum(record["atom_map"])
+            indices[record["atom_id"]]=editable.AddAtom(atom)
+        bond_types={"SINGLE":Chem.BondType.SINGLE,"DOUBLE":Chem.BondType.DOUBLE,"TRIPLE":Chem.BondType.TRIPLE,"AROMATIC":Chem.BondType.AROMATIC}; stereos={name:getattr(Chem.BondStereo,name) for name in ("STEREONONE","STEREOANY","STEREOZ","STEREOE","STEREOCIS","STEREOTRANS")}; directions={name:getattr(Chem.BondDir,name) for name in ("NONE","BEGINWEDGE","BEGINDASH","ENDDOWNRIGHT","ENDUPRIGHT","EITHERDOUBLE","UNKNOWN")}
+        for record in graph["bonds"]: editable.AddBond(indices[record["begin_atom_id"]],indices[record["end_atom_id"]],bond_types[record["bond_type"]])
+        for record in graph["bonds"]:
+            bond=editable.GetBondBetweenAtoms(indices[record["begin_atom_id"]],indices[record["end_atom_id"]]); bond.SetIsAromatic(record["aromatic"]); bond.SetIsConjugated(record["conjugated"]); bond.SetStereo(stereos[record["stereo"]]); bond.SetBondDir(directions[record["bond_direction"]])
+            if record["stereo_atom_ids"]: bond.SetStereoAtoms(*(indices[value] for value in record["stereo_atom_ids"]))
+        molecule=editable.GetMol(); Chem.SanitizeMol(molecule); ranks=Chem.CanonicalRankAtoms(molecule,breakTies=False,includeChirality=True,includeIsotopes=True,includeAtomMaps=False)
+        return {identity:int(ranks[index]) for identity,index in indices.items()}
+    except Exception as error:
+        raise ValueError("ChemicalGraph could not be rebuilt for symmetry") from error
 
 
 def _validate_unready_geometry(data: dict[str, object], status: str) -> None:
@@ -305,6 +327,12 @@ class MoleculeEditorResult:
             if graph.get("committed_commands") != data.get("committed_commands"):
                 raise ValueError("outer/graph committed_commands mismatch")
             if data.get("mode") is not None: _validate_views(data, graph)
+            if data.get("mode") == "edit":
+                if data.get("transaction_status") != "COMMITTED" or data.get("rollback") is not None: raise ValueError("valid edit transaction fields invalid")
+                parent_graph=_validate_graph(data.get("parent_graph"))
+                if parent_graph["state_hash"] != data.get("parent_state_hash"): raise ValueError("valid edit parent lineage mismatch")
+            elif data.get("mode") == "inspect" and any(data.get(key) is not None for key in ("transaction_status","rollback","parent_graph")):
+                raise ValueError("inspect exposes edit transaction fields")
             candidate = graph
         else:
             if data.get("graph") is not None or data.get("chemical_identity_hash") is not None or data.get("state_hash") is not None or data.get("committed_commands", []) != [] or geometry != "NOT_REQUESTED":
@@ -518,7 +546,23 @@ class MoleculeEditorProvider:
                 fragment = item.get("fragment_graph"); anchor = item.get("fragment_anchor_atom_id")
                 validated_fragment = _validate_graph(_plain(fragment))
                 if anchor not in {a.get("atom_id") for a in validated_fragment.get("atoms", ()) if isinstance(a, Mapping)}: raise ValueError("fragment anchor is invalid")
-                topology_known=False
+                if op=="attach_fragment": topology_known=False
+            if op in {"detach_fragment","substitute_fragment"}:
+                begin,end=endpoints[item["bond_id"]]; adjacency[begin].discard(end); adjacency[end].discard(begin); endpoints.pop(item["bond_id"]); bond_refs.discard(item["bond_id"])
+                retained=item["retained_atom_id"]; component=set(); pending=[retained]
+                while pending:
+                    atom=pending.pop()
+                    if atom in component: continue
+                    component.add(atom); pending.extend(adjacency.get(atom,set())-component)
+                removed=set(atom_refs)-component
+                for atom in removed:
+                    for neighbor in adjacency.get(atom,set()): adjacency.get(neighbor,set()).discard(atom)
+                    adjacency.pop(atom,None); atom_refs.discard(atom)
+                for identity,pair in tuple(endpoints.items()):
+                    if pair[0] in removed or pair[1] in removed: endpoints.pop(identity); bond_refs.discard(identity)
+                if op=="substitute_fragment":
+                    opaque=f"@fragment-{len(used)}"; adjacency.setdefault(retained,set()).add(opaque); adjacency[opaque]={retained}; topology_known=False
+                    if item.get("client_ref"): endpoints[item["client_ref"]]=(retained,opaque)
             if op=="add_atom": adjacency[item["client_ref"]]=set()
             elif op=="remove_atom":
                 removed=item["atom_id"]
