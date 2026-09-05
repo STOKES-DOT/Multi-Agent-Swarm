@@ -220,11 +220,7 @@ class PySCFEngine:
         from pyscf import dft
 
         mean_field = dft.RKS(molecule)
-        mean_field.xc = "B3LYP"
-        mean_field.grids.level = 3
-        mean_field.conv_tol = 1.0e-9
-        mean_field.max_cycle = 100
-        mean_field.verbose = 0
+        mean_field.xc = "b3lyp"
         return mean_field
 
     def optimize(
@@ -324,7 +320,7 @@ class PySCFEngine:
     def tddft(
         self, optimized: EvaluatedGeometry, protocol: CalculationProtocol
     ) -> tuple[ExcitedState, ...]:
-        from pyscf import tdscf
+        from pyscf import tddft
 
         np = self._np
 
@@ -336,11 +332,8 @@ class PySCFEngine:
                     "SCF_NOT_CONVERGED", "vertical RKS did not converge"
                 )
             self._final_mf = mean_field
-        solver = tdscf.TDDFT(self._final_mf)
+        solver = tddft.TDDFT(self._final_mf)
         solver.nstates = protocol.n_states
-        solver.singlet = True
-        solver.conv_tol = 1.0e-7
-        solver.max_cycle = 100
         try:
             energies, _ = solver.kernel()
             strengths = solver.oscillator_strength(gauge="length")

@@ -6,6 +6,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from examples.red_absorption.backends.pyscf_spectrum import (
@@ -54,6 +55,54 @@ def test_backend_leaves_cpu_thread_controls_to_runtime(monkeypatch) -> None:
     assert all(os.environ[name] == "8" for name in names)
     assert engine.metadata()["thread_control"] == "runtime_default"
     assert "threads" not in engine.metadata()
+
+
+def test_backend_builds_official_default_rks(monkeypatch) -> None:
+    mean_field = SimpleNamespace()
+    fake_dft = SimpleNamespace(RKS=lambda molecule: mean_field)
+    monkeypatch.setitem(sys.modules, "pyscf", SimpleNamespace(dft=fake_dft))
+
+    assert PySCFEngine._rks(object()) is mean_field
+    assert vars(mean_field) == {"xc": "b3lyp"}
+
+
+def test_backend_builds_official_default_tddft(monkeypatch) -> None:
+    assignments = []
+
+    class FakeTDDFT:
+        def __init__(self, mean_field) -> None:
+            object.__setattr__(self, "converged", np.ones(10, dtype=bool))
+
+        def __setattr__(self, name, value) -> None:
+            if name in {"nstates", "singlet", "conv_tol", "max_cycle"}:
+                assignments.append((name, value))
+            object.__setattr__(self, name, value)
+
+        def kernel(self):
+            return np.linspace(0.1, 0.2, self.nstates), object()
+
+        def oscillator_strength(self, gauge):
+            assert gauge == "length"
+            return np.full(self.nstates, 0.1)
+
+    fake_tddft = SimpleNamespace(TDDFT=FakeTDDFT)
+    monkeypatch.setitem(sys.modules, "pyscf", SimpleNamespace(tddft=fake_tddft))
+    engine = object.__new__(PySCFEngine)
+    engine._np = np
+    engine._final_mf = object()
+
+    states = engine.tddft(
+        geometry(),
+        protocol().model_copy(
+            update={
+                "geometry_workflow": "vertical_from_molecule_editor",
+                "n_states": 10,
+            }
+        ),
+    )
+
+    assert len(states) == 10
+    assert assignments == [("nstates", 10)]
 
 
 def geometry(z: float = 0.0) -> EvaluatedGeometry:
