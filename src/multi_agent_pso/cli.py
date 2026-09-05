@@ -146,6 +146,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "preflight":
         try:
             record = _execute_red_preflight(args.task, args.inputs, args.runs_dir)
+            if record.passed is not True:
+                raise ValueError("preflight record did not pass")
             print(
                 json.dumps(
                     {

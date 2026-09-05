@@ -10,23 +10,26 @@ from examples.red_absorption.preflight import (
     PreflightDependencies,
     preflight_red_absorption,
     verify_red_absorption_preflight,
+    verify_current_parent,
 )
+from examples.red_absorption.search import run_red_absorption_search
 from multi_agent_pso.configuration import LoadedRunInputs
 from tests.fixtures.red_absorption import load_valid_inputs
 from tests.integration.test_red_absorption_flow import FakeEditor, parent_graph
 
 
 class FakeSpectrum:
-    def __init__(self, *, wrong_geometry: bool = False):
+    def __init__(self, *, wrong_geometry: bool = False, failed: bool = False):
         self.calls = 0
         self.wrong_geometry = wrong_geometry
+        self.failed = failed
 
     async def execute_json(self, payload, **kwargs):
         self.calls += 1
         geometry_hash = "0" * 64 if self.wrong_geometry else payload["geometry_hash"]
         spectrum = {
-            "status": "SUCCESS",
-            "states": [{
+            "status": "FAILED" if self.failed else "SUCCESS",
+            "states": [] if self.failed else [{
                 "state_index": 1,
                 "energy_ev": 1239.841984 / 650,
                 "wavelength_nm": 650.0,
@@ -40,9 +43,20 @@ class FakeSpectrum:
                 "command_metadata": None,
                 "backend_metadata": None,
             },
-            "error": None,
+            "error": {"code": "FAILED", "message": "fixture", "details": {}}
+            if self.failed
+            else None,
         }
         return SimpleNamespace(status=SimpleNamespace(value="SUCCESS"), stdout_text=json.dumps(spectrum))
+
+
+class ClosingEditor(FakeEditor):
+    def __init__(self, graph):
+        super().__init__([], graph)
+        self.close_calls = 0
+
+    async def aclose(self):
+        self.close_calls += 1
 
 
 def fake_loaded_inputs(tmp_path):
@@ -86,10 +100,22 @@ async def test_preflight_uses_fake_boundaries_writes_artifact_but_no_run_db(tmp_
     assert record.spectrum_evaluation_status == "SUCCESS"
     with pytest.raises(TypeError):
         record.versions["framework"] = "tampered"
-    changed = record.model_dump(mode="json")
-    changed["task_snapshot_hash"] = "f" * 64
-    with pytest.raises(ValidationError, match="identity"):
-        type(record).model_validate(changed)
+    for field in (
+        "parent_state_hash",
+        "parent_chemical_hash",
+        "parent_geometry_hash",
+        "preflight_spectrum_hash",
+        "spectrum_evaluation_status",
+        "passed",
+    ):
+        changed = record.model_dump(mode="json")
+        changed[field] = (
+            "9" * 64
+            if field.endswith("hash")
+            else (False if field == "passed" else "FAILED")
+        )
+        with pytest.raises(ValidationError, match="identity"):
+            type(record).model_validate(changed)
     assert spectrum.calls == 1
     assert not (tmp_path / "runs" / "runs.sqlite").exists()
     artifacts = tuple((tmp_path / "runs" / "artifacts" / "preflight").glob("*.json"))
@@ -125,3 +151,76 @@ async def test_preflight_rejects_strict_spectrum_provenance_mismatch(tmp_path):
             dependencies=dependencies,
         )
     assert not (tmp_path / "runs" / "runs.sqlite").exists()
+
+
+@pytest.mark.asyncio
+async def test_failed_spectrum_never_publishes_an_authorizing_preflight(tmp_path):
+    loaded = fake_loaded_inputs(tmp_path)
+    dependencies = PreflightDependencies(
+        task_loader=lambda path: fake_task(),
+        input_loader=lambda path: loaded,
+        auth_probe=lambda: {"authenticated": True, "method": "chatgpt"},
+        molecule_editor=FakeEditor([], parent_graph()),
+        spectrum=FakeSpectrum(failed=True),
+        sdk_version="0.147.0",
+    )
+    with pytest.raises(ValueError, match="SUCCESS"):
+        await preflight_red_absorption(
+            tmp_path / "task.yaml",
+            tmp_path / "inputs.yaml",
+            tmp_path / "runs",
+            dependencies=dependencies,
+        )
+    assert not (tmp_path / "runs" / "artifacts").exists()
+
+
+@pytest.mark.asyncio
+async def test_search_rechecks_current_parent_before_any_run_mutation(tmp_path):
+    loaded = fake_loaded_inputs(tmp_path)
+    runs = tmp_path / "runs"
+    record = await preflight_red_absorption(
+        tmp_path / "task.yaml",
+        tmp_path / "inputs.yaml",
+        runs,
+        dependencies=PreflightDependencies(
+            task_loader=lambda path: fake_task(),
+            input_loader=lambda path: loaded,
+            auth_probe=lambda: {"authenticated": True, "method": "chatgpt"},
+            molecule_editor=FakeEditor([], parent_graph()),
+            spectrum=FakeSpectrum(),
+            sdk_version="0.147.0",
+        ),
+    )
+    changed_graph = parent_graph()
+    changed_graph["state_hash"] = "9" * 64
+    editor = ClosingEditor(changed_graph)
+    with pytest.raises(ValueError, match="parent"):
+        await run_red_absorption_search(
+            fake_task(), loaded, record, runs_dir=runs, molecule_editor=editor
+        )
+    assert editor.calls == 1 and editor.close_calls == 1
+    assert not (runs / "runs.sqlite").exists()
+    assert not (runs / "workspaces").exists()
+
+
+@pytest.mark.asyncio
+async def test_verify_current_parent_accepts_exact_recorded_identity(tmp_path):
+    loaded = fake_loaded_inputs(tmp_path)
+    record = await preflight_red_absorption(
+        tmp_path / "task.yaml",
+        tmp_path / "inputs.yaml",
+        tmp_path / "runs",
+        dependencies=PreflightDependencies(
+            task_loader=lambda path: fake_task(),
+            input_loader=lambda path: loaded,
+            auth_probe=lambda: {"authenticated": True, "method": "chatgpt"},
+            molecule_editor=FakeEditor([], parent_graph()),
+            spectrum=FakeSpectrum(),
+            sdk_version="0.147.0",
+        ),
+    )
+    editor = ClosingEditor(parent_graph())
+    assert await verify_current_parent(
+        loaded.value, record, tmp_path.resolve(), molecule_editor=editor
+    ) is editor
+    assert editor.close_calls == 0

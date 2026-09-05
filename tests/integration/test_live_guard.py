@@ -130,3 +130,24 @@ def test_preflight_cli_invokes_preflight_once_and_prints_sanitized_summary(
     assert len(calls) == 1
     assert '"max_new_evaluations":25' in output
     assert "credential" not in output.casefold() and "token" not in output.casefold()
+
+
+def test_preflight_cli_rejects_a_nonpassing_record(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        cli_module,
+        "_execute_red_preflight",
+        lambda *values: SimpleNamespace(
+            identity="a" * 64, max_new_evaluations=25, passed=False
+        ),
+    )
+    assert main(
+        [
+            "preflight",
+            str(tmp_path / "task.yaml"),
+            "--inputs",
+            str(tmp_path / "inputs.yaml"),
+            "--runs-dir",
+            str(tmp_path / "runs"),
+        ]
+    ) == 2
+    assert "pass" in capsys.readouterr().err

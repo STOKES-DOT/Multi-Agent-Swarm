@@ -16,10 +16,14 @@ from multi_agent_pso.resources import AsyncSemaphoreResourceManager
 from multi_agent_pso.retrieval import LocalWikiRetriever
 from multi_agent_pso.runtimes import LocalCodexRuntime
 from multi_agent_pso.storage import FileArtifactStore, SQLiteRunStore
-from multi_agent_pso.tools import JsonCommandProvider, MoleculeEditorProvider
+from multi_agent_pso.tools import JsonCommandProvider
 
 from .inputs import RedAbsorptionRunInputs
-from .preflight import PreflightRecord, verify_red_absorption_preflight
+from .preflight import (
+    PreflightRecord,
+    verify_current_parent,
+    verify_red_absorption_preflight,
+)
 from .stage_context import RedAbsorptionStageContextProvider
 from .workflow import RedAbsorptionWorkflowResources, RedAbsorptionWorkflowToolProvider
 
@@ -54,6 +58,7 @@ async def run_red_absorption_search(
     preflight: PreflightRecord,
     *,
     runs_dir: Path,
+    molecule_editor: object | None = None,
 ) -> dict[str, object]:
     verified = verify_red_absorption_preflight(
         task, loaded, runs_dir, versions=preflight.versions
@@ -64,6 +69,12 @@ async def run_red_absorption_search(
     if spec.pso.population_size != 5 or spec.pso.iterations != 5:
         raise ValueError("red-absorption v1 requires exactly 5 particles x 5 iterations")
     inputs = loaded.value
+    editor = await verify_current_parent(
+        inputs,
+        preflight,
+        runs_dir.parent.resolve(strict=True),
+        molecule_editor=molecule_editor,
+    )
     config_hash = _config_hash(task, loaded, preflight)
     run_id = f"red-{config_hash[:24]}"
     root = runs_dir.resolve(strict=False)
@@ -71,7 +82,6 @@ async def run_red_absorption_search(
     artifacts = FileArtifactStore(root / "artifacts")
     store = SQLiteRunStore(root / "runs.sqlite")
     wiki = LocalWikiRetriever(spec.wiki.path)
-    editor = MoleculeEditorProvider()
     spectrum = JsonCommandProvider(inputs.spectrum_argv)
     workflow_resources = RedAbsorptionWorkflowResources.from_inputs(
         inputs, max_new_evaluations=preflight.max_new_evaluations

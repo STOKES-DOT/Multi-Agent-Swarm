@@ -38,7 +38,7 @@ _HASH = re.compile(r"^[0-9a-f]{64}$")
 _MAX_PREFLIGHT_BYTES = 256 * 1024
 
 
-def _contract_identity(
+def _base_contract_identity(
     task_hash: str,
     raw_hash: str,
     semantic_hash: str,
@@ -62,10 +62,37 @@ def _contract_identity(
     ).hexdigest()
 
 
+def _contract_identity(
+    base_identity: str,
+    parent_state_hash: str,
+    parent_chemical_hash: str,
+    parent_geometry_hash: str,
+    spectrum_hash: str,
+    evaluation_status: str,
+    passed: bool,
+) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "base_identity": base_identity,
+                "parent_state_hash": parent_state_hash,
+                "parent_chemical_hash": parent_chemical_hash,
+                "parent_geometry_hash": parent_geometry_hash,
+                "preflight_spectrum_hash": spectrum_hash,
+                "spectrum_evaluation_status": evaluation_status,
+                "passed": passed,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 class PreflightRecord(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     identity: str = Field(pattern=r"^[0-9a-f]{64}$")
+    base_identity: str = Field(pattern=r"^[0-9a-f]{64}$")
     task_snapshot_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     input_raw_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     input_semantic_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -114,7 +141,7 @@ class PreflightRecord(BaseModel):
 
     @model_validator(mode="after")
     def validate_identity(self) -> "PreflightRecord":
-        expected = _contract_identity(
+        expected_base = _base_contract_identity(
             self.task_snapshot_hash,
             self.input_raw_hash,
             self.input_semantic_hash,
@@ -122,7 +149,16 @@ class PreflightRecord(BaseModel):
             self.versions,
             self.max_new_evaluations,
         )
-        if self.identity != expected:
+        expected = _contract_identity(
+            expected_base,
+            self.parent_state_hash,
+            self.parent_chemical_hash,
+            self.parent_geometry_hash,
+            self.preflight_spectrum_hash,
+            self.spectrum_evaluation_status,
+            self.passed,
+        )
+        if self.base_identity != expected_base or self.identity != expected:
             raise ValueError("preflight identity does not match its contract fields")
         return self
 
@@ -157,6 +193,65 @@ def _parent_source(inputs: RedAbsorptionRunInputs) -> dict[str, object]:
     if parent.kind == "chemical_graph":
         return {"kind": "chemical_graph", "value": parent.value}
     return {"kind": "path", "path": parent.path, "format": parent.format}
+
+
+async def verify_current_parent(
+    inputs: RedAbsorptionRunInputs,
+    record: PreflightRecord,
+    cwd: Path,
+    *,
+    molecule_editor: object | None = None,
+) -> object:
+    if not isinstance(inputs, RedAbsorptionRunInputs):
+        raise TypeError("inputs must be RedAbsorptionRunInputs")
+    if not isinstance(record, PreflightRecord) or record.passed is not True:
+        raise ValueError("a passing PreflightRecord is required")
+    if not isinstance(cwd, Path):
+        raise TypeError("cwd must be a Path")
+    workspace = cwd.resolve(strict=True)
+    if not workspace.is_dir():
+        raise ValueError("parent verification cwd must be an existing directory")
+    editor = molecule_editor or MoleculeEditorProvider()
+    try:
+        inspection = await editor.inspect(
+            _parent_source(inputs),
+            cwd=workspace,
+            geometry=inputs.geometry.model_dump(mode="json"),
+            timeout=inputs.spectrum_timeout_seconds,
+        )
+        if (
+            not inspection.processed
+            or inspection.chemical_status != "VALID"
+            or inspection.geometry_status != "READY"
+            or not inspection.ready_for_evaluator
+            or inspection.candidate is None
+            or inspection.payload is None
+        ):
+            raise ValueError("current parent is not evaluator-ready")
+        graph = inspection.candidate
+        atom_ids = {atom["atom_id"] for atom in graph["atoms"]}
+        actual = (
+            graph.get("state_hash"),
+            graph.get("chemical_identity_hash"),
+            inspection.payload.get("geometry_hash"),
+            graph.get("total_charge"),
+            graph.get("multiplicity"),
+        )
+        expected = (
+            record.parent_state_hash,
+            record.parent_chemical_hash,
+            record.parent_geometry_hash,
+            inputs.parent.charge,
+            inputs.parent.multiplicity,
+        )
+        if actual != expected or not set(inputs.parent.protected_atom_ids) <= atom_ids:
+            raise ValueError("current parent differs from preflight evidence")
+        return editor
+    except BaseException:
+        close = getattr(editor, "aclose", None)
+        if callable(close):
+            await close()
+        raise
 
 
 async def _default_auth_probe() -> Mapping[str, object]:
@@ -197,7 +292,7 @@ def _versions(dependencies: PreflightDependencies) -> dict[str, str]:
 
 
 def _identity(task: object, loaded: LoadedRunInputs, versions: Mapping[str, str]) -> str:
-    return _contract_identity(
+    return _base_contract_identity(
         task.snapshot_hash,
         loaded.raw_sha256,
         loaded.semantic_sha256,
@@ -280,10 +375,24 @@ async def preflight_red_absorption(
         if result.provenance.protocol != inputs.calculation_protocol or result.provenance.geometry_hash != geometry_hash:
             raise ValueError("preflight spectrum provenance mismatch")
         evaluation = RedAbsorptionEvaluator().evaluate_spectrum(result)
+        if result.status != "SUCCESS" or evaluation.status.value != "SUCCESS":
+            raise ValueError(
+                "preflight requires SUCCESS spectrum and evaluation status"
+            )
         protocol = inputs.calculation_protocol
-        identity = _identity(task, loaded, versions)
+        base_identity = _identity(task, loaded, versions)
+        identity = _contract_identity(
+            base_identity,
+            state_hash,
+            chemical_hash,
+            geometry_hash,
+            result.spectrum_hash,
+            evaluation.status.value,
+            True,
+        )
         record = PreflightRecord(
             identity=identity,
+            base_identity=base_identity,
             task_snapshot_hash=task.snapshot_hash,
             input_raw_hash=loaded.raw_sha256,
             input_semantic_hash=loaded.semantic_sha256,
@@ -371,7 +480,7 @@ def verify_red_absorption_preflight(
             record = PreflightRecord.model_validate_json(data)
         except ValueError as error:
             raise ValueError("preflight artifact is invalid") from error
-        if record.identity == identity:
+        if record.base_identity == identity:
             matches.append(record)
     if len(matches) != 1:
         raise ValueError("matching preflight artifact is missing or ambiguous")
@@ -403,4 +512,5 @@ __all__ = [
     "load_verified_red_absorption_preflight",
     "preflight_red_absorption",
     "verify_red_absorption_preflight",
+    "verify_current_parent",
 ]
