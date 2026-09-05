@@ -15,11 +15,13 @@ from .models import (
     TopologyConfig,
     WikiConfig,
 )
+from .run_inputs import LoadedRunInputs, load_run_inputs
 
 __all__ = [
     "AgentConfig",
     "ConcurrencyConfig",
     "LoadedPlugins",
+    "LoadedRunInputs",
     "PluginConfig",
     "PsoConfig",
     "RetryConfig",
@@ -33,5 +35,6 @@ __all__ = [
     "ThreadConfig",
     "TopologyConfig",
     "WikiConfig",
+    "load_run_inputs",
     "load_task_package",
 ]
