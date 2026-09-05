@@ -93,6 +93,7 @@ def test_rolled_back_edit_has_no_candidate() -> None:
         "transaction_status": "ROLLED_BACK",
         "rollback": {"preserved": True, "parent_state_hash": HASH},
         "parent_state_hash": HASH,
+        "parent_graph": _graph(),
         "state_hash": None,
         "committed_commands": [],
     }
