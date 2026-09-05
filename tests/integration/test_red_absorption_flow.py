@@ -14,7 +14,10 @@ from examples.red_absorption.adapter import (
 from examples.red_absorption.evaluator import RedAbsorptionEvaluator
 from examples.red_absorption.models import SpectrumResult
 from examples.red_absorption.stage_context import RedAbsorptionStageContextProvider
-from examples.red_absorption.workflow import RedAbsorptionWorkflowToolProvider
+from examples.red_absorption.workflow import (
+    RedAbsorptionWorkflowResources,
+    RedAbsorptionWorkflowToolProvider,
+)
 from multi_agent_pso.core import AgentStage, EpisodeStatus, EvaluationStatus
 from multi_agent_pso.core.topology import RingTopology
 from multi_agent_pso.core.update_rule import ConstrictedUpdateRule
@@ -289,11 +292,12 @@ def make_runner(tmp_path: Path):
     stage_provider = RedAbsorptionStageContextProvider(inputs, wiki, editor)
     runtime = SchemaRuntime(order)
     cache = {}
+    workflow_resources = RedAbsorptionWorkflowResources.from_inputs(inputs, cache)
     tool = RedAbsorptionWorkflowToolProvider.bind(
         inputs,
         editor,
+        workflow_resources,
         spectrum=RecordingSpectrum(inputs.spectrum_argv, order),
-        cache=cache,
         own_spectrum=True,
     )
     adapter = RedAbsorptionTaskAdapter()
@@ -398,7 +402,11 @@ async def test_illegal_edit_never_runs_spectrum_and_failed_spectrum_has_no_fitne
     editor = FakeEditor([], parent_graph())
     spectrum = RecordingSpectrum(inputs.spectrum_argv, [])
     tool = RedAbsorptionWorkflowToolProvider.bind(
-        inputs, editor, spectrum=spectrum, own_spectrum=True
+        inputs,
+        editor,
+        RedAbsorptionWorkflowResources.from_inputs(inputs),
+        spectrum=spectrum,
+        own_spectrum=True,
     )
     request, context = authorized_request_context(
         [{"operation": "replace_atom", "atom_id": "a9999", "atomic_number": 7}],
@@ -427,6 +435,7 @@ async def test_unready_editor_results_never_start_spectrum(
     tool = RedAbsorptionWorkflowToolProvider.bind(
         inputs,
         editor,
+        RedAbsorptionWorkflowResources.from_inputs(inputs),
         spectrum=RecordingSpectrum(inputs.spectrum_argv, order),
         own_spectrum=True,
     )
@@ -450,7 +459,11 @@ async def test_spectrum_cache_key_requires_all_four_identity_components(tmp_path
     editor = FakeEditor([], parent_graph())
     spectrum = RecordingSpectrum(inputs.spectrum_argv, [])
     tool = RedAbsorptionWorkflowToolProvider.bind(
-        inputs, editor, spectrum=spectrum, cache=cache, own_spectrum=True
+        inputs,
+        editor,
+        RedAbsorptionWorkflowResources.from_inputs(inputs, cache),
+        spectrum=spectrum,
+        own_spectrum=True,
     )
     commands = [{"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}]
     request, context = authorized_request_context(commands, tmp_path.resolve())
@@ -484,7 +497,10 @@ async def test_workflow_maps_spectrum_process_boundaries(
 ):
     inputs = load_valid_inputs(tmp_path)
     tool = RedAbsorptionWorkflowToolProvider.bind(
-        inputs, FakeEditor([], parent_graph()), spectrum=spectrum
+        inputs,
+        FakeEditor([], parent_graph()),
+        RedAbsorptionWorkflowResources.from_inputs(inputs),
+        spectrum=spectrum,
     )
     request, context = authorized_request_context(
         [{"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}],

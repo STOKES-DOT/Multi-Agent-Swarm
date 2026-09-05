@@ -4,7 +4,7 @@ from .adapter import DIMENSION_NAMES, RedAbsorptionTaskAdapter
 from .evaluator import RedAbsorptionEvaluator
 from .inputs import MoleculeEditorGeometryConfig, ParentSource, RedAbsorptionRunInputs
 from .stage_context import RedAbsorptionStageContextProvider
-from .workflow import RedAbsorptionWorkflowToolProvider
+from .workflow import RedAbsorptionWorkflowResources, RedAbsorptionWorkflowToolProvider
 from .models import (
     CalculationProtocol,
     ExcitedState,
@@ -24,6 +24,7 @@ __all__ = [
     "RedAbsorptionTaskAdapter",
     "RedAbsorptionStageContextProvider",
     "RedAbsorptionWorkflowToolProvider",
+    "RedAbsorptionWorkflowResources",
     "SpectrumError",
     "SpectrumProvenance",
     "SpectrumResult",

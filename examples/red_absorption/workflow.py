@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping, MutableMapping
 import re
+import threading
 from typing import Protocol
 
 from multi_agent_pso.core import AgentStage
@@ -45,6 +46,64 @@ class MoleculeEditorLike(Protocol):
     ): ...
 
 
+class RedAbsorptionWorkflowResources:
+    """Run-scoped cache, concurrency gate, locks, and counters bound to one event loop."""
+
+    def __init__(
+        self,
+        inputs: RedAbsorptionRunInputs,
+        cache: MutableMapping[CacheKey, SpectrumResult],
+    ):
+        self._concurrency = inputs.evaluation_concurrency
+        self._protocol_hash = inputs.calculation_protocol.protocol_hash
+        self._cache = cache
+        self._locks: dict[CacheKey, asyncio.Lock] = {}
+        self._locks_guard = asyncio.Lock()
+        self._spectrum_slots = asyncio.Semaphore(self._concurrency)
+        self._execution_count = 0
+        self._cache_hit_count = 0
+        self._loop = None
+        self._loop_guard = threading.Lock()
+
+    @classmethod
+    def from_inputs(
+        cls,
+        inputs: RedAbsorptionRunInputs,
+        cache: MutableMapping[CacheKey, SpectrumResult] | None = None,
+    ) -> "RedAbsorptionWorkflowResources":
+        if not isinstance(inputs, RedAbsorptionRunInputs):
+            raise TypeError("inputs must be RedAbsorptionRunInputs")
+        if cache is not None and not isinstance(cache, MutableMapping):
+            raise TypeError("cache must be a mutable mapping")
+        return cls(inputs, {} if cache is None else cache)
+
+    @property
+    def concurrency(self) -> int:
+        return self._concurrency
+
+    @property
+    def execution_count(self) -> int:
+        return self._execution_count
+
+    @property
+    def cache_hit_count(self) -> int:
+        return self._cache_hit_count
+
+    def _bind_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        with self._loop_guard:
+            if self._loop is None:
+                self._loop = loop
+            elif self._loop is not loop:
+                raise RuntimeError(
+                    "workflow resources cannot be used across event loops"
+                )
+
+    async def _lock_for(self, key: CacheKey) -> asyncio.Lock:
+        async with self._locks_guard:
+            return self._locks.setdefault(key, asyncio.Lock())
+
+
 def _parent_source(inputs: RedAbsorptionRunInputs) -> dict[str, object]:
     parent = inputs.parent
     if parent.kind == "smiles":
@@ -61,16 +120,11 @@ class RedAbsorptionWorkflowToolProvider:
         self._inputs: RedAbsorptionRunInputs | None = None
         self._editor: MoleculeEditorLike | None = None
         self._spectrum: JsonCommandProvider | None = None
+        self._resources: RedAbsorptionWorkflowResources | None = None
         self._own_spectrum = False
-        self._cache: MutableMapping[CacheKey, SpectrumResult] = {}
-        self._locks: dict[CacheKey, asyncio.Lock] = {}
-        self._locks_guard = asyncio.Lock()
-        self._spectrum_slots = asyncio.Semaphore(1)
         self._state_lock = asyncio.Lock()
         self._active: set[asyncio.Event] = set()
         self._closing = False
-        self._execution_count = 0
-        self._cache_hit_count = 0
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
 
@@ -79,9 +133,9 @@ class RedAbsorptionWorkflowToolProvider:
         cls,
         inputs: RedAbsorptionRunInputs,
         molecule_editor: MoleculeEditorLike,
+        resources: RedAbsorptionWorkflowResources,
         *,
         spectrum: JsonCommandProvider | None = None,
-        cache: MutableMapping[CacheKey, SpectrumResult] | None = None,
         own_spectrum: bool | None = None,
     ) -> "RedAbsorptionWorkflowToolProvider":
         """Bind a run. Injected editor/cache are caller-owned; spectrum ownership is explicit."""
@@ -91,10 +145,17 @@ class RedAbsorptionWorkflowToolProvider:
             getattr(molecule_editor, "edit", None)
         ):
             raise TypeError("molecule_editor must provide inspect and edit")
+        if not isinstance(resources, RedAbsorptionWorkflowResources):
+            raise TypeError("resources must be RedAbsorptionWorkflowResources")
+        if (
+            resources.concurrency != inputs.evaluation_concurrency
+            or resources._protocol_hash != inputs.calculation_protocol.protocol_hash
+        ):
+            raise ValueError("workflow resources do not match run inputs")
         instance = cls()
         instance._inputs = inputs
         instance._editor = molecule_editor
-        instance._spectrum_slots = asyncio.Semaphore(inputs.evaluation_concurrency)
+        instance._resources = resources
         if spectrum is None:
             instance._spectrum = JsonCommandProvider(inputs.spectrum_argv)
             instance._own_spectrum = True
@@ -107,25 +168,19 @@ class RedAbsorptionWorkflowToolProvider:
             raise TypeError("own_spectrum must be boolean")
         if own_spectrum is not None and spectrum is None and own_spectrum is not True:
             raise ValueError("internally created spectrum provider must be owned")
-        if cache is not None and not isinstance(cache, MutableMapping):
-            raise TypeError("cache must be a mutable mapping")
-        if cache is not None:
-            instance._cache = cache
         return instance
 
     @property
     def execution_count(self) -> int:
-        return self._execution_count
+        return 0 if self._resources is None else self._resources.execution_count
 
     @property
     def cache_hit_count(self) -> int:
-        return self._cache_hit_count
-
-    async def _lock_for(self, key: CacheKey) -> asyncio.Lock:
-        async with self._locks_guard:
-            return self._locks.setdefault(key, asyncio.Lock())
+        return 0 if self._resources is None else self._resources.cache_hit_count
 
     async def execute(self, request: ToolRequest, context: ToolContext) -> ToolResult:
+        if self._resources is not None:
+            self._resources._bind_loop()
         active = asyncio.Event()
         async with self._state_lock:
             if self._closing or self._closed:
@@ -143,7 +198,12 @@ class RedAbsorptionWorkflowToolProvider:
     async def _execute_active(
         self, request: ToolRequest, context: ToolContext
     ) -> ToolResult:
-        if self._inputs is None or self._editor is None or self._spectrum is None:
+        if (
+            self._inputs is None
+            or self._editor is None
+            or self._spectrum is None
+            or self._resources is None
+        ):
             return ToolResult(
                 ToolStatus.REJECTED,
                 error="red-absorption workflow requires validated run inputs",
@@ -174,6 +234,7 @@ class RedAbsorptionWorkflowToolProvider:
                 error="tool request differs from persisted proposal",
             )
         inputs = self._inputs
+        resources = self._resources
         geometry = inputs.geometry.model_dump(mode="json")
         try:
             inspection = await self._editor.inspect(
@@ -261,17 +322,17 @@ class RedAbsorptionWorkflowToolProvider:
             inputs.calculation_protocol.protocol_hash,
             EVALUATOR_VERSION,
         )
-        lock = await self._lock_for(key)
+        lock = await resources._lock_for(key)
         async with lock:
-            spectrum_result = self._cache.get(key)
+            spectrum_result = resources._cache.get(key)
             if spectrum_result is None:
-                async with self._spectrum_slots:
-                    spectrum_result = self._cache.get(key)
+                async with resources._spectrum_slots:
+                    spectrum_result = resources._cache.get(key)
                     if spectrum_result is not None:
-                        self._cache_hit_count += 1
+                        resources._cache_hit_count += 1
                         cache_hit = True
                     else:
-                        self._execution_count += 1
+                        resources._execution_count += 1
                         command_result = await self._spectrum.execute_json(
                             {
                                 "candidate": payload,
@@ -314,7 +375,7 @@ class RedAbsorptionWorkflowToolProvider:
                             return ToolResult(
                                 ToolStatus.FAILED, error="spectrum provenance mismatch"
                             )
-                        self._cache[key] = spectrum_result
+                        resources._cache[key] = spectrum_result
                         cache_hit = False
             else:
                 if (
@@ -326,7 +387,7 @@ class RedAbsorptionWorkflowToolProvider:
                     return ToolResult(
                         ToolStatus.FAILED, error="cached spectrum provenance mismatch"
                     )
-                self._cache_hit_count += 1
+                resources._cache_hit_count += 1
                 cache_hit = True
         result_payload = _plain_json(payload)
         result_payload.update(
@@ -339,6 +400,8 @@ class RedAbsorptionWorkflowToolProvider:
         return ToolResult(ToolStatus.SUCCESS, result_payload)
 
     async def aclose(self) -> None:
+        if self._resources is not None:
+            self._resources._bind_loop()
         async with self._state_lock:
             if self._closed:
                 return
@@ -366,4 +429,8 @@ class RedAbsorptionWorkflowToolProvider:
             self._closing = False
 
 
-__all__ = ["CacheKey", "RedAbsorptionWorkflowToolProvider"]
+__all__ = [
+    "CacheKey",
+    "RedAbsorptionWorkflowResources",
+    "RedAbsorptionWorkflowToolProvider",
+]

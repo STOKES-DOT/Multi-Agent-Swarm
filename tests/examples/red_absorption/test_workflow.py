@@ -7,7 +7,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from examples.red_absorption.workflow import RedAbsorptionWorkflowToolProvider
+from examples.red_absorption.workflow import (
+    RedAbsorptionWorkflowResources,
+    RedAbsorptionWorkflowToolProvider,
+)
 from multi_agent_pso.tools import JsonCommandProvider, JsonCommandStatus
 from tests.fixtures.red_absorption import load_valid_inputs
 from tests.integration.test_red_absorption_flow import (
@@ -97,7 +100,13 @@ async def test_spectrum_semaphore_limits_different_cache_keys(
     inputs = inputs_with_concurrency(tmp_path, limit)
     spectrum = DelayedSpectrum()
     editor = VariableEditor([], parent_graph())
-    tool = RedAbsorptionWorkflowToolProvider.bind(inputs, editor, spectrum=spectrum)
+    resources = RedAbsorptionWorkflowResources.from_inputs(inputs)
+    tools = [
+        RedAbsorptionWorkflowToolProvider.bind(
+            inputs, editor, resources, spectrum=spectrum
+        )
+        for _ in range(2)
+    ]
     pairs = [
         authorized_request_context(
             [
@@ -112,10 +121,72 @@ async def test_spectrum_semaphore_limits_different_cache_keys(
         for number in (7, 8)
     ]
     results = await asyncio.gather(
-        *(tool.execute(request, context) for request, context in pairs)
+        *(
+            tool.execute(request, context)
+            for tool, (request, context) in zip(tools, pairs, strict=True)
+        )
     )
     assert all(result.status.value == "SUCCESS" for result in results)
-    assert spectrum.max_active == expected and tool.execution_count == 2
+    assert spectrum.max_active == expected and resources.execution_count == 2
+
+
+@pytest.mark.asyncio
+async def test_same_key_is_single_flight_across_providers(tmp_path):
+    inputs = inputs_with_concurrency(tmp_path, 2)
+    resources = RedAbsorptionWorkflowResources.from_inputs(inputs)
+    spectra = [DelayedSpectrum(), DelayedSpectrum()]
+    tools = [
+        RedAbsorptionWorkflowToolProvider.bind(
+            inputs,
+            VariableEditor([], parent_graph()),
+            resources,
+            spectrum=spectra[index],
+        )
+        for index in range(2)
+    ]
+    pair = authorized_request_context(
+        [{"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}],
+        tmp_path.resolve(),
+    )
+    results = await asyncio.gather(*(tool.execute(*pair) for tool in tools))
+    assert all(result.status.value == "SUCCESS" for result in results)
+    assert resources.execution_count == 1 and resources.cache_hit_count == 1
+    assert sum(spectrum.calls for spectrum in spectra) == 1
+
+
+@pytest.mark.asyncio
+async def test_different_run_resources_are_independent(tmp_path):
+    inputs = inputs_with_concurrency(tmp_path, 1)
+    spectrum = DelayedSpectrum()
+    resources = [RedAbsorptionWorkflowResources.from_inputs(inputs) for _ in range(2)]
+    tools = [
+        RedAbsorptionWorkflowToolProvider.bind(
+            inputs,
+            VariableEditor([], parent_graph()),
+            resources[index],
+            spectrum=spectrum,
+        )
+        for index in range(2)
+    ]
+    pairs = [
+        authorized_request_context(
+            [
+                {
+                    "operation": "replace_atom",
+                    "atom_id": "a0001",
+                    "atomic_number": number,
+                }
+            ],
+            tmp_path.resolve(),
+        )
+        for number in (7, 8)
+    ]
+    await asyncio.gather(
+        *(tool.execute(*pair) for tool, pair in zip(tools, pairs, strict=True))
+    )
+    assert spectrum.max_active == 2 and [
+        resource.execution_count for resource in resources
+    ] == [1, 1]
 
 
 @pytest.mark.asyncio
@@ -124,7 +195,11 @@ async def test_close_waits_for_active_and_concurrent_callers_share_cleanup(tmp_p
     spectrum = DelayedSpectrum()
     editor = VariableEditor([], parent_graph())
     tool = RedAbsorptionWorkflowToolProvider.bind(
-        inputs, editor, spectrum=spectrum, own_spectrum=True
+        inputs,
+        editor,
+        RedAbsorptionWorkflowResources.from_inputs(inputs),
+        spectrum=spectrum,
+        own_spectrum=True,
     )
     request, context = authorized_request_context(
         [{"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}],
@@ -147,7 +222,10 @@ def test_evaluator_version_override_is_not_part_of_bind_api(tmp_path):
     inputs = inputs_with_concurrency(tmp_path, 1)
     with pytest.raises(TypeError):
         RedAbsorptionWorkflowToolProvider.bind(
-            inputs, VariableEditor([], parent_graph()), evaluator_version="other"
+            inputs,
+            VariableEditor([], parent_graph()),
+            RedAbsorptionWorkflowResources.from_inputs(inputs),
+            evaluator_version="other",
         )
 
 
@@ -156,7 +234,11 @@ async def test_cancelled_close_continues_and_close_failure_can_retry(tmp_path):
     inputs = inputs_with_concurrency(tmp_path, 1)
     spectrum = ControlledCloseSpectrum()
     tool = RedAbsorptionWorkflowToolProvider.bind(
-        inputs, VariableEditor([], parent_graph()), spectrum=spectrum, own_spectrum=True
+        inputs,
+        VariableEditor([], parent_graph()),
+        RedAbsorptionWorkflowResources.from_inputs(inputs),
+        spectrum=spectrum,
+        own_spectrum=True,
     )
     caller = asyncio.create_task(tool.aclose())
     await spectrum.started.wait()
@@ -170,7 +252,11 @@ async def test_cancelled_close_continues_and_close_failure_can_retry(tmp_path):
     failing = ControlledCloseSpectrum(fail_first=True)
     failing.release.set()
     retry = RedAbsorptionWorkflowToolProvider.bind(
-        inputs, VariableEditor([], parent_graph()), spectrum=failing, own_spectrum=True
+        inputs,
+        VariableEditor([], parent_graph()),
+        RedAbsorptionWorkflowResources.from_inputs(inputs),
+        spectrum=failing,
+        own_spectrum=True,
     )
     with pytest.raises(RuntimeError):
         await retry.aclose()
