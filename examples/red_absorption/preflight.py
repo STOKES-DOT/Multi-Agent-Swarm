@@ -32,7 +32,7 @@ from multi_agent_pso import __version__
 from multi_agent_pso.configuration import LoadedRunInputs, load_run_inputs, load_task_package
 from multi_agent_pso.core import ArtifactRef
 from multi_agent_pso.storage import FileArtifactStore
-from multi_agent_pso.resources import SQLiteBudgetLedger
+from multi_agent_pso.resources import DurableBudgetLedger
 from multi_agent_pso.tools import JsonCommandProvider, MoleculeEditorProvider
 
 from .evaluator import RedAbsorptionEvaluator
@@ -75,7 +75,7 @@ def _validate_storage_target(runs_dir: Path) -> None:
                     directory_metadata.st_mode
                 ):
                     raise ValueError(f"{name} storage namespace is unsafe")
-        for name in ("runs.sqlite", "evaluation_budget.sqlite"):
+        for name in ("runs.sqlite", "evaluation_budget.jsonl"):
             database = runs_dir / name
             if database.exists() or database.is_symlink():
                 database_metadata = os.lstat(database)
@@ -130,9 +130,10 @@ def _validate_storage_target(runs_dir: Path) -> None:
                     connection.close()
             except sqlite3.Error as error:
                 raise ValueError("runs.sqlite does not support required locking") from error
-        budget_database = runs_dir / "evaluation_budget.sqlite"
-        if budget_database.exists():
-            SQLiteBudgetLedger(budget_database)
+        budget_ledger = runs_dir / "evaluation_budget.jsonl"
+        if budget_ledger.exists():
+            ledger = DurableBudgetLedger(budget_ledger)
+            ledger.close()
     if not all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW")):
         raise RuntimeError("run storage claims require POSIX no-follow support")
     probe_parent = absolute if absolute.exists() else parent

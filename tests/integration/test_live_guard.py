@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import pytest
 from types import SimpleNamespace
 
@@ -8,7 +9,7 @@ from multi_agent_pso.cli import main
 from multi_agent_pso.resources import (
     AsyncSemaphoreResourceManager,
     BudgetClaimStatus,
-    SQLiteBudgetLedger,
+    DurableBudgetLedger,
 )
 from examples.red_absorption.search import _particle_workspace
 
@@ -54,17 +55,17 @@ def test_particle_workspace_rejects_unsafe_single_components(
         _particle_workspace(tmp_path, run_id, particle_id)
 
 
-def test_sqlite_budget_reservation_is_atomic_persistent_and_cache_reopenable(tmp_path):
+def test_durable_budget_reservation_is_atomic_persistent_and_cache_reopenable(tmp_path):
     import threading
 
-    path = tmp_path / "budget.sqlite"
-    ledger = SQLiteBudgetLedger(path)
+    path = tmp_path / "budget.jsonl"
+    ledgers = [DurableBudgetLedger(path), DurableBudgetLedger(path)]
     barrier = threading.Barrier(30)
     accepted = []
 
     def reserve(index):
         barrier.wait()
-        if ledger.reserve("run-1", f"key-{index}", 25):
+        if ledgers[index % 2].reserve("run-1", f"key-{index}", 25):
             accepted.append(index)
 
     threads = [threading.Thread(target=reserve, args=(index,)) for index in range(30)]
@@ -72,60 +73,84 @@ def test_sqlite_budget_reservation_is_atomic_persistent_and_cache_reopenable(tmp
         thread.start()
     for thread in threads:
         thread.join()
-    assert len(accepted) == ledger.count("run-1") == 25
+    assert len(accepted) == ledgers[0].count("run-1") == 25
     key = f"key-{accepted[0]}"
-    ledger.commit("run-1", key, {"spectrum": "cached"})
-    reopened = SQLiteBudgetLedger(path)
+    ledgers[0].commit("run-1", key, {"spectrum": "cached"})
+    reopened = DurableBudgetLedger(path)
     assert reopened.get("run-1", key) == {"spectrum": "cached"}
     assert not reopened.reserve("run-1", "overflow", 25)
 
 
-def test_sqlite_budget_ledger_rejects_symlink_and_hostile_payload(tmp_path):
-    target = tmp_path / "target.sqlite"
+def test_durable_budget_ledger_rejects_symlink_and_hostile_payload(tmp_path):
+    target = tmp_path / "target.jsonl"
     target.write_bytes(b"unchanged")
-    link = tmp_path / "budget.sqlite"
+    link = tmp_path / "budget.jsonl"
     link.symlink_to(target)
     with pytest.raises(ValueError, match="symlink|regular"):
-        SQLiteBudgetLedger(link)
+        DurableBudgetLedger(link)
     assert target.read_bytes() == b"unchanged"
 
-    ledger = SQLiteBudgetLedger(tmp_path / "safe.sqlite")
+    ledger = DurableBudgetLedger(tmp_path / "safe.jsonl")
     assert ledger.reserve("run", "key", 1)
     with pytest.raises((TypeError, ValueError)):
         ledger.commit("run", "key", {"bad": float("nan")})
 
 
-def test_sqlite_budget_ledger_rejects_symlinked_parent_and_is_private(tmp_path):
+def test_durable_budget_ledger_rejects_symlinked_parent_and_is_private(tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
     linked_parent = tmp_path / "linked"
     linked_parent.symlink_to(outside, target_is_directory=True)
     with pytest.raises(ValueError, match="symlink|directory|unsafe"):
-        SQLiteBudgetLedger(linked_parent / "budget.sqlite")
+        DurableBudgetLedger(linked_parent / "budget.jsonl")
     assert not (outside / "budget.sqlite").exists()
 
-    database = tmp_path / "private.sqlite"
-    SQLiteBudgetLedger(database)
+    database = tmp_path / "private.jsonl"
+    DurableBudgetLedger(database)
     assert database.stat().st_mode & 0o777 == 0o600
 
 
-def test_sqlite_budget_ledger_is_first_wins_and_strict_on_read(tmp_path):
-    import sqlite3
+def test_durable_budget_ledger_never_reopens_replaced_namespace(tmp_path):
+    path = tmp_path / "budget.jsonl"
+    outside = tmp_path / "outside.jsonl"
+    outside.write_bytes(b"unchanged")
+    ledger = DurableBudgetLedger(path)
+    assert ledger.reserve("run", "key", 1)
+    path.unlink()
+    path.symlink_to(outside)
+    with pytest.raises(ValueError, match="namespace|identity"):
+        ledger.count("run")
+    assert outside.read_bytes() == b"unchanged"
+    ledger.close()
 
-    database = tmp_path / "budget.sqlite"
-    ledger = SQLiteBudgetLedger(database)
+
+def test_durable_budget_ledger_is_first_wins_and_strict_on_read(tmp_path):
+    database = tmp_path / "budget.jsonl"
+    ledger = DurableBudgetLedger(database)
     assert ledger.reserve("run", "key", 1)
     ledger.commit("run", "key", {"value": 1})
     ledger.commit("run", "key", {"value": 1})
     with pytest.raises(ValueError, match="different|conflict|committed"):
         ledger.commit("run", "key", {"value": 2})
-    with sqlite3.connect(database) as connection:
-        connection.execute(
-            "UPDATE budget_entries SET payload_json = ? WHERE run_id = ? AND item_key = ?",
-            ('{"x":1,"x":2}', "run", "key"),
-        )
+    ledger.close()
+    limit = json.dumps(
+        {"version": 1, "operation": "limit", "run_id": "run", "item_limit": 1},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    reserve = json.dumps(
+        {"version": 1, "operation": "reserve", "run_id": "run", "item_key": "key"},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    duplicate = (
+        '{"item_key":"key","operation":"commit","payload":'
+        '{"x":1,"x":2},"run_id":"run","version":1}'
+    )
+    database.write_text(f"{limit}\n{reserve}\n{duplicate}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="duplicate|JSON"):
-        ledger.get("run", "key")
+        DurableBudgetLedger(database)
+    ledger = DurableBudgetLedger(tmp_path / "identifiers.jsonl")
     for method, args in (
         (ledger.get, (123, "key")),
         (ledger.count, (123,)),
@@ -135,8 +160,8 @@ def test_sqlite_budget_ledger_is_first_wins_and_strict_on_read(tmp_path):
             method(*args)
 
 
-def test_sqlite_budget_ledger_distinguishes_pending_completed_and_exhausted(tmp_path):
-    ledger = SQLiteBudgetLedger(tmp_path / "budget.sqlite")
+def test_durable_budget_ledger_distinguishes_pending_completed_and_exhausted(tmp_path):
+    ledger = DurableBudgetLedger(tmp_path / "budget.jsonl")
     assert ledger.claim("run", "first", 1) is BudgetClaimStatus.RESERVED
     assert ledger.claim("run", "first", 1) is BudgetClaimStatus.PENDING
     assert ledger.claim("run", "second", 1) is BudgetClaimStatus.EXHAUSTED

@@ -15,7 +15,7 @@ from multi_agent_pso.core.topology import RingTopology
 from multi_agent_pso.core.update_rule import ConstrictedUpdateRule
 from multi_agent_pso.orchestration import AgentLoop, SynchronousSwarmRunner
 from multi_agent_pso.reporting import build_run_report_from_store, publish_run_report
-from multi_agent_pso.resources import AsyncSemaphoreResourceManager, SQLiteBudgetLedger
+from multi_agent_pso.resources import AsyncSemaphoreResourceManager, DurableBudgetLedger
 from multi_agent_pso.retrieval import LocalWikiRetriever
 from multi_agent_pso.runtimes import LocalCodexRuntime
 from multi_agent_pso.storage import FileArtifactStore, SQLiteRunStore
@@ -138,12 +138,12 @@ async def run_red_absorption_search(
 ) -> dict[str, object]:
     if runs_dir.is_symlink():
         raise ValueError("runs_dir must not be a symlink")
-    budget_target = runs_dir / "evaluation_budget.sqlite"
+    budget_target = runs_dir / "evaluation_budget.jsonl"
     if budget_target.is_symlink() or (
         budget_target.exists()
         and not stat.S_ISREG(os.lstat(budget_target).st_mode)
     ):
-        raise ValueError("evaluation budget database target is unsafe")
+        raise ValueError("evaluation budget ledger target is unsafe")
     verified = verify_red_absorption_preflight(
         task, loaded, runs_dir, versions=current_preflight_versions()
     )
@@ -160,6 +160,7 @@ async def run_red_absorption_search(
         molecule_editor=molecule_editor,
     )
     spectrum = None
+    budget_ledger = None
     try:
         config_hash = _config_hash(task, loaded, preflight)
         run_id = f"red-{config_hash[:24]}"
@@ -168,10 +169,11 @@ async def run_red_absorption_search(
         store = SQLiteRunStore(root / "runs.sqlite")
         wiki = LocalWikiRetriever(spec.wiki.path)
         spectrum = JsonCommandProvider(inputs.spectrum_argv)
+        budget_ledger = DurableBudgetLedger(root / "evaluation_budget.jsonl")
         workflow_resources = RedAbsorptionWorkflowResources.from_inputs(
             inputs,
             max_new_evaluations=preflight.max_new_evaluations,
-            ledger=SQLiteBudgetLedger(root / "evaluation_budget.sqlite"),
+            ledger=budget_ledger,
             run_id=run_id,
         )
         slots = AsyncSemaphoreResourceManager(
@@ -182,6 +184,14 @@ async def run_red_absorption_search(
         tools: list[RedAbsorptionWorkflowToolProvider] = []
         runtime = LocalCodexRuntime(model=spec.agent.model)
     except BaseException as primary:
+        if budget_ledger is not None:
+            try:
+                budget_ledger.close()
+            except BaseException as cleanup_error:
+                primary.add_note(
+                    "search initialization cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
         for resource in (spectrum, editor):
             if resource is None:
                 continue
@@ -260,6 +270,11 @@ async def run_red_absorption_search(
             )
             if isinstance(result, BaseException)
         ]
+        if budget_ledger is not None:
+            try:
+                budget_ledger.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
         for resource in (spectrum, editor):
             try:
                 await resource.aclose()

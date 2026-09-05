@@ -12,7 +12,7 @@ from examples.red_absorption.workflow import (
     RedAbsorptionWorkflowToolProvider,
     _violates_protection_policy,
 )
-from multi_agent_pso.resources import SQLiteBudgetLedger
+from multi_agent_pso.resources import DurableBudgetLedger
 from multi_agent_pso.tools import JsonCommandProvider, JsonCommandStatus
 from tests.fixtures.red_absorption import load_valid_inputs
 from tests.integration.test_red_absorption_flow import (
@@ -295,7 +295,7 @@ def test_protected_atom_gate_covers_entire_discarded_bridge_component(
 @pytest.mark.asyncio
 async def test_same_persistent_key_waits_for_completed_cache_across_instances(tmp_path):
     inputs = inputs_with_concurrency(tmp_path, 2)
-    ledger = SQLiteBudgetLedger(tmp_path / "budget.sqlite")
+    ledger = DurableBudgetLedger(tmp_path / "budget.jsonl")
     resources = [
         RedAbsorptionWorkflowResources.from_inputs(
             inputs,

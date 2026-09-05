@@ -11,7 +11,7 @@ from typing import Protocol
 from multi_agent_pso.core import AgentStage
 from multi_agent_pso.protocols import ToolContext, ToolRequest, ToolResult, ToolStatus
 from multi_agent_pso.tools import JsonCommandProvider, JsonCommandStatus
-from multi_agent_pso.resources import BudgetClaimStatus, SQLiteBudgetLedger
+from multi_agent_pso.resources import BudgetClaimStatus, DurableBudgetLedger
 
 from .evaluator import EVALUATOR_VERSION
 from .inputs import RedAbsorptionRunInputs
@@ -55,7 +55,7 @@ class RedAbsorptionWorkflowResources:
         inputs: RedAbsorptionRunInputs,
         cache: MutableMapping[CacheKey, SpectrumResult],
         max_new_evaluations: int,
-        ledger: SQLiteBudgetLedger | None,
+        ledger: DurableBudgetLedger | None,
         run_id: str | None,
     ):
         self._concurrency = inputs.evaluation_concurrency
@@ -81,7 +81,7 @@ class RedAbsorptionWorkflowResources:
         cache: MutableMapping[CacheKey, SpectrumResult] | None = None,
         *,
         max_new_evaluations: int = 25,
-        ledger: SQLiteBudgetLedger | None = None,
+        ledger: DurableBudgetLedger | None = None,
         run_id: str | None = None,
     ) -> "RedAbsorptionWorkflowResources":
         if not isinstance(inputs, RedAbsorptionRunInputs):
