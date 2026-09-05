@@ -29,7 +29,6 @@ from multi_agent_pso.protocols import (
     StageRequest,
     StageResponse,
     ToolContext,
-    ToolRequest,
     ToolResult,
     ToolStatus,
 )
@@ -37,6 +36,7 @@ from multi_agent_pso.tools import validate_commands, validate_source
 
 from .evaluator import EVALUATOR_VERSION, RedAbsorptionEvaluator
 from .models import SpectrumResult
+from .workflow import RedAbsorptionWorkflowToolProvider
 
 
 DIMENSION_NAMES = (
@@ -240,11 +240,14 @@ class RedAbsorptionTaskAdapter:
                     )
         inspected_graph = copied.get("inspected_graph")
         inspection = copied.get("inspected_source_hash")
+        inspection_geometry = copied.get("inspected_geometry_hash")
         if stage is AgentStage.PROPOSING_ACTION:
             if (
                 not isinstance(inspected_graph, dict)
                 or not isinstance(inspection, str)
                 or not _HASH.fullmatch(inspection)
+                or not isinstance(inspection_geometry, str)
+                or not _HASH.fullmatch(inspection_geometry)
             ):
                 raise ValueError("proposal context requires inspected graph and hash")
             validated = validate_source(
@@ -264,6 +267,7 @@ class RedAbsorptionTaskAdapter:
             "decoded": decoded,
             "evidence": allowed,
             "inspection": inspection,
+            "inspection_geometry": inspection_geometry,
             "graph": inspected_graph,
             "wiki_query": copied.get("wiki_query"),
         }
@@ -522,6 +526,8 @@ class RedAbsorptionTaskAdapter:
                 "edit_budget": budget,
                 "fragment_heavy_atom_cap": decoded["fragment_heavy_atoms"],
                 "operation_policy": decoded["operation_weights"],
+                "inspected_graph": entry["graph"],
+                "inspected_geometry_hash": entry["inspection_geometry"],
             }
         )
 
@@ -603,6 +609,8 @@ class RedAbsorptionTaskAdapter:
                 "edit_budget",
                 "fragment_heavy_atom_cap",
                 "operation_policy",
+                "inspected_graph",
+                "inspected_geometry_hash",
             }
             or authorized.get("edit_budget") != decoded["edit_budget"]
             or authorized.get("fragment_heavy_atom_cap")
@@ -717,14 +725,6 @@ class RedAbsorptionTaskAdapter:
         }
 
 
-class _UnboundToolProvider:
-    async def execute(self, request: ToolRequest, context: ToolContext) -> ToolResult:
-        return ToolResult(
-            ToolStatus.REJECTED,
-            error="red-absorption tool provider requires validated run inputs",
-        )
-
-
 def create_position_space() -> ContinuousBoxPositionSpace:
     return ContinuousBoxPositionSpace(np.zeros(8), np.ones(8))
 
@@ -733,8 +733,8 @@ def create_task_adapter() -> RedAbsorptionTaskAdapter:
     return RedAbsorptionTaskAdapter()
 
 
-def create_tool_provider() -> _UnboundToolProvider:
-    return _UnboundToolProvider()
+def create_tool_provider() -> RedAbsorptionWorkflowToolProvider:
+    return RedAbsorptionWorkflowToolProvider()
 
 
 def create_evaluator() -> RedAbsorptionEvaluator:

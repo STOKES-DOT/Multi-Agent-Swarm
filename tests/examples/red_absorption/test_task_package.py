@@ -9,6 +9,7 @@ import yaml
 from multi_agent_pso.configuration import load_task_package
 import multi_agent_pso.configuration.loader as loader
 import multi_agent_pso.retrieval.local_wiki as local_wiki
+from examples.red_absorption.workflow import RedAbsorptionWorkflowToolProvider
 from multi_agent_pso.configuration.models import SnapshotConfig
 
 
@@ -43,6 +44,7 @@ def test_task_package_loads_real_maintained_wiki_without_raw_snapshot() -> None:
     assert package.spec.pso.population_size == 5
     assert elapsed < 20
     assert package.plugins.task_adapter is not None
+    assert isinstance(package.plugins.tool_provider, RedAbsorptionWorkflowToolProvider)
     assert len(package.schema_bytes) == 3
     wiki = [entry for entry in package.manifest.entries if entry.role == "wiki"]
     assert wiki and sum(entry.size_bytes for entry in wiki) < 10 * 1024 * 1024

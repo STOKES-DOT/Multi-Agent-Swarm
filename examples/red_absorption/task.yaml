@@ -31,6 +31,7 @@ plugins:
     - __init__.py
     - inputs.py
     - stage_context.py
+    - workflow.py
     - models.py
     - evaluator.py
     - prompts/hypothesize.md

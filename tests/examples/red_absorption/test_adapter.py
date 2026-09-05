@@ -142,6 +142,7 @@ def context(**updates: object) -> dict[str, object]:
             }
         ],
         "inspected_source_hash": HASH,
+        "inspected_geometry_hash": GEOMETRY_HASH,
         "inspected_graph": graph(),
     }
     value.update(updates)

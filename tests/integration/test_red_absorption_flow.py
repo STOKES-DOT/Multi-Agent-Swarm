@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import copy
 import json
 from pathlib import Path
@@ -12,10 +11,11 @@ from examples.red_absorption.adapter import (
     RedAbsorptionTaskAdapter,
     create_position_space,
 )
-from examples.red_absorption.evaluator import EVALUATOR_VERSION, RedAbsorptionEvaluator
+from examples.red_absorption.evaluator import RedAbsorptionEvaluator
 from examples.red_absorption.inputs import RedAbsorptionRunInputs
 from examples.red_absorption.models import SpectrumResult
 from examples.red_absorption.stage_context import RedAbsorptionStageContextProvider
+from examples.red_absorption.workflow import RedAbsorptionWorkflowToolProvider
 from multi_agent_pso.configuration import load_run_inputs
 from multi_agent_pso.core import AgentStage, EpisodeStatus, EvaluationStatus
 from multi_agent_pso.core.topology import RingTopology
@@ -27,6 +27,7 @@ from multi_agent_pso.protocols import (
     StageResponse,
     ThreadRef,
     TokenUsage,
+    ToolContext,
     ToolRequest,
     ToolResult,
     ToolStatus,
@@ -44,6 +45,7 @@ HASH = "a" * 64
 PARENT_HASH = "b" * 64
 CANDIDATE_HASH = "c" * 64
 GEOMETRY_HASH = "d" * 64
+PARENT_GEOMETRY_HASH = "e" * 64
 INPUTS = Path("tests/fixtures/red_absorption/valid-inputs.yaml")
 
 
@@ -52,7 +54,8 @@ def parent_graph() -> dict[str, object]:
 
     value = graph()
     value["state_hash"] = PARENT_HASH
-    value["chemical_identity_hash"] = "e" * 64
+    value["chemical_identity_hash"] = "f" * 64
+    value["geometry_status"] = "READY"
     return value
 
 
@@ -74,16 +77,86 @@ class FakeWiki:
 
 
 class FakeEditor:
-    def __init__(self, order: list[str], graph):
+    def __init__(self, order: list[str], graph, edit_mode: str = "ready"):
         self.order = order
         self.graph = graph
         self.calls = 0
+        self.edit_calls = 0
+        self.geometry_configs = []
+        self.edit_mode = edit_mode
 
     async def inspect(self, source, *, cwd, geometry=None, artifacts=None, timeout=60):
         self.order.append("inspect")
         self.calls += 1
+        self.geometry_configs.append(copy.deepcopy(geometry))
         return SimpleNamespace(
-            processed=True, chemical_status="VALID", candidate=copy.deepcopy(self.graph)
+            processed=True,
+            chemical_status="VALID",
+            geometry_status="READY",
+            ready_for_evaluator=True,
+            candidate=copy.deepcopy(self.graph),
+            payload={"geometry_hash": PARENT_GEOMETRY_HASH},
+        )
+
+    async def edit(
+        self,
+        inspection,
+        commands,
+        *,
+        cwd,
+        geometry=None,
+        artifacts=None,
+        timeout=60,
+        attempt=1,
+    ):
+        self.order.append("edit")
+        self.edit_calls += 1
+        self.geometry_configs.append(copy.deepcopy(geometry))
+        commands = validate_commands(commands, self.graph)
+        if self.edit_mode == "invalid":
+            return SimpleNamespace(
+                processed=True,
+                chemical_status="INVALID",
+                geometry_status="NOT_REQUESTED",
+                ready_for_evaluator=False,
+                candidate=None,
+                payload={},
+            )
+        child = copy.deepcopy(self.graph)
+        child.update(
+            state_hash=HASH,
+            chemical_identity_hash=CANDIDATE_HASH,
+            parent_state_hash=PARENT_HASH,
+            committed_commands=copy.deepcopy(list(commands)),
+            geometry_status="READY",
+        )
+        payload = {
+            "chemical_status": "VALID",
+            "geometry_status": "READY",
+            "ready_for_evaluator": True,
+            "graph": child,
+            "state_hash": HASH,
+            "chemical_identity_hash": CANDIDATE_HASH,
+            "parent_state_hash": PARENT_HASH,
+            "geometry_hash": GEOMETRY_HASH,
+            "committed_commands": copy.deepcopy(list(commands)),
+        }
+        if self.edit_mode == "geometry_failed":
+            return SimpleNamespace(
+                processed=True,
+                chemical_status="VALID",
+                geometry_status="FAILED",
+                ready_for_evaluator=False,
+                candidate=child,
+                payload=payload,
+            )
+        return SimpleNamespace(
+            processed=True,
+            chemical_status="VALID",
+            geometry_status="READY",
+            ready_for_evaluator=True,
+            candidate=child,
+            payload=payload,
         )
 
 
@@ -155,66 +228,58 @@ class SchemaRuntime:
         return StageResponse(json.dumps(payload), TokenUsage(1, 1))
 
 
-class CompositeTool:
-    def __init__(
-        self, inputs: RedAbsorptionRunInputs, graph, cwd: Path, order: list[str]
-    ):
-        self.inputs = inputs
-        self.graph = graph
-        self.cwd = cwd
+class RecordingSpectrum(JsonCommandProvider):
+    def __init__(self, argv, order):
+        super().__init__(argv)
         self.order = order
-        self.cache = {}
-        self.cache_lock = asyncio.Lock()
-        self.execution_count = 0
-        self.command = JsonCommandProvider(inputs.spectrum_argv)
 
-    async def execute(self, request: ToolRequest, context):
-        self.order.append("tool")
-        payload = request.to_json()["payload"]
-        try:
-            commands = validate_commands(payload["commands"], self.graph)
-        except (KeyError, TypeError, ValueError) as error:
-            return ToolResult(ToolStatus.REJECTED, error=str(error))
-        protocol = self.inputs.calculation_protocol
-        key = (CANDIDATE_HASH, GEOMETRY_HASH, protocol.protocol_hash, EVALUATOR_VERSION)
-        async with self.cache_lock:
-            cached = self.cache.get(key)
-            if cached is None:
-                self.order.append("spectrum")
-                process = await self.command.execute_json(
-                    {
-                        "protocol": protocol.model_dump(mode="json"),
-                        "geometry_hash": GEOMETRY_HASH,
-                    },
-                    cwd=self.cwd,
-                    timeout_seconds=self.inputs.spectrum_timeout_seconds,
-                )
-                assert (
-                    process.status is JsonCommandStatus.SUCCESS
-                    and process.payload is not None
-                )
-                cached = SpectrumResult.model_validate(json.loads(process.stdout_text))
-                self.cache[key] = cached
-                self.execution_count += 1
-                cache_hit = False
-            else:
-                cache_hit = True
-        return ToolResult(
-            ToolStatus.SUCCESS,
-            {
-                "chemical_status": "VALID",
-                "state_hash": HASH,
-                "chemical_identity_hash": CANDIDATE_HASH,
-                "parent_state_hash": PARENT_HASH,
-                "committed_commands": commands,
-                "spectrum_result": cached.model_dump(mode="json"),
-                "cache_key": list(key),
-                "cache_hit": cache_hit,
-            },
-        )
+    async def execute_json(self, *args, **kwargs):
+        self.order.append("spectrum")
+        return await super().execute_json(*args, **kwargs)
 
-    async def aclose(self):
-        await self.command.aclose()
+
+class ResultSpectrum(JsonCommandProvider):
+    def __init__(self, status: JsonCommandStatus, stdout_text: str | None = None):
+        self.status = status
+        self.stdout_text = stdout_text
+
+    async def execute_json(self, *args, **kwargs):
+        return SimpleNamespace(status=self.status, stdout_text=self.stdout_text)
+
+
+def authorized_request_context(commands, workspace: Path):
+    payload = {
+        "inspected_source_hash": PARENT_HASH,
+        "commands": commands,
+        "target_position": [0.0] * 8,
+        "edit_budget": 1,
+        "fragment_heavy_atom_cap": 1,
+        "operation_policy": {
+            "replace_atom": 0.25,
+            "change_bond": 0.25,
+            "attach_fragment": 0.25,
+            "substitute_fragment": 0.25,
+        },
+        "inspected_graph": parent_graph(),
+        "inspected_geometry_hash": PARENT_GEOMETRY_HASH,
+    }
+    proposal = {
+        "authorization_id": "9" * 64,
+        "provider": "molecule_editor",
+        "operation": "edit",
+        "tool_payload": payload,
+    }
+    request = ToolRequest("id", "molecule_editor", "edit", payload, "key")
+    context = ToolContext(
+        "run",
+        "p0",
+        0,
+        AgentStage.EXECUTING,
+        0,
+        workspace,
+        metadata={"proposal": proposal},
+    )
+    return request, context
 
 
 def make_runner(tmp_path: Path):
@@ -225,7 +290,14 @@ def make_runner(tmp_path: Path):
     editor = FakeEditor(order, graph)
     stage_provider = RedAbsorptionStageContextProvider(inputs, wiki, editor)
     runtime = SchemaRuntime(order)
-    tool = CompositeTool(inputs, graph, tmp_path.resolve(), order)
+    cache = {}
+    tool = RedAbsorptionWorkflowToolProvider.bind(
+        inputs,
+        editor,
+        spectrum=RecordingSpectrum(inputs.spectrum_argv, order),
+        cache=cache,
+        own_spectrum=True,
+    )
     adapter = RedAbsorptionTaskAdapter()
     store = FakeRunStore()
     resources = FakeResources()
@@ -261,12 +333,12 @@ def make_runner(tmp_path: Path):
         resource_budget={"evaluations": 6},
         failure_threshold=2,
     )
-    return runner, tool, order, store
+    return runner, tool, order, store, editor, cache
 
 
 @pytest.mark.asyncio
 async def test_three_by_two_red_absorption_flow_is_audited_and_cached(tmp_path: Path):
-    runner, tool, order, store = make_runner(tmp_path)
+    runner, tool, order, store, editor, cache = make_runner(tmp_path)
     result = await runner.run(iterations=2)
     episodes = [
         episode for generation in result.generations for episode in generation.episodes
@@ -277,6 +349,15 @@ async def test_three_by_two_red_absorption_flow_is_audited_and_cached(tmp_path: 
     assert result.final_snapshot.gbest.evaluation.feasible is True
     assert result.final_snapshot.gbest.evaluation.metrics["selected_state_index"] == 1
     assert tool.execution_count == 1
+    assert tool.cache_hit_count == 5
+    assert editor.calls == 12 and editor.edit_calls == 6
+    assert all(
+        config
+        == load_run_inputs(INPUTS, RedAbsorptionRunInputs).value.geometry.model_dump(
+            mode="json"
+        )
+        for config in editor.geometry_configs
+    )
     cache_hits = []
     for episode in episodes:
         stages = [
@@ -306,7 +387,7 @@ async def test_three_by_two_red_absorption_flow_is_audited_and_cached(tmp_path: 
         < order.index("agent:HYPOTHESIZING")
         < order.index("inspect")
         < order.index("agent:PROPOSING_ACTION")
-        < order.index("tool")
+        < order.index("edit")
         < order.index("spectrum")
     )
     replay = await runner.run(iterations=2)
@@ -319,25 +400,16 @@ async def test_illegal_edit_never_runs_spectrum_and_failed_spectrum_has_no_fitne
     tmp_path: Path,
 ):
     inputs = load_run_inputs(INPUTS, RedAbsorptionRunInputs).value
-    tool = CompositeTool(inputs, parent_graph(), tmp_path.resolve(), [])
-    result = await tool.execute(
-        ToolRequest(
-            "id",
-            "molecule_editor",
-            "edit",
-            {
-                "commands": [
-                    {
-                        "operation": "replace_atom",
-                        "atom_id": "a9999",
-                        "atomic_number": 7,
-                    }
-                ]
-            },
-            "key",
-        ),
-        None,
+    editor = FakeEditor([], parent_graph())
+    spectrum = RecordingSpectrum(inputs.spectrum_argv, [])
+    tool = RedAbsorptionWorkflowToolProvider.bind(
+        inputs, editor, spectrum=spectrum, own_spectrum=True
     )
+    request, context = authorized_request_context(
+        [{"operation": "replace_atom", "atom_id": "a9999", "atomic_number": 7}],
+        tmp_path.resolve(),
+    )
+    result = await tool.execute(request, context)
     assert result.status is ToolStatus.REJECTED and tool.execution_count == 0
     failed = await RedAbsorptionEvaluator().evaluate(
         CandidateRef("missing", "f" * 64), None
@@ -346,23 +418,82 @@ async def test_illegal_edit_never_runs_spectrum_and_failed_spectrum_has_no_fitne
     await tool.aclose()
 
 
+@pytest.mark.parametrize(
+    ("mode", "status"),
+    [("invalid", ToolStatus.REJECTED), ("geometry_failed", ToolStatus.FAILED)],
+)
+@pytest.mark.asyncio
+async def test_unready_editor_results_never_start_spectrum(
+    tmp_path: Path, mode: str, status: ToolStatus
+):
+    inputs = load_run_inputs(INPUTS, RedAbsorptionRunInputs).value
+    order = []
+    editor = FakeEditor(order, parent_graph(), edit_mode=mode)
+    tool = RedAbsorptionWorkflowToolProvider.bind(
+        inputs,
+        editor,
+        spectrum=RecordingSpectrum(inputs.spectrum_argv, order),
+        own_spectrum=True,
+    )
+    request, context = authorized_request_context(
+        [{"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}],
+        tmp_path.resolve(),
+    )
+    result = await tool.execute(request, context)
+    assert (
+        result.status is status
+        and tool.execution_count == 0
+        and "spectrum" not in order
+    )
+    await tool.aclose()
+
+
 @pytest.mark.asyncio
 async def test_spectrum_cache_key_requires_all_four_identity_components(tmp_path: Path):
     inputs = load_run_inputs(INPUTS, RedAbsorptionRunInputs).value
-    tool = CompositeTool(inputs, parent_graph(), tmp_path.resolve(), [])
-    commands = [{"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}]
-    request = ToolRequest(
-        "id", "molecule_editor", "edit", {"commands": commands}, "key"
+    cache = {}
+    editor = FakeEditor([], parent_graph())
+    spectrum = RecordingSpectrum(inputs.spectrum_argv, [])
+    tool = RedAbsorptionWorkflowToolProvider.bind(
+        inputs, editor, spectrum=spectrum, cache=cache, own_spectrum=True
     )
-    first = await tool.execute(request, None)
+    commands = [{"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}]
+    request, context = authorized_request_context(commands, tmp_path.resolve())
+    first = await tool.execute(request, context)
     payload = first.to_json()["payload"]
     spectrum = SpectrumResult.model_validate(payload["spectrum_result"])
     exact = tuple(payload["cache_key"])
     for index in range(4):
         variant = list(exact)
         variant[index] = "0" * 64 if index < 3 else "other-evaluator"
-        tool.cache = {tuple(variant): spectrum}
+        cache.clear()
+        cache[tuple(variant)] = spectrum
         before = tool.execution_count
-        await tool.execute(request, None)
+        await tool.execute(request, context)
         assert tool.execution_count == before + 1
     await tool.aclose()
+
+
+@pytest.mark.parametrize(
+    ("spectrum", "expected"),
+    [
+        (ResultSpectrum(JsonCommandStatus.TIMEOUT), ToolStatus.TIMEOUT),
+        (ResultSpectrum(JsonCommandStatus.PROCESS_ERROR), ToolStatus.FAILED),
+        (ResultSpectrum(JsonCommandStatus.INVALID_JSON), ToolStatus.FAILED),
+        (ResultSpectrum(JsonCommandStatus.SUCCESS, "not-json"), ToolStatus.FAILED),
+    ],
+)
+@pytest.mark.asyncio
+async def test_workflow_maps_spectrum_process_boundaries(
+    tmp_path: Path, spectrum: ResultSpectrum, expected: ToolStatus
+):
+    inputs = load_run_inputs(INPUTS, RedAbsorptionRunInputs).value
+    tool = RedAbsorptionWorkflowToolProvider.bind(
+        inputs, FakeEditor([], parent_graph()), spectrum=spectrum
+    )
+    request, context = authorized_request_context(
+        [{"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}],
+        tmp_path.resolve(),
+    )
+    result = await tool.execute(request, context)
+    assert result.status is expected and tool.execution_count == 1

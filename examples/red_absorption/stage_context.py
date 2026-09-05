@@ -51,10 +51,18 @@ class RedAbsorptionStageContextProvider:
                 "wiki_hits": [hit.to_json() for hit in self._wiki.search(query)],
             }
         if stage is AgentStage.PROPOSING_ACTION:
-            if "inspected_graph" in context and "inspected_source_hash" in context:
+            if all(
+                key in context
+                for key in (
+                    "inspected_graph",
+                    "inspected_source_hash",
+                    "inspected_geometry_hash",
+                )
+            ):
                 return {
                     "inspected_graph": context["inspected_graph"],
                     "inspected_source_hash": context["inspected_source_hash"],
+                    "inspected_geometry_hash": context["inspected_geometry_hash"],
                 }
             parent = self._inputs.parent
             if parent.kind == "smiles":
@@ -63,17 +71,26 @@ class RedAbsorptionStageContextProvider:
                 source = {"kind": "chemical_graph", "value": parent.value}
             else:
                 source = {"kind": "path", "path": parent.path, "format": parent.format}
-            result = await self._editor.inspect(source, cwd=tool_context.workspace)
+            result = await self._editor.inspect(
+                source,
+                cwd=tool_context.workspace,
+                geometry=self._inputs.geometry.model_dump(mode="json"),
+                timeout=self._inputs.spectrum_timeout_seconds,
+            )
             if (
                 not result.processed
                 or result.chemical_status != "VALID"
+                or result.geometry_status != "READY"
+                or not result.ready_for_evaluator
                 or result.candidate is None
+                or result.payload is None
             ):
                 raise ValueError("parent MoleculeEditor inspection failed")
             graph = result.candidate
             return {
                 "inspected_graph": graph,
                 "inspected_source_hash": graph["state_hash"],
+                "inspected_geometry_hash": result.payload["geometry_hash"],
             }
         return {}
 
