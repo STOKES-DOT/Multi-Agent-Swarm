@@ -31,6 +31,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 addopts = "-ra -m 'not live'"
 asyncio_mode = "auto"
+pythonpath = ["."]
 markers = [
   "live: invokes local Codex or an external scientific tool",
 ]
