@@ -146,7 +146,7 @@ class FakeEngine:
                 oscillator_strength=0.1,
                 converged=True,
             )
-            for index in range(1, 21)
+            for index in range(1, calculation_protocol.n_states + 1)
         )
 
     def metadata(self):
@@ -165,6 +165,19 @@ def test_backend_optimizes_before_tddft_and_preserves_geometry_identity() -> Non
         == result.evaluated_geometry.geometry_hash
     )
     assert len(result.states) == 20
+
+
+def test_vertical_backend_skips_optimization_and_returns_ten_roots() -> None:
+    document = request()
+    document["protocol"] = protocol().model_copy(
+        update={"geometry_workflow": "vertical_from_molecule_editor", "n_states": 10}
+    ).model_dump(mode="json")
+    engine = FakeEngine()
+    result = run_calculation(document, engine=engine)
+    assert result.status == "SUCCESS"
+    assert engine.calls == ["tddft"]
+    assert len(result.states) == 10
+    assert result.provenance.geometry_hash == SOURCE_HASH
 
 
 @pytest.mark.parametrize(

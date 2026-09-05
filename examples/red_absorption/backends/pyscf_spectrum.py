@@ -82,12 +82,18 @@ class QuantumEngine(Protocol):
 
 
 def _validate_protocol(protocol: CalculationProtocol) -> None:
+    supported_workflow = (
+        protocol.geometry_workflow == "b3lyp_sto3g_optimized"
+        and protocol.n_states == 20
+    ) or (
+        protocol.geometry_workflow == "vertical_from_molecule_editor"
+        and protocol.n_states == 10
+    )
     if (
-        protocol.geometry_workflow != "b3lyp_sto3g_optimized"
+        not supported_workflow
         or protocol.environment != "gas_phase"
         or protocol.backend != "pyscf-geometric"
         or protocol.backend_version != BACKEND_VERSION
-        or protocol.n_states != 20
         or protocol.multiplicity != 1
     ):
         raise ValueError("unsupported PySCF red-absorption protocol")
@@ -130,15 +136,23 @@ def run_calculation(
         raise ValueError("source geometry charge or multiplicity mismatches protocol")
     selected_engine = engine or PySCFEngine()
     try:
-        optimized, optimization = selected_engine.optimize(
-            request.source_geometry, request.protocol
-        )
-        if not _same_atoms(request.source_geometry, optimized):
-            raise QuantumFailure(
-                "GEOMETRY_IDENTITY_MISMATCH",
-                "optimization changed AtomIds, elements, charge, or multiplicity",
+        if request.protocol.geometry_workflow == "b3lyp_sto3g_optimized":
+            evaluation_geometry, optimization = selected_engine.optimize(
+                request.source_geometry, request.protocol
             )
-        states = selected_engine.tddft(optimized, request.protocol)
+            if not _same_atoms(request.source_geometry, evaluation_geometry):
+                raise QuantumFailure(
+                    "GEOMETRY_IDENTITY_MISMATCH",
+                    "optimization changed AtomIds, elements, charge, or multiplicity",
+                )
+            evaluation_hash = evaluation_geometry.geometry_hash
+            published_geometry = evaluation_geometry
+        else:
+            evaluation_geometry = request.source_geometry
+            evaluation_hash = request.source_geometry_hash
+            optimization = None
+            published_geometry = None
+        states = selected_engine.tddft(evaluation_geometry, request.protocol)
         if len(states) != request.protocol.n_states:
             raise QuantumFailure(
                 "TDDFT_NOT_CONVERGED", "TDDFT did not return all requested roots"
@@ -146,12 +160,12 @@ def run_calculation(
         return SpectrumResult(
             status="SUCCESS",
             states=states,
-            evaluated_geometry=optimized,
+            evaluated_geometry=published_geometry,
             provenance=SpectrumProvenance(
                 protocol=request.protocol,
-                geometry_hash=optimized.geometry_hash,
+                geometry_hash=evaluation_hash,
                 source_geometry_hash=request.source_geometry_hash,
-                evaluation_geometry_hash=optimized.geometry_hash,
+                evaluation_geometry_hash=evaluation_hash,
                 geometry_optimization=optimization,
                 command_metadata={"shell": False},
                 backend_metadata=dict(selected_engine.metadata()),
@@ -330,7 +344,13 @@ class PySCFEngine:
         np = self._np
 
         if self._final_mf is None:
-            raise QuantumFailure("TDDFT_NOT_CONVERGED", "optimized RKS is unavailable")
+            mean_field = self._rks(self._molecule(optimized))
+            mean_field.kernel()
+            if not mean_field.converged:
+                raise QuantumFailure(
+                    "SCF_NOT_CONVERGED", "vertical RKS did not converge"
+                )
+            self._final_mf = mean_field
         solver = tdscf.TDDFT(self._final_mf)
         solver.nstates = protocol.n_states
         solver.singlet = True

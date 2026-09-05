@@ -827,7 +827,7 @@ async def preflight_red_absorption(
             "geometry_hash": geometry_hash,
             "protocol": protocol.model_dump(mode="json"),
         }
-        if protocol.geometry_workflow == "b3lyp_sto3g_optimized":
+        if protocol.backend == "pyscf-geometric":
             source_geometry = _evaluated_geometry_from_payload(
                 inspection.payload,
                 charge=protocol.charge,

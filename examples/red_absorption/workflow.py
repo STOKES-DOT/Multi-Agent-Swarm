@@ -708,10 +708,7 @@ class RedAbsorptionWorkflowToolProvider:
                                         mode="json"
                                     ),
                                 }
-                                if (
-                                    inputs.calculation_protocol.geometry_workflow
-                                    == "b3lyp_sto3g_optimized"
-                                ):
+                                if inputs.calculation_protocol.backend == "pyscf-geometric":
                                     source_geometry = _evaluated_geometry_from_payload(
                                         payload,
                                         charge=inputs.calculation_protocol.charge,

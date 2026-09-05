@@ -57,9 +57,9 @@ def test_dikta_gas_pyscf_input_is_explicit_and_bounded() -> None:
     )
     loaded = load_run_inputs(path, RedAbsorptionRunInputs)
     assert loaded.value.parent.value == "O=c1c2ccccc2n2c3ccccc3c(=O)c3cccc1c32"
-    assert loaded.value.calculation_protocol.geometry_workflow == "b3lyp_sto3g_optimized"
+    assert loaded.value.calculation_protocol.geometry_workflow == "vertical_from_molecule_editor"
     assert loaded.value.calculation_protocol.environment == "gas_phase"
-    assert loaded.value.calculation_protocol.n_states == 20
+    assert loaded.value.calculation_protocol.n_states == 10
     assert loaded.value.evaluation_concurrency == 1
 
 

@@ -9,11 +9,11 @@ spectrum_argv:
   - /opt/anaconda3/envs/multi-agent-pso/bin/python
   - /Users/jiaoyuan/Documents/GitHub/Multi-Agent-PSO/examples/red_absorption/backends/pyscf_spectrum.py
 calculation_protocol:
-  geometry_workflow: b3lyp_sto3g_optimized
+  geometry_workflow: vertical_from_molecule_editor
   environment: gas_phase
   backend: pyscf-geometric
   backend_version: pyscf-2.9.0+geometric-1.1.1
-  n_states: 20
+  n_states: 10
   charge: 0
   multiplicity: 1
 geometry:
@@ -21,5 +21,5 @@ geometry:
   random_seed: 42
   max_iterations: 200
   rmsd_threshold_angstrom: 0.2
-spectrum_timeout_seconds: 3600.0
+spectrum_timeout_seconds: 900.0
 evaluation_concurrency: 1
