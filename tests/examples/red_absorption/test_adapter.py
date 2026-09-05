@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
 from pathlib import Path
 
@@ -295,6 +296,24 @@ def test_build_request_includes_template_schema_context_and_decoded_target() -> 
     assert authorization in request.prompt
     assert '"edit_budget":1' in request.prompt
     assert "claimed reward" in request.prompt.lower()
+
+
+def test_proposal_response_schema_types_every_const_for_codex() -> None:
+    request = RedAbsorptionTaskAdapter().build_stage_request(
+        AgentStage.PROPOSING_ACTION, context()
+    )
+
+    def assert_const_types(node: object) -> None:
+        if isinstance(node, Mapping):
+            if "const" in node:
+                assert node.get("type") == "string"
+            for value in node.values():
+                assert_const_types(value)
+        elif isinstance(node, list):
+            for value in node:
+                assert_const_types(value)
+
+    assert_const_types(request.response_schema)
 
 
 def test_candidate_realized_adherence_and_compare() -> None:
