@@ -23,11 +23,25 @@ class _FrozenModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
 
+class EvaluationEvidence(_FrozenModel):
+    candidate_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    feasible: bool
+    fitness: float
+    selected_wavelength_nm: float | None = None
+    selected_oscillator_strength: float | None = None
+    protocol_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class IterationReport(_FrozenModel):
     iteration_id: int = Field(ge=0)
     gbest_candidate_hash: str | None = None
     gbest_fitness: float | None = None
     gbest_feasible: bool | None = None
+    verified_gbest_evaluation: bool = False
+    successful_evaluations: int = 0
+    successful_feasible_evaluations: int = 0
+    verified_feasible_candidate_hashes: tuple[str, ...] = ()
+    evaluation_evidence: tuple[EvaluationEvidence, ...] = ()
     selected_wavelength_nm: float | None = None
     selected_oscillator_strength: float | None = None
     feasible_rate: float | None = None
@@ -218,6 +232,97 @@ def _pbest_hashes(snapshot: Mapping[str, object]) -> dict[str, object]:
     return result
 
 
+def _finite_number(value: object) -> float | None:
+    if type(value) not in {int, float} or not math.isfinite(float(value)):
+        return None
+    return float(value)
+
+
+def _evaluation_evidence(
+    candidate_hash: object, evaluation: Evaluation
+) -> EvaluationEvidence | None:
+    if (
+        not isinstance(candidate_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", candidate_hash) is None
+        or evaluation.status is not EvaluationStatus.SUCCESS
+        or evaluation.fitness is None
+    ):
+        return None
+    provenance = _mapping(evaluation.model_dump(mode="json").get("provenance"))
+    protocol = _mapping(provenance.get("protocol")) if provenance else None
+    protocol_hash = provenance.get("protocol_hash") if provenance else None
+    if (
+        protocol is None
+        or protocol.get("functional") != "B3LYP"
+        or protocol.get("basis") != "STO-3G"
+        or protocol.get("excited_state_method") != "TDDFT"
+        or not isinstance(protocol_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", protocol_hash) is None
+    ):
+        return None
+    try:
+        encoded_protocol = json.dumps(
+            protocol,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return None
+    if hashlib.sha256(encoded_protocol).hexdigest() != protocol_hash:
+        return None
+    metrics = _mapping(evaluation.metrics) or {}
+    wavelength_value = metrics.get("selected_wavelength_nm")
+    strength_value = metrics.get("selected_oscillator_strength")
+    wavelength = (
+        None if wavelength_value is None else _finite_number(wavelength_value)
+    )
+    strength = None if strength_value is None else _finite_number(strength_value)
+    if (wavelength_value is not None and wavelength is None) or (
+        strength_value is not None and strength is None
+    ):
+        return None
+    return EvaluationEvidence(
+        candidate_hash=candidate_hash,
+        feasible=evaluation.feasible,
+        fitness=evaluation.fitness,
+        selected_wavelength_nm=wavelength,
+        selected_oscillator_strength=strength,
+        protocol_hash=protocol_hash,
+    )
+
+
+def _matches_snapshot_best(
+    evidence: EvaluationEvidence, report: IterationReport
+) -> bool:
+    if (
+        evidence.candidate_hash != report.gbest_candidate_hash
+        or evidence.feasible is not report.gbest_feasible
+        or report.gbest_fitness is None
+        or report.selected_wavelength_nm is None
+        or report.selected_oscillator_strength is None
+    ):
+        return False
+    metrics_match = all(
+        math.isclose(left, right, rel_tol=1e-12, abs_tol=1e-12)
+        for left, right in (
+            (evidence.fitness, report.gbest_fitness),
+            (evidence.selected_wavelength_nm, report.selected_wavelength_nm),
+            (
+                evidence.selected_oscillator_strength,
+                report.selected_oscillator_strength,
+            ),
+        )
+        if left is not None
+    )
+    return (
+        metrics_match
+        and evidence.selected_wavelength_nm is not None
+        and evidence.selected_oscillator_strength is not None
+    )
+
+
 def _build_iteration(
     iteration_id: int,
     snapshot: Mapping[str, object],
@@ -231,6 +336,7 @@ def _build_iteration(
     submitted = set()
     candidates = []
     evaluations = []
+    evaluation_evidence = []
     cache_hits = executions = completed = 0
     failure = timeout = invalid = 0
     evidence = set()
@@ -239,6 +345,7 @@ def _build_iteration(
     agent_elapsed = []
     spectrum_elapsed = []
     for particle, records in by_particle.items():
+        particle_candidate_hash = None
         if any(
             record.event.stage.value == "EXECUTING"
             and record.event.event_type == "started"
@@ -318,8 +425,13 @@ def _build_iteration(
                 if spectrum is not None and cache_marker is False:
                     executions += 1
             candidate = _mapping(executing.payload.get("candidate"))
-            if candidate and isinstance(candidate.get("candidate_hash"), str):
-                candidates.append(candidate["candidate_hash"])
+            if (
+                executing.event_type == "completed"
+                and candidate
+                and isinstance(candidate.get("candidate_hash"), str)
+            ):
+                particle_candidate_hash = candidate["candidate_hash"]
+                candidates.append(particle_candidate_hash)
             adherence = _mapping(executing.payload.get("adherence"))
             errors = adherence.get("absolute_error") if adherence else None
             if isinstance(errors, (list, tuple)) and errors:
@@ -334,25 +446,40 @@ def _build_iteration(
             ),
             None,
         )
-        if evaluating:
+        if evaluating and evaluating.event_type == "completed":
             try:
-                evaluations.append(
-                    Evaluation.model_validate(evaluating.payload.get("evaluation"))
+                evaluation = Evaluation.model_validate(
+                    evaluating.payload.get("evaluation")
                 )
             except (TypeError, ValueError):
                 pass
+            else:
+                evaluations.append(evaluation)
+                bound = _evaluation_evidence(particle_candidate_hash, evaluation)
+                if bound is not None:
+                    evaluation_evidence.append(bound)
     if episodes:
-        submitted = {episode.particle_id for episode in episodes}
-        candidates = [
-            episode.candidate_hash for episode in episodes if episode.candidate_hash
-        ]
-        evaluations = [episode.evaluation for episode in episodes if episode.evaluation]
         failure = sum(episode.status.value == "FAILED" for episode in episodes)
         timeout = sum(episode.status.value == "TIMEOUT" for episode in episodes)
         invalid = sum(episode.status.value == "INVALID" for episode in episodes)
     feasible = sum(
         evaluation.status is EvaluationStatus.SUCCESS and evaluation.feasible
         for evaluation in evaluations
+    )
+    successful = sum(
+        evaluation.status is EvaluationStatus.SUCCESS for evaluation in evaluations
+    )
+    unique_evidence = tuple(
+        sorted(
+            set(evaluation_evidence),
+            key=lambda item: (
+                item.candidate_hash,
+                item.fitness,
+                item.selected_wavelength_nm or -math.inf,
+                item.selected_oscillator_strength or -math.inf,
+                item.protocol_hash,
+            ),
+        )
     )
     candidate_hash, fitness, best_feasible, wavelength, strength = _snapshot_best(
         snapshot
@@ -368,6 +495,12 @@ def _build_iteration(
         gbest_candidate_hash=candidate_hash,
         gbest_fitness=fitness,
         gbest_feasible=best_feasible,
+        successful_evaluations=successful,
+        successful_feasible_evaluations=feasible,
+        verified_feasible_candidate_hashes=tuple(
+            sorted({item.candidate_hash for item in unique_evidence if item.feasible})
+        ),
+        evaluation_evidence=unique_evidence,
         selected_wavelength_nm=wavelength,
         selected_oscillator_strength=strength,
         feasible_rate=None if not evaluations else feasible / len(evaluations),
@@ -473,18 +606,33 @@ def build_run_report(source: SwarmRunResult | RecordedRunEvidence) -> RunReport:
         run_id = source.run_id
     else:
         raise TypeError("source must be SwarmRunResult or RecordedRunEvidence")
+    all_evidence = tuple(
+        evidence for report in reports for evidence in report.evaluation_evidence
+    )
+    reports = [
+        report.model_copy(
+            update={
+                "verified_gbest_evaluation": any(
+                    _matches_snapshot_best(evidence, report)
+                    for evidence in all_evidence
+                )
+            }
+        )
+        for report in reports
+    ]
     latest = reports[-1] if reports else None
     if (
         latest
         and latest.gbest_candidate_hash
         and latest.gbest_feasible is True
+        and latest.verified_gbest_evaluation
         and isinstance(latest.selected_wavelength_nm, (int, float))
         and isinstance(latest.selected_oscillator_strength, (int, float))
     ):
         claim = f"Best recorded B3LYP/STO-3G absorption oscillator-strength proxy: {latest.gbest_candidate_hash} at {latest.selected_wavelength_nm} nm with oscillator strength {latest.selected_oscillator_strength}."
-    elif any(report.evaluated for report in reports) and not any(
-        (report.feasible_rate or 0) > 0 for report in reports
-    ):
+    elif sum(report.successful_evaluations for report in reports) > 0 and sum(
+        report.successful_feasible_evaluations for report in reports
+    ) == 0:
         claim = "No feasible red-absorption candidate was found."
     else:
         claim = "No completed evaluation evidence is available; the result is unknown."
@@ -545,6 +693,7 @@ def publish_run_report(
 
 
 __all__ = [
+    "EvaluationEvidence",
     "IterationReport",
     "RecordedRunEvidence",
     "ReportRunStore",

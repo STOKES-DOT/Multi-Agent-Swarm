@@ -46,6 +46,11 @@ def recorded_evidence(run_id: str = "report-run") -> RecordedRunEvidence:
             "selected_wavelength_nm": 650.0,
             "selected_oscillator_strength": 0.2,
         },
+        provenance={
+            "protocol": protocol.model_dump(mode="json"),
+            "protocol_hash": protocol.protocol_hash,
+            "geometry_hash": "d" * 64,
+        },
     ).model_dump(mode="json")
     best = {"candidate_hash": "c" * 64, "fitness": 1.2, "evaluation": evaluation}
     snapshots = (

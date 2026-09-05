@@ -1,6 +1,7 @@
 """Evidence-only run reporting."""
 
 from .run_report import (
+    EvaluationEvidence,
     IterationReport,
     RecordedRunEvidence,
     ReportRunStore,
@@ -11,6 +12,7 @@ from .run_report import (
 )
 
 __all__ = [
+    "EvaluationEvidence",
     "IterationReport",
     "RecordedRunEvidence",
     "ReportRunStore",
