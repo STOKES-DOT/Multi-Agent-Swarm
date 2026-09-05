@@ -12,6 +12,8 @@ import json
 import os
 from pathlib import Path
 import re
+from secrets import token_hex
+import sqlite3
 import stat
 import sys
 from types import MappingProxyType
@@ -30,6 +32,7 @@ from multi_agent_pso import __version__
 from multi_agent_pso.configuration import LoadedRunInputs, load_run_inputs, load_task_package
 from multi_agent_pso.core import ArtifactRef
 from multi_agent_pso.storage import FileArtifactStore
+from multi_agent_pso.resources import SQLiteBudgetLedger
 from multi_agent_pso.tools import JsonCommandProvider, MoleculeEditorProvider
 
 from .evaluator import RedAbsorptionEvaluator
@@ -39,18 +42,39 @@ from .models import SpectrumResult
 
 _HASH = re.compile(r"^[0-9a-f]{64}$")
 _MAX_PREFLIGHT_BYTES = 256 * 1024
+_MAX_PREFLIGHT_TOTAL_BYTES = 4 * 1024 * 1024
+_AUTH_TIMEOUT_SECONDS = 10.0
+_AUTH_SPAWN_HANDOFF_SECONDS = 0.25
+_AUTH_TERMINATE_GRACE_SECONDS = 0.25
+_AUTH_GUARDIANS: set[asyncio.Task[None]] = set()
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthSpawnFailure:
+    error: BaseException
 
 
 def _validate_storage_target(runs_dir: Path) -> None:
     if not isinstance(runs_dir, Path):
         raise TypeError("runs_dir must be a Path")
-    parent = runs_dir.parent.resolve(strict=True)
-    if not parent.is_dir() or not os.access(parent, os.W_OK):
-        raise ValueError("run storage parent is not writable")
+    absolute = runs_dir.absolute()
+    parent = absolute.parent
+    if parent.resolve(strict=True) != parent or not parent.is_dir():
+        raise ValueError("run storage parent is unsafe")
     if runs_dir.exists() or runs_dir.is_symlink():
         metadata = os.lstat(runs_dir)
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
             raise ValueError("runs_dir must be a regular directory namespace")
+        if absolute.resolve(strict=True) != absolute:
+            raise ValueError("runs_dir must not traverse symlinks")
+        for name in ("artifacts", "workspaces", ".runs.sqlite.episode-locks"):
+            directory = runs_dir / name
+            if directory.exists() or directory.is_symlink():
+                directory_metadata = os.lstat(directory)
+                if stat.S_ISLNK(directory_metadata.st_mode) or not stat.S_ISDIR(
+                    directory_metadata.st_mode
+                ):
+                    raise ValueError(f"{name} storage namespace is unsafe")
         for name in ("runs.sqlite", "evaluation_budget.sqlite"):
             database = runs_dir / name
             if database.exists() or database.is_symlink():
@@ -59,8 +83,103 @@ def _validate_storage_target(runs_dir: Path) -> None:
                     database_metadata.st_mode
                 ):
                     raise ValueError(f"{name} target is unsafe")
+                for suffix in ("-wal", "-shm"):
+                    sidecar = database.with_name(f"{database.name}{suffix}")
+                    if sidecar.exists() or sidecar.is_symlink():
+                        sidecar_metadata = os.lstat(sidecar)
+                        if stat.S_ISLNK(sidecar_metadata.st_mode) or not stat.S_ISREG(
+                            sidecar_metadata.st_mode
+                        ):
+                            raise ValueError(f"{name}{suffix} target is unsafe")
+        run_database = runs_dir / "runs.sqlite"
+        if run_database.exists():
+            try:
+                connection = sqlite3.connect(
+                    f"{run_database.absolute().as_uri()}?mode=ro", uri=True, timeout=5
+                )
+                try:
+                    integrity = connection.execute("PRAGMA quick_check").fetchone()
+                    tables = {
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table'"
+                        )
+                    }
+                    if integrity is None or integrity[0] != "ok" or not {
+                        "schema_metadata",
+                        "runs",
+                    } <= tables:
+                        raise ValueError("runs.sqlite schema or integrity is invalid")
+                    version = connection.execute(
+                        "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+                    ).fetchone()
+                    if version != (1,):
+                        raise ValueError("runs.sqlite schema version is invalid")
+                finally:
+                    connection.close()
+            except sqlite3.Error as error:
+                raise ValueError("runs.sqlite is not a usable SQLite run store") from error
+            try:
+                connection = sqlite3.connect(
+                    f"{run_database.absolute().as_uri()}?mode=rw", uri=True, timeout=5
+                )
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.rollback()
+                finally:
+                    connection.close()
+            except sqlite3.Error as error:
+                raise ValueError("runs.sqlite does not support required locking") from error
+        budget_database = runs_dir / "evaluation_budget.sqlite"
+        if budget_database.exists():
+            SQLiteBudgetLedger(budget_database)
     if not all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW")):
         raise RuntimeError("run storage claims require POSIX no-follow support")
+    probe_parent = absolute if absolute.exists() else parent
+    probe_name = f".preflight-storage-{token_hex(12)}.sqlite"
+    parent_fd = os.open(
+        probe_parent,
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        descriptor = os.open(
+            probe_name,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        os.close(descriptor)
+    finally:
+        os.close(parent_fd)
+    probe = probe_parent / probe_name
+    try:
+        connection = sqlite3.connect(probe, timeout=5)
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("CREATE TABLE probe(value INTEGER)")
+            connection.rollback()
+        finally:
+            connection.close()
+    except sqlite3.Error as error:
+        raise ValueError("run storage does not support SQLite locking") from error
+    finally:
+        for candidate in (
+            probe,
+            probe.with_name(f"{probe.name}-wal"),
+            probe.with_name(f"{probe.name}-shm"),
+        ):
+            try:
+                candidate.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _base_contract_identity(
@@ -311,50 +430,176 @@ async def verify_current_parent(
         if actual != expected or not set(inputs.parent.protected_atom_ids) <= atom_ids:
             raise ValueError("current parent differs from preflight evidence")
         return editor
-    except BaseException:
+    except BaseException as primary:
         close = getattr(editor, "aclose", None)
         if callable(close):
-            await close()
+            try:
+                await close()
+            except BaseException as cleanup_error:
+                primary.add_note(
+                    "current-parent cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
         raise
 
 
-async def _default_auth_probe() -> Mapping[str, object]:
-    process = await asyncio.create_subprocess_exec(
-        "codex",
-        "login",
-        "status",
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    async def read_bounded(stream) -> bytes:
-        value = bytearray()
-        while True:
-            chunk = await stream.read(4096)
-            if not chunk:
-                return bytes(value)
-            value.extend(chunk)
-            if len(value) > 64 * 1024:
-                raise RuntimeError("Codex authentication output exceeded 64 KiB")
-
+async def _capture_auth_spawn():
     try:
-        stdout, stderr, returncode = await asyncio.wait_for(
-            asyncio.gather(
-                read_bounded(process.stdout),
-                read_bounded(process.stderr),
-                process.wait(),
-            ),
-            timeout=10,
+        return await asyncio.create_subprocess_exec(
+            "codex",
+            "login",
+            "status",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-    except BaseException:
-        if process.returncode is None:
+    except BaseException as error:
+        return _AuthSpawnFailure(error)
+
+
+async def _read_auth_bounded(stream) -> bytes:
+    value = bytearray()
+    while True:
+        chunk = await stream.read(min(4096, 64 * 1024 + 1 - len(value)))
+        if not chunk:
+            return bytes(value)
+        value.extend(chunk)
+        if len(value) > 64 * 1024:
+            raise RuntimeError("Codex authentication output exceeded 64 KiB")
+
+
+async def _discard_auth_output(stream) -> None:
+    while await stream.read(64 * 1024):
+        pass
+
+
+async def _shutdown_auth_process(process, tasks=(), wait_task=None) -> None:
+    cleanup_errors = []
+    if process.returncode is None:
+        try:
             process.terminate()
+        except ProcessLookupError:
+            pass
+        except BaseException as error:
+            cleanup_errors.append(error)
+    if wait_task is None:
+        wait_task = asyncio.create_task(process.wait())
+    if not wait_task.done():
+        done, _ = await asyncio.wait(
+            (wait_task,), timeout=_AUTH_TERMINATE_GRACE_SECONDS
+        )
+        if not done and process.returncode is None:
             try:
-                await asyncio.wait_for(process.wait(), timeout=0.25)
-            except (TimeoutError, ProcessLookupError):
-                if process.returncode is None:
-                    process.kill()
-                await process.wait()
+                process.kill()
+            except ProcessLookupError:
+                pass
+            except BaseException as error:
+                cleanup_errors.append(error)
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    else:
+        drains = [
+            asyncio.create_task(_discard_auth_output(stream))
+            for stream in (process.stdout, process.stderr)
+            if stream is not None
+        ]
+        results = await asyncio.gather(wait_task, *drains, return_exceptions=True)
+    cleanup_errors.extend(
+        result for result in results if isinstance(result, BaseException)
+    )
+    if cleanup_errors:
+        primary, *secondary = cleanup_errors
+        for error in secondary:
+            primary.add_note(f"additional auth cleanup failure: {error!r}")
+        raise primary
+
+
+async def _guard_late_auth_spawn(spawn_task) -> None:
+    try:
+        outcome = await asyncio.shield(spawn_task)
+        if not isinstance(outcome, _AuthSpawnFailure):
+            await _shutdown_auth_process(outcome)
+    except BaseException:
+        pass
+
+
+def _register_auth_guardian(spawn_task) -> None:
+    guardian = asyncio.create_task(_guard_late_auth_spawn(spawn_task))
+    _AUTH_GUARDIANS.add(guardian)
+
+    def done(task):
+        _AUTH_GUARDIANS.discard(task)
+        try:
+            task.exception()
+        except BaseException:
+            pass
+
+    guardian.add_done_callback(done)
+
+
+async def _handoff_auth_spawn(spawn_task, primary: BaseException) -> None:
+    try:
+        done, _ = await asyncio.wait(
+            (spawn_task,), timeout=_AUTH_SPAWN_HANDOFF_SECONDS
+        )
+    except BaseException as error:
+        primary.add_note(f"auth spawn handoff failed: {type(error).__name__}: {error}")
+        done = set()
+    if not done:
+        _register_auth_guardian(spawn_task)
+        return
+    outcome = spawn_task.result()
+    if not isinstance(outcome, _AuthSpawnFailure):
+        try:
+            await _shutdown_auth_process(outcome)
+        except BaseException as error:
+            primary.add_note(f"auth spawn cleanup failed: {type(error).__name__}: {error}")
+
+
+async def _default_auth_probe() -> Mapping[str, object]:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _AUTH_TIMEOUT_SECONDS
+    spawn_task = asyncio.create_task(_capture_auth_spawn())
+    try:
+        done, _ = await asyncio.wait(
+            (spawn_task,), timeout=max(0.0, deadline - loop.time())
+        )
+    except BaseException as primary:
+        await _handoff_auth_spawn(spawn_task, primary)
+        raise
+    if not done:
+        primary = TimeoutError("Codex authentication process spawn timed out")
+        await _handoff_auth_spawn(spawn_task, primary)
+        raise primary
+    outcome = spawn_task.result()
+    if isinstance(outcome, _AuthSpawnFailure):
+        raise outcome.error
+    process = outcome
+    stdout_task = asyncio.create_task(_read_auth_bounded(process.stdout))
+    stderr_task = asyncio.create_task(_read_auth_bounded(process.stderr))
+    wait_task = asyncio.create_task(process.wait())
+    tasks = (stdout_task, stderr_task, wait_task)
+    group = asyncio.gather(*tasks)
+    try:
+        done, _ = await asyncio.wait(
+            (group,), timeout=max(0.0, deadline - loop.time())
+        )
+        if not done:
+            raise TimeoutError("Codex authentication status timed out")
+        stdout, stderr, returncode = group.result()
+    except BaseException as primary:
+        cleanup = asyncio.create_task(
+            _shutdown_auth_process(process, tasks, wait_task=wait_task)
+        )
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError as error:
+                primary.add_note(f"auth cleanup cancellation: {error}")
+        try:
+            cleanup.result()
+        except BaseException as error:
+            primary.add_note(f"auth cleanup failed: {type(error).__name__}: {error}")
         raise
     if returncode != 0:
         raise RuntimeError("Codex authentication status is unavailable")
@@ -362,20 +607,27 @@ async def _default_auth_probe() -> Mapping[str, object]:
         text = (stdout + stderr).decode("utf-8").casefold()
     except UnicodeDecodeError as error:
         raise RuntimeError("Codex authentication status is not UTF-8") from error
+    if len(stdout) + len(stderr) > 64 * 1024:
+        raise RuntimeError("Codex authentication output exceeded 64 KiB total")
     method = _parse_auth_status(text)
     return {"authenticated": True, "method": method}
 
 
 def _parse_auth_status(text: str) -> str:
-    normalized = text.casefold().strip()
-    if any(
-        marker in normalized
-        for marker in ("not logged in", "not authenticated", "unauthenticated")
-    ):
-        raise RuntimeError("Codex authentication status is explicitly negative")
-    if not any(marker in normalized for marker in ("logged in", "authenticated")):
+    if not isinstance(text, str):
+        raise TypeError("Codex authentication status must be text")
+    positive = None
+    for line in text.splitlines():
+        normalized = " ".join(line.casefold().strip().split())
+        if re.fullmatch(r"logged in(?: (?:using|with|via) .+)?", normalized):
+            positive = normalized
+            break
+        if normalized == "authenticated":
+            positive = normalized
+            break
+    if positive is None:
         raise RuntimeError("Codex status did not confirm authentication")
-    return "chatgpt" if "chatgpt" in normalized else "codex-login"
+    return "chatgpt" if "chatgpt" in positive else "codex-login"
 
 
 async def _resolve_probe(value: object) -> object:
@@ -395,6 +647,11 @@ def _versions(dependencies: PreflightDependencies) -> dict[str, str]:
         "local_codex_runtime": dependencies.runtime_version,
         "molecule_editor": dependencies.molecule_editor_version,
     }
+
+
+def current_preflight_versions() -> Mapping[str, str]:
+    """Return production dependency versions used to authorize a live search."""
+    return MappingProxyType(_versions(PreflightDependencies()))
 
 
 def _identity(task: object, loaded: LoadedRunInputs, versions: Mapping[str, str]) -> str:
@@ -436,11 +693,13 @@ async def preflight_red_absorption(
         raise RuntimeError("Codex authentication method is unavailable")
     versions = _versions(dependencies)
 
-    editor = dependencies.molecule_editor or MoleculeEditorProvider()
-    spectrum = dependencies.spectrum or JsonCommandProvider(inputs.spectrum_argv)
     own_editor = dependencies.molecule_editor is None or dependencies.own_resources
     own_spectrum = dependencies.spectrum is None or dependencies.own_resources
+    editor = None
+    spectrum = None
     try:
+        editor = dependencies.molecule_editor or MoleculeEditorProvider()
+        spectrum = dependencies.spectrum or JsonCommandProvider(inputs.spectrum_argv)
         inspection = await editor.inspect(
             _parent_source(inputs),
             cwd=runs_dir.parent.resolve(),
@@ -563,7 +822,7 @@ async def preflight_red_absorption(
         primary = sys.exception()
         cleanup_error: BaseException | None = None
         for owned, resource in ((own_spectrum, spectrum), (own_editor, editor)):
-            if not owned:
+            if not owned or resource is None:
                 continue
             try:
                 await resource.aclose()
@@ -607,9 +866,15 @@ def verify_red_absorption_preflight(
     directory = runs_dir / "artifacts" / "preflight"
     if directory.is_symlink() or not directory.is_dir():
         raise ValueError("matching preflight artifact is missing")
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | os.O_NONBLOCK
+        | getattr(os, "O_CLOEXEC", 0)
+    )
     directory_fd = os.open(directory, flags | os.O_DIRECTORY)
-    documents: list[tuple[str, bytes]] = []
+    matches = []
+    total_bytes = 0
     try:
         names = []
         with os.scandir(directory_fd) as entries:
@@ -630,39 +895,66 @@ def verify_red_absorption_preflight(
                     continue
                 if metadata.st_size > _MAX_PREFLIGHT_BYTES:
                     raise ValueError("preflight artifact exceeds its byte budget")
-                data = os.read(descriptor, _MAX_PREFLIGHT_BYTES + 1)
+                total_bytes += metadata.st_size
+                if total_bytes > _MAX_PREFLIGHT_TOTAL_BYTES:
+                    raise ValueError("preflight artifacts exceed their total byte budget")
+                chunks = []
+                remaining = _MAX_PREFLIGHT_BYTES + 1
+                while remaining:
+                    chunk = os.read(descriptor, min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                data = b"".join(chunks)
                 if len(data) != metadata.st_size:
                     raise ValueError("preflight artifact changed while reading")
-                documents.append((name, data))
+                namespace = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if (namespace.st_dev, namespace.st_ino) != (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ):
+                    raise ValueError("preflight artifact namespace changed while reading")
             finally:
                 os.close(descriptor)
+            actual_hash = hashlib.sha256(data).hexdigest()
+            if actual_hash != expected_hash:
+                raise ValueError("preflight artifact content hash mismatch")
+            try:
+                record = PreflightRecord.model_validate_json(data)
+            except ValueError as error:
+                raise ValueError("preflight artifact is invalid") from error
+            if record.base_identity == identity:
+                matches.append(record)
     finally:
         os.close(directory_fd)
-    matches = []
-    store = FileArtifactStore(runs_dir / "artifacts")
-    for name, data in documents:
-        expected_hash = name.removesuffix(".json")
-        actual_hash = hashlib.sha256(data).hexdigest()
-        if actual_hash != expected_hash:
-            raise ValueError("preflight artifact content hash mismatch")
-        reference = ArtifactRef(
-            relative_path=f"preflight/{name}",
-            sha256=actual_hash,
-            size_bytes=len(data),
-            media_type="application/json",
-            committed=True,
-        )
-        store.verify(reference)
-        try:
-            record = PreflightRecord.model_validate_json(data)
-        except ValueError as error:
-            raise ValueError("preflight artifact is invalid") from error
-        if record.base_identity == identity:
-            matches.append(record)
     if len(matches) != 1:
         raise ValueError("matching preflight artifact is missing or ambiguous")
     record = matches[0]
-    if not record.passed or dict(record.versions) != dict(versions):
+    protocol = loaded.value.calculation_protocol
+    expected_fields = {
+        "task_snapshot_hash": task.snapshot_hash,
+        "input_raw_hash": loaded.raw_sha256,
+        "input_semantic_hash": loaded.semantic_sha256,
+        "protected_atom_ids": loaded.value.parent.protected_atom_ids,
+        "protected_smarts": loaded.value.parent.protected_smarts,
+        "protocol_hash": protocol.protocol_hash,
+        "protocol_functional": protocol.functional,
+        "protocol_basis": protocol.basis,
+        "protocol_method": protocol.excited_state_method,
+        "protocol_backend": protocol.backend,
+        "protocol_backend_version": protocol.backend_version,
+        "geometry_workflow": protocol.geometry_workflow,
+        "spectrum_timeout_seconds": loaded.value.spectrum_timeout_seconds,
+        "evaluation_concurrency": loaded.value.evaluation_concurrency,
+        "max_new_evaluations": task.spec.pso.population_size
+        * task.spec.pso.iterations,
+    }
+    if (
+        not record.passed
+        or dict(record.versions) != dict(versions)
+        or any(getattr(record, key) != value for key, value in expected_fields.items())
+    ):
         raise ValueError("preflight artifact is stale or mismatched")
     return record
 
@@ -686,6 +978,7 @@ def load_verified_red_absorption_preflight(
 __all__ = [
     "PreflightDependencies",
     "PreflightRecord",
+    "current_preflight_versions",
     "load_verified_red_absorption_preflight",
     "preflight_red_absorption",
     "verify_red_absorption_preflight",

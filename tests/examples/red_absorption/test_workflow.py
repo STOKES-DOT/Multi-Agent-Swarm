@@ -10,7 +10,9 @@ import pytest
 from examples.red_absorption.workflow import (
     RedAbsorptionWorkflowResources,
     RedAbsorptionWorkflowToolProvider,
+    _violates_protection_policy,
 )
+from multi_agent_pso.resources import SQLiteBudgetLedger
 from multi_agent_pso.tools import JsonCommandProvider, JsonCommandStatus
 from tests.fixtures.red_absorption import load_valid_inputs
 from tests.integration.test_red_absorption_flow import (
@@ -245,6 +247,82 @@ async def test_detach_cannot_indirectly_delete_protected_component(tmp_path):
     result = await tool.execute(request, context)
     assert result.status.value == "REJECTED"
     assert editor.edit_calls == spectrum.calls == 0
+
+
+@pytest.mark.parametrize("operation", ["detach_fragment", "substitute_fragment"])
+def test_protected_atom_gate_covers_entire_discarded_bridge_component(
+    tmp_path, operation
+):
+    graph = copy.deepcopy(parent_graph())
+    third = copy.deepcopy(graph["atoms"][0])
+    third["atom_id"] = "a0003"
+    graph["atoms"].append(third)
+    second_bond = copy.deepcopy(graph["bonds"][0])
+    second_bond.update(
+        {
+            "bond_id": "b0002",
+            "begin_atom_id": "a0002",
+            "end_atom_id": "a0003",
+        }
+    )
+    graph["bonds"].append(second_bond)
+    inputs = inputs_with_concurrency(tmp_path, 1)
+    inputs = inputs.model_copy(
+        update={
+            "parent": inputs.parent.model_copy(
+                update={"protected_atom_ids": ("a0003",)}
+            )
+        }
+    )
+    command = {
+        "operation": operation,
+        "bond_id": "b0001",
+        "retained_atom_id": "a0001",
+    }
+    if operation == "substitute_fragment":
+        command.update(
+            {
+                "fragment_graph": copy.deepcopy(parent_graph()),
+                "fragment_anchor_atom_id": "a0001",
+                "bond_type": "SINGLE",
+            }
+        )
+    assert _violates_protection_policy(
+        inputs, {"inspected_graph": graph, "commands": [command]}
+    )
+
+
+@pytest.mark.asyncio
+async def test_same_persistent_key_waits_for_completed_cache_across_instances(tmp_path):
+    inputs = inputs_with_concurrency(tmp_path, 2)
+    ledger = SQLiteBudgetLedger(tmp_path / "budget.sqlite")
+    resources = [
+        RedAbsorptionWorkflowResources.from_inputs(
+            inputs,
+            max_new_evaluations=25,
+            ledger=ledger,
+            run_id="run-1",
+        )
+        for _ in range(2)
+    ]
+    spectra = [DelayedSpectrum(), DelayedSpectrum()]
+    tools = [
+        RedAbsorptionWorkflowToolProvider.bind(
+            inputs,
+            VariableEditor([], parent_graph()),
+            resources[index],
+            spectrum=spectra[index],
+        )
+        for index in range(2)
+    ]
+    pair = authorized_request_context(
+        [{"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}],
+        tmp_path.resolve(),
+    )
+    results = await asyncio.gather(*(tool.execute(*pair) for tool in tools))
+    assert [result.status.value for result in results] == ["SUCCESS", "SUCCESS"]
+    assert sum(spectrum.calls for spectrum in spectra) == 1
+    assert ledger.count("run-1") == 1
 
 
 @pytest.mark.asyncio

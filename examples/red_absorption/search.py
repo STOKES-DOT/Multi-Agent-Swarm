@@ -24,6 +24,7 @@ from multi_agent_pso.tools import JsonCommandProvider
 from .inputs import RedAbsorptionRunInputs
 from .preflight import (
     PreflightRecord,
+    current_preflight_versions,
     verify_current_parent,
     verify_red_absorption_preflight,
 )
@@ -100,6 +101,33 @@ def _particle_workspace(root: Path, run_id: str, particle_id: str) -> Path:
             os.close(descriptor)
 
 
+def _make_private_run_root(runs_dir: Path) -> Path:
+    absolute = runs_dir.absolute()
+    if runs_dir.is_symlink():
+        raise ValueError("runs_dir must not be a symlink")
+    try:
+        absolute.mkdir(mode=0o700, parents=False, exist_ok=True)
+        if absolute.resolve(strict=True) != absolute:
+            raise ValueError("runs_dir must not traverse symlinks")
+        descriptor = os.open(
+            absolute,
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as error:
+        raise ValueError("runs_dir must be a safe directory") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise ValueError("runs_dir must be an owned directory")
+        os.fchmod(descriptor, 0o700)
+    finally:
+        os.close(descriptor)
+    return absolute
+
+
 async def run_red_absorption_search(
     task: TaskPackage,
     loaded: LoadedRunInputs[RedAbsorptionRunInputs],
@@ -117,7 +145,7 @@ async def run_red_absorption_search(
     ):
         raise ValueError("evaluation budget database target is unsafe")
     verified = verify_red_absorption_preflight(
-        task, loaded, runs_dir, versions=preflight.versions
+        task, loaded, runs_dir, versions=current_preflight_versions()
     )
     if verified != preflight or preflight.max_new_evaluations != 25:
         raise ValueError("preflight record does not authorize this search")
@@ -135,8 +163,7 @@ async def run_red_absorption_search(
     try:
         config_hash = _config_hash(task, loaded, preflight)
         run_id = f"red-{config_hash[:24]}"
-        root = runs_dir.resolve(strict=False)
-        root.mkdir(parents=True, exist_ok=True)
+        root = _make_private_run_root(runs_dir)
         artifacts = FileArtifactStore(root / "artifacts")
         store = SQLiteRunStore(root / "runs.sqlite")
         wiki = LocalWikiRetriever(spec.wiki.path)
@@ -154,10 +181,17 @@ async def run_red_absorption_search(
         stage_context = RedAbsorptionStageContextProvider(inputs, wiki, editor)
         tools: list[RedAbsorptionWorkflowToolProvider] = []
         runtime = LocalCodexRuntime(model=spec.agent.model)
-    except BaseException:
-        if spectrum is not None:
-            await spectrum.aclose()
-        await editor.aclose()
+    except BaseException as primary:
+        for resource in (spectrum, editor):
+            if resource is None:
+                continue
+            try:
+                await resource.aclose()
+            except BaseException as cleanup_error:
+                primary.add_note(
+                    "search initialization cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
         raise
     try:
         async with runtime:

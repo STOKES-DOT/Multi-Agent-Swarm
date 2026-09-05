@@ -20,7 +20,10 @@ def _expected_red_evaluations(task_path: Path) -> int:
         raise ValueError("task must be an existing regular file")
     descriptor = os.open(
         task_path,
-        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | os.O_NONBLOCK
+        | getattr(os, "O_CLOEXEC", 0),
     )
     try:
         metadata = os.fstat(descriptor)

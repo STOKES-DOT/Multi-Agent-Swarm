@@ -7,6 +7,7 @@ import multi_agent_pso.cli as cli_module
 from multi_agent_pso.cli import main
 from multi_agent_pso.resources import (
     AsyncSemaphoreResourceManager,
+    BudgetClaimStatus,
     SQLiteBudgetLedger,
 )
 from examples.red_absorption.search import _particle_workspace
@@ -92,6 +93,57 @@ def test_sqlite_budget_ledger_rejects_symlink_and_hostile_payload(tmp_path):
     assert ledger.reserve("run", "key", 1)
     with pytest.raises((TypeError, ValueError)):
         ledger.commit("run", "key", {"bad": float("nan")})
+
+
+def test_sqlite_budget_ledger_rejects_symlinked_parent_and_is_private(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink|directory|unsafe"):
+        SQLiteBudgetLedger(linked_parent / "budget.sqlite")
+    assert not (outside / "budget.sqlite").exists()
+
+    database = tmp_path / "private.sqlite"
+    SQLiteBudgetLedger(database)
+    assert database.stat().st_mode & 0o777 == 0o600
+
+
+def test_sqlite_budget_ledger_is_first_wins_and_strict_on_read(tmp_path):
+    import sqlite3
+
+    database = tmp_path / "budget.sqlite"
+    ledger = SQLiteBudgetLedger(database)
+    assert ledger.reserve("run", "key", 1)
+    ledger.commit("run", "key", {"value": 1})
+    ledger.commit("run", "key", {"value": 1})
+    with pytest.raises(ValueError, match="different|conflict|committed"):
+        ledger.commit("run", "key", {"value": 2})
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE budget_entries SET payload_json = ? WHERE run_id = ? AND item_key = ?",
+            ('{"x":1,"x":2}', "run", "key"),
+        )
+    with pytest.raises(ValueError, match="duplicate|JSON"):
+        ledger.get("run", "key")
+    for method, args in (
+        (ledger.get, (123, "key")),
+        (ledger.count, (123,)),
+        (ledger.commit, (123, "key", {})),
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            method(*args)
+
+
+def test_sqlite_budget_ledger_distinguishes_pending_completed_and_exhausted(tmp_path):
+    ledger = SQLiteBudgetLedger(tmp_path / "budget.sqlite")
+    assert ledger.claim("run", "first", 1) is BudgetClaimStatus.RESERVED
+    assert ledger.claim("run", "first", 1) is BudgetClaimStatus.PENDING
+    assert ledger.claim("run", "second", 1) is BudgetClaimStatus.EXHAUSTED
+    ledger.commit("run", "first", {"value": 1})
+    assert ledger.claim("run", "first", 1) is BudgetClaimStatus.COMPLETED
+    with pytest.raises(ValueError, match="immutable"):
+        ledger.claim("run", "second", 2)
 
 
 def task_file(tmp_path):

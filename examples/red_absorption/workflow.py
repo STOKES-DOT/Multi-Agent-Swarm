@@ -11,7 +11,7 @@ from typing import Protocol
 from multi_agent_pso.core import AgentStage
 from multi_agent_pso.protocols import ToolContext, ToolRequest, ToolResult, ToolStatus
 from multi_agent_pso.tools import JsonCommandProvider, JsonCommandStatus
-from multi_agent_pso.resources import SQLiteBudgetLedger
+from multi_agent_pso.resources import BudgetClaimStatus, SQLiteBudgetLedger
 
 from .evaluator import EVALUATOR_VERSION
 from .inputs import RedAbsorptionRunInputs
@@ -60,6 +60,7 @@ class RedAbsorptionWorkflowResources:
     ):
         self._concurrency = inputs.evaluation_concurrency
         self._protocol_hash = inputs.calculation_protocol.protocol_hash
+        self._timeout_seconds = inputs.spectrum_timeout_seconds
         self._cache = cache
         self._locks: dict[CacheKey, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
@@ -150,16 +151,30 @@ class RedAbsorptionWorkflowResources:
                 self._run_id, self._ledger_key(key), result.model_dump(mode="json")
             )
 
-    async def _reserve_execution(self, key: CacheKey) -> bool:
+    async def _claim_execution(self, key: CacheKey) -> BudgetClaimStatus:
         async with self._budget_lock:
             if self._ledger is not None:
-                return self._ledger.reserve(
+                return self._ledger.claim(
                     self._run_id, self._ledger_key(key), self._max_new_evaluations
                 )
             if self._execution_count >= self._max_new_evaluations:
-                return False
+                return BudgetClaimStatus.EXHAUSTED
             self._execution_count += 1
-            return True
+            return BudgetClaimStatus.RESERVED
+
+    async def _wait_for_recovery(self, key: CacheKey) -> SpectrumResult | None:
+        if self._ledger is None:
+            return None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._timeout_seconds
+        while True:
+            recovered = self._recover(key)
+            if recovered is not None:
+                return recovered
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return None
+            await asyncio.sleep(min(0.05, remaining))
 
 
 def _parent_source(inputs: RedAbsorptionRunInputs) -> dict[str, object]:
@@ -185,11 +200,36 @@ def _violates_protection_policy(
     commands = authoritative.get("commands")
     if not isinstance(graph, Mapping) or not isinstance(commands, (list, tuple)):
         return True
-    bond_atoms = {
-        bond.get("bond_id"): {bond.get("begin_atom_id"), bond.get("end_atom_id")}
-        for bond in graph.get("bonds", [])
-        if isinstance(bond, Mapping)
+    if len(commands) > 1 and any(
+        isinstance(command, Mapping)
+        and command.get("operation") in {"detach_fragment", "substitute_fragment"}
+        for command in commands
+    ):
+        # A multi-command transaction can change the component cut before a
+        # fragment removal. Fail closed rather than reimplement the editor.
+        return True
+    atoms = {
+        atom.get("atom_id")
+        for atom in graph.get("atoms", [])
+        if isinstance(atom, Mapping) and isinstance(atom.get("atom_id"), str)
     }
+    adjacency = {atom: set() for atom in atoms}
+    bond_atoms = {}
+    for bond in graph.get("bonds", []):
+        if not isinstance(bond, Mapping):
+            return True
+        identity = bond.get("bond_id")
+        begin = bond.get("begin_atom_id")
+        end = bond.get("end_atom_id")
+        if (
+            not isinstance(identity, str)
+            or begin not in adjacency
+            or end not in adjacency
+        ):
+            return True
+        bond_atoms[identity] = (begin, end)
+        adjacency[begin].add(end)
+        adjacency[end].add(begin)
     atom_fields = (
         "atom_id",
         "anchor_atom_id",
@@ -200,10 +240,61 @@ def _violates_protection_policy(
     for command in commands:
         if not isinstance(command, Mapping):
             return True
+        operation = command.get("operation")
         touched = {command.get(field) for field in atom_fields}
-        touched.update(bond_atoms.get(command.get("bond_id"), set()))
+        endpoints = bond_atoms.get(command.get("bond_id"), ())
+        touched.update(endpoints)
         if protected & touched:
             return True
+        if operation in {"detach_fragment", "substitute_fragment"}:
+            if len(endpoints) != 2:
+                return True
+            begin, end = endpoints
+            retained = command.get("retained_atom_id")
+            if retained not in adjacency:
+                return True
+            adjacency[begin].discard(end)
+            adjacency[end].discard(begin)
+            retained_component = set()
+            pending = [retained]
+            while pending:
+                atom = pending.pop()
+                if atom in retained_component:
+                    continue
+                retained_component.add(atom)
+                pending.extend(adjacency[atom] - retained_component)
+            discarded = set(adjacency) - retained_component
+            if protected & discarded:
+                return True
+            for atom in discarded:
+                for neighbor in adjacency[atom]:
+                    adjacency[neighbor].discard(atom)
+                adjacency.pop(atom, None)
+            for identity, pair in tuple(bond_atoms.items()):
+                if pair[0] in discarded or pair[1] in discarded:
+                    bond_atoms.pop(identity, None)
+            if operation == "substitute_fragment":
+                # Fragment-local IDs are outside the protected parent namespace.
+                opaque = f"@fragment-{len(adjacency)}"
+                adjacency[retained].add(opaque)
+                adjacency[opaque] = {retained}
+        elif operation == "remove_atom":
+            removed = command.get("atom_id")
+            if removed not in adjacency or protected & adjacency[removed]:
+                return True
+            for neighbor in tuple(adjacency[removed]):
+                adjacency[neighbor].discard(removed)
+            adjacency.pop(removed)
+        elif operation == "remove_bond" and len(endpoints) == 2:
+            begin, end = endpoints
+            adjacency[begin].discard(end)
+            adjacency[end].discard(begin)
+            bond_atoms.pop(command.get("bond_id"), None)
+        elif operation == "add_bond":
+            begin, end = command.get("begin"), command.get("end")
+            if begin in adjacency and end in adjacency:
+                adjacency[begin].add(end)
+                adjacency[end].add(begin)
     return False
 
 
@@ -431,75 +522,97 @@ class RedAbsorptionWorkflowToolProvider:
                         resources._cache_hit_count += 1
                         cache_hit = True
                     else:
-                        if not await resources._reserve_execution(key):
+                        claim = await resources._claim_execution(key)
+                        if claim is BudgetClaimStatus.COMPLETED:
+                            spectrum_result = resources._recover(key)
+                            if spectrum_result is None:
+                                return ToolResult(
+                                    ToolStatus.FAILED,
+                                    {"cache_key": list(key), "cache_hit": False},
+                                    error="completed evaluation cache is missing",
+                                )
+                            resources._cache_hit_count += 1
+                            cache_hit = True
+                        elif claim is BudgetClaimStatus.PENDING:
+                            spectrum_result = await resources._wait_for_recovery(key)
+                            if spectrum_result is None:
+                                return ToolResult(
+                                    ToolStatus.TIMEOUT,
+                                    {"cache_key": list(key), "cache_hit": False},
+                                    error="matching evaluation remains pending",
+                                )
+                            resources._cache_hit_count += 1
+                            cache_hit = True
+                        elif claim is BudgetClaimStatus.EXHAUSTED:
                             return ToolResult(
                                 ToolStatus.REJECTED,
                                 {"cache_key": list(key), "cache_hit": False},
                                 error="maximum new evaluation budget exhausted",
                             )
-                        command_result = await self._spectrum.execute_json(
-                            {
-                                "candidate": payload,
-                                "chemical_identity_hash": chemical_hash,
-                                "state_hash": state_hash,
-                                "geometry_hash": geometry_hash,
-                                "protocol": inputs.calculation_protocol.model_dump(
-                                    mode="json"
+                        if claim is BudgetClaimStatus.RESERVED:
+                            command_result = await self._spectrum.execute_json(
+                                {
+                                    "candidate": payload,
+                                    "chemical_identity_hash": chemical_hash,
+                                    "state_hash": state_hash,
+                                    "geometry_hash": geometry_hash,
+                                    "protocol": inputs.calculation_protocol.model_dump(
+                                        mode="json"
+                                    ),
+                                },
+                                cwd=context.workspace,
+                                timeout_seconds=inputs.spectrum_timeout_seconds,
+                            )
+                            spectrum_process = {
+                                "status": command_result.status.value,
+                                "exit_code": getattr(command_result, "exit_code", None),
+                                "elapsed_seconds": getattr(
+                                    command_result, "elapsed_seconds", None
                                 ),
-                            },
-                            cwd=context.workspace,
-                            timeout_seconds=inputs.spectrum_timeout_seconds,
-                        )
-                        spectrum_process = {
-                            "status": command_result.status.value,
-                            "exit_code": getattr(command_result, "exit_code", None),
-                            "elapsed_seconds": getattr(
-                                command_result, "elapsed_seconds", None
-                            ),
-                        }
-                        failed_process_payload = {
-                            "cache_key": list(key),
-                            "cache_hit": False,
-                            "spectrum_process": spectrum_process,
-                        }
-                        if command_result.status is JsonCommandStatus.TIMEOUT:
-                            return ToolResult(
-                                ToolStatus.TIMEOUT,
-                                failed_process_payload,
-                                error="spectrum command timed out",
-                            )
-                        if (
-                            command_result.status is not JsonCommandStatus.SUCCESS
-                            or command_result.stdout_text is None
-                        ):
-                            return ToolResult(
-                                ToolStatus.FAILED,
-                                failed_process_payload,
-                                error=f"spectrum command failed: {command_result.status.value}",
-                            )
-                        try:
-                            spectrum_result = SpectrumResult.model_validate_json(
-                                command_result.stdout_text
-                            )
-                        except (TypeError, ValueError) as error:
-                            return ToolResult(
-                                ToolStatus.FAILED,
-                                failed_process_payload,
-                                error=f"invalid spectrum result: {type(error).__name__}",
-                            )
-                        if (
-                            spectrum_result.provenance.protocol
-                            != inputs.calculation_protocol
-                            or spectrum_result.provenance.geometry_hash != geometry_hash
-                        ):
-                            return ToolResult(
-                                ToolStatus.FAILED,
-                                failed_process_payload,
-                                error="spectrum provenance mismatch",
-                            )
-                        resources._commit_result(key, spectrum_result)
-                        resources._cache[key] = spectrum_result
-                        cache_hit = False
+                            }
+                            failed_process_payload = {
+                                "cache_key": list(key),
+                                "cache_hit": False,
+                                "spectrum_process": spectrum_process,
+                            }
+                            if command_result.status is JsonCommandStatus.TIMEOUT:
+                                return ToolResult(
+                                    ToolStatus.TIMEOUT,
+                                    failed_process_payload,
+                                    error="spectrum command timed out",
+                                )
+                            if (
+                                command_result.status is not JsonCommandStatus.SUCCESS
+                                or command_result.stdout_text is None
+                            ):
+                                return ToolResult(
+                                    ToolStatus.FAILED,
+                                    failed_process_payload,
+                                    error=f"spectrum command failed: {command_result.status.value}",
+                                )
+                            try:
+                                spectrum_result = SpectrumResult.model_validate_json(
+                                    command_result.stdout_text
+                                )
+                            except (TypeError, ValueError) as error:
+                                return ToolResult(
+                                    ToolStatus.FAILED,
+                                    failed_process_payload,
+                                    error=f"invalid spectrum result: {type(error).__name__}",
+                                )
+                            if (
+                                spectrum_result.provenance.protocol
+                                != inputs.calculation_protocol
+                                or spectrum_result.provenance.geometry_hash != geometry_hash
+                            ):
+                                return ToolResult(
+                                    ToolStatus.FAILED,
+                                    failed_process_payload,
+                                    error="spectrum provenance mismatch",
+                                )
+                            resources._commit_result(key, spectrum_result)
+                            resources._cache[key] = spectrum_result
+                            cache_hit = False
             else:
                 if (
                     not isinstance(spectrum_result, SpectrumResult)

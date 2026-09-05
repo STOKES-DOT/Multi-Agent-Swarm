@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 
+import examples.red_absorption.preflight as preflight_module
 from examples.red_absorption.preflight import (
     PreflightDependencies,
     preflight_red_absorption,
     verify_red_absorption_preflight,
     verify_current_parent,
     _parse_auth_status,
+    _contract_identity,
+    _validate_storage_target,
 )
 from examples.red_absorption.search import run_red_absorption_search
 from multi_agent_pso.configuration import LoadedRunInputs
@@ -67,7 +71,16 @@ class ClosingEditor(FakeEditor):
         self.close_calls += 1
 
 
-@pytest.mark.parametrize("text", ["not logged in", "unauthenticated", "not authenticated"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "not logged in",
+        "unauthenticated",
+        "not authenticated",
+        "not currently logged in",
+        "authentication status: logged in previously but session expired",
+    ],
+)
 def test_auth_status_explicit_negative_markers_are_rejected(text):
     with pytest.raises(RuntimeError, match="authentication"):
         _parse_auth_status(text)
@@ -75,6 +88,120 @@ def test_auth_status_explicit_negative_markers_are_rejected(text):
 
 def test_auth_status_requires_explicit_positive_and_reports_chatgpt():
     assert _parse_auth_status("Logged in using ChatGPT") == "chatgpt"
+
+
+@pytest.mark.asyncio
+async def test_auth_spawn_has_bounded_handoff_guardian(monkeypatch):
+    release = preflight_module.asyncio.Event()
+
+    async def delayed_spawn():
+        await release.wait()
+        return preflight_module._AuthSpawnFailure(RuntimeError("late spawn"))
+
+    monkeypatch.setattr(preflight_module, "_capture_auth_spawn", delayed_spawn)
+    monkeypatch.setattr(preflight_module, "_AUTH_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(preflight_module, "_AUTH_SPAWN_HANDOFF_SECONDS", 0.01)
+    with pytest.raises(TimeoutError, match="spawn"):
+        await preflight_module._default_auth_probe()
+    assert preflight_module._AUTH_GUARDIANS
+    release.set()
+    await preflight_module.asyncio.gather(
+        *tuple(preflight_module._AUTH_GUARDIANS)
+    )
+    await preflight_module.asyncio.sleep(0)
+    assert not preflight_module._AUTH_GUARDIANS
+
+
+def test_storage_preflight_rejects_corrupt_run_database(tmp_path):
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    (runs / "runs.sqlite").write_bytes(b"not sqlite")
+    with pytest.raises(ValueError, match="SQLite|sqlite"):
+        _validate_storage_target(runs)
+
+
+def test_preflight_artifact_fifo_is_nonblocking(tmp_path):
+    import os
+
+    runs = tmp_path / "runs"
+    directory = runs / "artifacts" / "preflight"
+    directory.mkdir(parents=True)
+    os.mkfifo(directory / ("a" * 64 + ".json"))
+    loaded = fake_loaded_inputs(tmp_path)
+    with pytest.raises(ValueError, match="missing"):
+        verify_red_absorption_preflight(
+            fake_task(),
+            loaded,
+            runs,
+            versions={
+                "framework": "0.1.0",
+                "openai_codex_sdk": "0.147.0",
+                "local_codex_runtime": "local-codex-runtime:v1",
+                "molecule_editor": "0.1.0",
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_preflight_closes_owned_editor_when_spectrum_constructor_fails(
+    tmp_path, monkeypatch
+):
+    editor = ClosingEditor(parent_graph())
+    monkeypatch.setattr(preflight_module, "MoleculeEditorProvider", lambda: editor)
+
+    def fail_spectrum(_argv):
+        raise RuntimeError("spectrum constructor failed")
+
+    monkeypatch.setattr(preflight_module, "JsonCommandProvider", fail_spectrum)
+    with pytest.raises(RuntimeError, match="spectrum constructor failed"):
+        await preflight_red_absorption(
+            tmp_path / "task.yaml",
+            tmp_path / "inputs.yaml",
+            tmp_path / "runs",
+            dependencies=PreflightDependencies(
+                task_loader=lambda path: fake_task(),
+                input_loader=lambda path: fake_loaded_inputs(tmp_path),
+                auth_probe=lambda: {"authenticated": True, "method": "chatgpt"},
+                sdk_version="0.147.0",
+            ),
+        )
+    assert editor.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_current_parent_cleanup_preserves_primary_failure(tmp_path):
+    class BrokenEditor:
+        def __init__(self):
+            self.close_calls = 0
+
+        async def inspect(self, *args, **kwargs):
+            raise ValueError("parent mismatch")
+
+        async def aclose(self):
+            self.close_calls += 1
+            raise RuntimeError("close failed")
+
+    editor = BrokenEditor()
+    loaded = fake_loaded_inputs(tmp_path)
+    record = await preflight_red_absorption(
+        tmp_path / "task.yaml",
+        tmp_path / "inputs.yaml",
+        tmp_path / "runs",
+        dependencies=PreflightDependencies(
+            task_loader=lambda path: fake_task(),
+            input_loader=lambda path: loaded,
+            auth_probe=lambda: {"authenticated": True, "method": "chatgpt"},
+            molecule_editor=FakeEditor([], parent_graph()),
+            spectrum=FakeSpectrum(),
+            sdk_version="0.147.0",
+        ),
+    )
+    with pytest.raises(ValueError, match="parent mismatch") as captured:
+        await verify_current_parent(
+            loaded.value, record, tmp_path.resolve(), molecule_editor=editor
+        )
+    assert editor.close_calls == 1
+    assert any("close failed" in note for note in captured.value.__notes__)
 
 
 @pytest.mark.asyncio
@@ -170,6 +297,67 @@ async def test_preflight_uses_fake_boundaries_writes_artifact_but_no_run_db(tmp_
     with pytest.raises(ValueError, match="hash|integrity"):
         verify_red_absorption_preflight(
             fake_task(), loaded, tmp_path / "runs", versions=record.versions
+        )
+
+
+@pytest.mark.asyncio
+async def test_verifier_cross_checks_recomputed_record_fields_against_inputs(tmp_path):
+    loaded = fake_loaded_inputs(tmp_path)
+    runs = tmp_path / "runs"
+    record = await preflight_red_absorption(
+        tmp_path / "task.yaml",
+        tmp_path / "inputs.yaml",
+        runs,
+        dependencies=PreflightDependencies(
+            task_loader=lambda path: fake_task(),
+            input_loader=lambda path: loaded,
+            auth_probe=lambda: {"authenticated": True, "method": "chatgpt"},
+            molecule_editor=FakeEditor([], parent_graph()),
+            spectrum=FakeSpectrum(),
+            sdk_version="0.147.0",
+        ),
+    )
+    forged = record.model_dump(mode="json")
+    forged["protocol_backend"] = "forged"
+    displayed_keys = (
+        "protected_atom_ids",
+        "protected_smarts",
+        "protocol_functional",
+        "protocol_basis",
+        "protocol_method",
+        "protocol_backend",
+        "protocol_backend_version",
+        "geometry_workflow",
+        "spectrum_timeout_seconds",
+        "evaluation_concurrency",
+        "versions",
+        "authentication_method",
+        "backend_hardware",
+    )
+    displayed = {key: forged[key] for key in displayed_keys}
+    forged["authorized_fields_hash"] = hashlib.sha256(
+        json.dumps(displayed, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    forged["identity"] = _contract_identity(
+        forged["base_identity"],
+        forged["parent_state_hash"],
+        forged["parent_chemical_hash"],
+        forged["parent_geometry_hash"],
+        forged["preflight_spectrum_hash"],
+        forged["spectrum_evaluation_status"],
+        forged["passed"],
+        forged["authentication_method"],
+        forged["backend_hardware"],
+        forged["authorized_fields_hash"],
+    )
+    forged_record = type(record).model_validate(forged)
+    artifact = next((runs / "artifacts" / "preflight").glob("*.json"))
+    artifact.unlink()
+    data = forged_record.canonical_bytes()
+    (artifact.parent / f"{hashlib.sha256(data).hexdigest()}.json").write_bytes(data)
+    with pytest.raises(ValueError, match="mismatched"):
+        verify_red_absorption_preflight(
+            fake_task(), loaded, runs, versions=record.versions
         )
 
 
