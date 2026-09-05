@@ -22,7 +22,12 @@ except ImportError:  # pragma: no cover - fail-closed platform branch
 
 from pydantic import JsonValue
 
-from multi_agent_pso.core import ArtifactRef, EpisodeCheckpoint, StageEvent, StoredStageEvent
+from multi_agent_pso.core import (
+    ArtifactRef,
+    EpisodeCheckpoint,
+    StageEvent,
+    StoredStageEvent,
+)
 from multi_agent_pso.protocols import EpisodeClaimConflict, ToolResult, ToolStatus
 
 
@@ -64,7 +69,9 @@ def _require_iteration(value: object) -> int:
 def _require_hash(value: object) -> str:
     if not isinstance(value, str):
         raise TypeError("snapshot_hash must be a string")
-    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+    if len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
         raise ValueError("snapshot_hash must be a lowercase SHA-256 digest")
     return value
 
@@ -122,14 +129,47 @@ _REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
     "particles": ("run_id", "particle_id", "payload_json"),
     "iterations": ("run_id", "iteration_id", "snapshot_json"),
     "iteration_particles": ("run_id", "iteration_id", "particle_id", "payload_json"),
-    "stage_events": ("event_id", "run_id", "particle_id", "iteration_id", "stage", "attempt", "event_type", "payload_json"),
-    "hypotheses": ("hypothesis_id", "run_id", "particle_id", "iteration_id", "payload_json"),
+    "stage_events": (
+        "event_id",
+        "run_id",
+        "particle_id",
+        "iteration_id",
+        "stage",
+        "attempt",
+        "event_type",
+        "payload_json",
+    ),
+    "hypotheses": (
+        "hypothesis_id",
+        "run_id",
+        "particle_id",
+        "iteration_id",
+        "payload_json",
+    ),
     "tool_requests": ("request_id", "run_id", "payload_json"),
     "tool_results": ("idempotency_key", "result_json"),
-    "evaluations": ("evaluation_id", "run_id", "particle_id", "iteration_id", "payload_json"),
-    "pbest_history": ("history_id", "run_id", "particle_id", "iteration_id", "payload_json"),
+    "evaluations": (
+        "evaluation_id",
+        "run_id",
+        "particle_id",
+        "iteration_id",
+        "payload_json",
+    ),
+    "pbest_history": (
+        "history_id",
+        "run_id",
+        "particle_id",
+        "iteration_id",
+        "payload_json",
+    ),
     "gbest_history": ("history_id", "run_id", "iteration_id", "payload_json"),
-    "thread_checkpoints": ("checkpoint_id", "run_id", "particle_id", "iteration_id", "payload_json"),
+    "thread_checkpoints": (
+        "checkpoint_id",
+        "run_id",
+        "particle_id",
+        "iteration_id",
+        "payload_json",
+    ),
     "artifact_index": ("relative_path", "run_id", "artifact_json"),
 }
 
@@ -141,7 +181,9 @@ def _normalized_schema_sql(value: str) -> str:
 def _schema_fingerprint(connection: sqlite3.Connection) -> dict[str, str]:
     return {
         row["name"]: _normalized_schema_sql(row["sql"])
-        for row in connection.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table'")
+        for row in connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+        )
         if not row["name"].startswith("sqlite_")
     }
 
@@ -168,7 +210,9 @@ class SQLiteRunStore:
 
     def __init__(self, database_path: Path) -> None:
         self._path = _require_path(database_path)
-        self._claim_directory = self._path.with_name(f".{self._path.name}.episode-locks")
+        self._claim_directory = self._path.with_name(
+            f".{self._path.name}.episode-locks"
+        )
         created = self._prepare_database_file()
         if not created:
             self._validate_existing_database_read_only()
@@ -179,7 +223,9 @@ class SQLiteRunStore:
                 for statement in _SCHEMA.split(";"):
                     if statement.strip():
                         connection.execute(statement)
-                connection.execute("INSERT INTO schema_metadata VALUES (1, ?)", (_SCHEMA_VERSION,))
+                connection.execute(
+                    "INSERT INTO schema_metadata VALUES (1, ?)", (_SCHEMA_VERSION,)
+                )
             else:
                 self._validate_schema(connection)
             connection.commit()
@@ -192,6 +238,58 @@ class SQLiteRunStore:
         finally:
             connection.close()
             self._secure_database_files(suppress_errors=True)
+
+    def list_run_ids(self) -> tuple[str, ...]:
+        connection = self._connect()
+        try:
+            return tuple(
+                row["run_id"]
+                for row in connection.execute("SELECT run_id FROM runs ORDER BY rowid")
+            )
+        finally:
+            connection.close()
+
+    def list_iteration_snapshots_json(
+        self, run_id: str
+    ) -> tuple[Mapping[str, JsonValue], ...]:
+        run_id = _require_identifier(run_id, "run_id")
+        connection = self._connect()
+        try:
+            return tuple(
+                json.loads(row["snapshot_json"])
+                for row in connection.execute(
+                    "SELECT snapshot_json FROM iterations WHERE run_id = ? ORDER BY iteration_id",
+                    (run_id,),
+                )
+            )
+        finally:
+            connection.close()
+
+    def list_run_stage_events(self, run_id: str) -> tuple[StoredStageEvent, ...]:
+        run_id = _require_identifier(run_id, "run_id")
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """SELECT event_id, run_id, particle_id, iteration_id, stage, attempt, event_type, payload_json FROM stage_events WHERE run_id = ? ORDER BY event_id""",
+                (run_id,),
+            ).fetchall()
+            return tuple(
+                StoredStageEvent(
+                    sequence=row["event_id"],
+                    event=StageEvent(
+                        run_id=row["run_id"],
+                        particle_id=row["particle_id"],
+                        iteration_id=row["iteration_id"],
+                        stage=row["stage"],
+                        attempt=row["attempt"],
+                        event_type=row["event_type"],
+                        payload=json.loads(row["payload_json"]),
+                    ),
+                )
+                for row in rows
+            )
+        finally:
+            connection.close()
 
     @contextmanager
     def episode_claim(
@@ -208,9 +306,7 @@ class SQLiteRunStore:
         digest = hashlib.sha256(key_json.encode("utf-8")).hexdigest()
         registry_key = (str(self._path), digest)
         with _CLAIM_THREAD_GUARD:
-            thread_lock = _CLAIM_THREAD_LOCKS.setdefault(
-                registry_key, threading.Lock()
-            )
+            thread_lock = _CLAIM_THREAD_LOCKS.setdefault(registry_key, threading.Lock())
         if not thread_lock.acquire(blocking=False):
             raise EpisodeClaimConflict("particle episode is already claimed")
         directory_fd: int | None = None
@@ -242,10 +338,7 @@ class SQLiteRunStore:
             if (
                 not stat.S_ISREG(lock_metadata.st_mode)
                 or lock_metadata.st_nlink != 1
-                or (
-                    hasattr(os, "getuid")
-                    and lock_metadata.st_uid != os.getuid()
-                )
+                or (hasattr(os, "getuid") and lock_metadata.st_uid != os.getuid())
             ):
                 raise RuntimeError("episode claim path is not a safe regular file")
             os.fchmod(lock_fd, 0o600)
@@ -313,14 +406,18 @@ class SQLiteRunStore:
             if str(mode).lower() == "wal":
                 return
             try:
-                switched_mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                switched_mode = connection.execute(
+                    "PRAGMA journal_mode=WAL"
+                ).fetchone()[0]
                 if str(switched_mode).lower() == "wal":
                     return
             except sqlite3.OperationalError as error:
                 if "locked" not in str(error).lower():
                     raise
             if attempt + 1 == _WAL_MAX_ATTEMPTS or time.monotonic() >= deadline:
-                raise sqlite3.OperationalError("timed out switching SQLite journal mode to WAL")
+                raise sqlite3.OperationalError(
+                    "timed out switching SQLite journal mode to WAL"
+                )
             time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
             delay = min(delay * 2, 0.1)
 
@@ -328,7 +425,9 @@ class SQLiteRunStore:
     def _table_names(connection: sqlite3.Connection) -> set[str]:
         return {
             row["name"]
-            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
             if not row["name"].startswith("sqlite_")
         }
 
@@ -337,7 +436,9 @@ class SQLiteRunStore:
         if "schema_metadata" not in tables:
             raise RuntimeError("database has no schema metadata")
         for table, columns in _REQUIRED_COLUMNS.items():
-            actual = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+            actual = {
+                row["name"] for row in connection.execute(f"PRAGMA table_info({table})")
+            }
             if not set(columns) <= actual:
                 raise RuntimeError("unsupported schema layout")
         if _schema_fingerprint(connection) != _EXPECTED_SCHEMA_FINGERPRINT:
@@ -359,7 +460,9 @@ class SQLiteRunStore:
 
     def _prepare_database_file(self) -> bool:
         try:
-            descriptor = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            descriptor = os.open(
+                self._path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
         except FileExistsError:
             if self._path.is_symlink():
                 raise ValueError("database_path must not be a symlink")
@@ -536,7 +639,9 @@ class SQLiteRunStore:
             if run_row is None:
                 raise sqlite3.IntegrityError("unknown run_id")
             if run_row["snapshot_hash"] != checkpoint.protocol_snapshot_hash:
-                raise ValueError("checkpoint protocol hash does not match run snapshot hash")
+                raise ValueError(
+                    "checkpoint protocol hash does not match run snapshot hash"
+                )
             existing_rows = connection.execute(
                 """SELECT event_id, run_id, particle_id, iteration_id, stage,
                 attempt, event_type, payload_json FROM stage_events
@@ -568,8 +673,13 @@ class SQLiteRunStore:
             if matching_rows:
                 existing_row = matching_rows[0]
                 existing_event = self._stage_event_from_row(existing_row)
-                if _canonical_json(existing_event.model_dump(mode="json")) != canonical_event:
-                    raise ValueError("stage transition conflict: terminal event differs")
+                if (
+                    _canonical_json(existing_event.model_dump(mode="json"))
+                    != canonical_event
+                ):
+                    raise ValueError(
+                        "stage transition conflict: terminal event differs"
+                    )
                 checkpoint_rows = connection.execute(
                     """SELECT payload_json FROM thread_checkpoints
                     WHERE run_id = ? AND particle_id = ? AND iteration_id = ?
@@ -578,7 +688,9 @@ class SQLiteRunStore:
                 ).fetchall()
                 matching_checkpoint: EpisodeCheckpoint | None = None
                 for row in checkpoint_rows:
-                    candidate = EpisodeCheckpoint.model_validate(json.loads(row["payload_json"]))
+                    candidate = EpisodeCheckpoint.model_validate(
+                        json.loads(row["payload_json"])
+                    )
                     if candidate.terminal_event_sequence == existing_row["event_id"]:
                         matching_checkpoint = candidate
                         break
@@ -593,7 +705,9 @@ class SQLiteRunStore:
             sequence = self._insert_stage_event(connection, event)
             stored_checkpoint_payload = dict(input_checkpoint)
             stored_checkpoint_payload["terminal_event_sequence"] = sequence
-            stored_checkpoint = EpisodeCheckpoint.model_validate(stored_checkpoint_payload)
+            stored_checkpoint = EpisodeCheckpoint.model_validate(
+                stored_checkpoint_payload
+            )
             checkpoint_json = _canonical_json(stored_checkpoint.model_dump(mode="json"))
             connection.execute(
                 """INSERT INTO thread_checkpoints
@@ -711,8 +825,7 @@ class SQLiteRunStore:
                     len(resolution_rows) != 1
                     or resolution_rows[0]["event_id"] != sequence
                     or (
-                        interrupted_rows
-                        and interrupted_rows[0]["event_id"] >= sequence
+                        interrupted_rows and interrupted_rows[0]["event_id"] >= sequence
                     )
                 ):
                     raise ValueError(
@@ -830,7 +943,9 @@ class SQLiteRunStore:
                     raise ValueError("checkpoint must serialize as an object")
                 return value
             except Exception as error:
-                raise RuntimeError("store corrupted: invalid stage checkpoint") from error
+                raise RuntimeError(
+                    "store corrupted: invalid stage checkpoint"
+                ) from error
         finally:
             connection.close()
             self._secure_database_files(suppress_errors=True)
@@ -868,7 +983,9 @@ class SQLiteRunStore:
                 "SELECT result_json FROM tool_results WHERE idempotency_key = ?", (key,)
             ).fetchone()
             if row is None:
-                connection.execute("INSERT INTO tool_results VALUES (?, ?)", (key, serialized))
+                connection.execute(
+                    "INSERT INTO tool_results VALUES (?, ?)", (key, serialized)
+                )
             elif row["result_json"] != serialized:
                 raise ValueError("idempotency key conflict: committed result differs")
             self._secure_database_files()
@@ -880,20 +997,29 @@ class SQLiteRunStore:
             connection.close()
             self._secure_database_files(suppress_errors=True)
 
-    def iteration_transaction(self, run_id: str, iteration_id: int) -> "_IterationTransaction":
+    def iteration_transaction(
+        self, run_id: str, iteration_id: int
+    ) -> "_IterationTransaction":
         return _IterationTransaction(
             self,
             _require_identifier(run_id, "run_id"),
             _require_iteration(iteration_id),
         )
 
-    def get_particle_json(self, run_id: str, particle_id: str) -> dict[str, JsonValue] | None:
+    def get_particle_json(
+        self, run_id: str, particle_id: str
+    ) -> dict[str, JsonValue] | None:
         return self._get_json(
             "SELECT payload_json FROM particles WHERE run_id = ? AND particle_id = ?",
-            (_require_identifier(run_id, "run_id"), _require_identifier(particle_id, "particle_id")),
+            (
+                _require_identifier(run_id, "run_id"),
+                _require_identifier(particle_id, "particle_id"),
+            ),
         )
 
-    def get_iteration_snapshot_json(self, run_id: str, iteration_id: int) -> dict[str, JsonValue] | None:
+    def get_iteration_snapshot_json(
+        self, run_id: str, iteration_id: int
+    ) -> dict[str, JsonValue] | None:
         return self._get_json(
             "SELECT snapshot_json FROM iterations WHERE run_id = ? AND iteration_id = ?",
             (_require_identifier(run_id, "run_id"), _require_iteration(iteration_id)),
@@ -908,7 +1034,9 @@ class SQLiteRunStore:
             (_require_identifier(run_id, "run_id"),),
         )
 
-    def _get_json(self, query: str, parameters: tuple[object, ...]) -> dict[str, JsonValue] | None:
+    def _get_json(
+        self, query: str, parameters: tuple[object, ...]
+    ) -> dict[str, JsonValue] | None:
         connection = self._connect()
         try:
             row = connection.execute(query, parameters).fetchone()
@@ -939,9 +1067,12 @@ class _IterationTransaction:
         try:
             self._connection.execute("BEGIN IMMEDIATE")
             store._secure_database_files()
-            if self._connection.execute(
-                "SELECT 1 FROM runs WHERE run_id = ?", (run_id,)
-            ).fetchone() is None:
+            if (
+                self._connection.execute(
+                    "SELECT 1 FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                is None
+            ):
                 raise ValueError("unknown run_id")
         except BaseException:
             self._connection.rollback()
@@ -959,11 +1090,15 @@ class _IterationTransaction:
             self.commit() if exc_type is None else self.rollback()
         return False
 
-    def put_particle_json(self, particle_id: str, payload: Mapping[str, JsonValue]) -> None:
+    def put_particle_json(
+        self, particle_id: str, payload: Mapping[str, JsonValue]
+    ) -> None:
         particle = _require_identifier(particle_id, "particle_id")
         self._particles[particle] = self._payload_json(payload)
 
-    def put_pbest_json(self, particle_id: str, payload: Mapping[str, JsonValue]) -> None:
+    def put_pbest_json(
+        self, particle_id: str, payload: Mapping[str, JsonValue]
+    ) -> None:
         particle = _require_identifier(particle_id, "particle_id")
         self._pbests[particle] = self._payload_json(payload)
 

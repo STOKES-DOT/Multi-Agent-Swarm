@@ -22,6 +22,7 @@ from multi_agent_pso.core import AgentStage, EpisodeStatus, EvaluationStatus
 from multi_agent_pso.core.topology import RingTopology
 from multi_agent_pso.core.update_rule import ConstrictedUpdateRule
 from multi_agent_pso.orchestration import AgentLoop, SynchronousSwarmRunner
+from multi_agent_pso.reporting import build_run_report
 from multi_agent_pso.protocols import (
     CandidateRef,
     StageRequest,
@@ -353,6 +354,14 @@ async def test_three_by_two_red_absorption_flow_is_audited_and_cached(tmp_path: 
     assert tool.execution_count == 1
     assert tool.cache_hit_count == 5
     assert editor.calls == 12 and editor.edit_calls == 6
+    report = build_run_report(result)
+    assert len(report.iterations) == 2 and all(
+        item.evaluated == 3 for item in report.iterations
+    )
+    assert sum(item.completed_calculation for item in report.iterations) == 6
+    assert sum(item.spectrum_execution_count for item in report.iterations) == 1
+    assert sum(item.cache_hits for item in report.iterations) == 5
+    assert "absorption oscillator-strength proxy" in report.final_claim
     assert all(
         config == load_valid_inputs(tmp_path).geometry.model_dump(mode="json")
         for config in editor.geometry_configs
@@ -508,3 +517,4 @@ async def test_workflow_maps_spectrum_process_boundaries(
     )
     result = await tool.execute(request, context)
     assert result.status is expected and tool.execution_count == 1
+    assert result.payload["spectrum_process"]["status"] == spectrum.status.value

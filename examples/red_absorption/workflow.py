@@ -324,6 +324,7 @@ class RedAbsorptionWorkflowToolProvider:
         lock = await resources._lock_for(key)
         async with lock:
             spectrum_result = resources._cache.get(key)
+            spectrum_process = None
             if spectrum_result is None:
                 async with resources._spectrum_slots:
                     spectrum_result = resources._cache.get(key)
@@ -345,9 +346,18 @@ class RedAbsorptionWorkflowToolProvider:
                             cwd=context.workspace,
                             timeout_seconds=inputs.spectrum_timeout_seconds,
                         )
+                        spectrum_process = {
+                            "status": command_result.status.value,
+                            "exit_code": getattr(command_result, "exit_code", None),
+                            "elapsed_seconds": getattr(
+                                command_result, "elapsed_seconds", None
+                            ),
+                        }
                         if command_result.status is JsonCommandStatus.TIMEOUT:
                             return ToolResult(
-                                ToolStatus.TIMEOUT, error="spectrum command timed out"
+                                ToolStatus.TIMEOUT,
+                                {"spectrum_process": spectrum_process},
+                                error="spectrum command timed out",
                             )
                         if (
                             command_result.status is not JsonCommandStatus.SUCCESS
@@ -355,6 +365,7 @@ class RedAbsorptionWorkflowToolProvider:
                         ):
                             return ToolResult(
                                 ToolStatus.FAILED,
+                                {"spectrum_process": spectrum_process},
                                 error=f"spectrum command failed: {command_result.status.value}",
                             )
                         try:
@@ -364,6 +375,7 @@ class RedAbsorptionWorkflowToolProvider:
                         except (TypeError, ValueError) as error:
                             return ToolResult(
                                 ToolStatus.FAILED,
+                                {"spectrum_process": spectrum_process},
                                 error=f"invalid spectrum result: {type(error).__name__}",
                             )
                         if (
@@ -372,7 +384,9 @@ class RedAbsorptionWorkflowToolProvider:
                             or spectrum_result.provenance.geometry_hash != geometry_hash
                         ):
                             return ToolResult(
-                                ToolStatus.FAILED, error="spectrum provenance mismatch"
+                                ToolStatus.FAILED,
+                                {"spectrum_process": spectrum_process},
+                                error="spectrum provenance mismatch",
                             )
                         resources._cache[key] = spectrum_result
                         cache_hit = False
@@ -394,6 +408,7 @@ class RedAbsorptionWorkflowToolProvider:
                 "spectrum_result": spectrum_result.model_dump(mode="json"),
                 "cache_key": list(key),
                 "cache_hit": cache_hit,
+                "spectrum_process": spectrum_process,
             }
         )
         return ToolResult(ToolStatus.SUCCESS, result_payload)
