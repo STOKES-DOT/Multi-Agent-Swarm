@@ -220,6 +220,79 @@ def test_rejects_file_replacement_while_resolving_path(
         load_run_inputs(path, FixtureInputs)
 
 
+def test_rejects_atomic_replacement_after_resolve_without_reading_new_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_inputs(tmp_path / "inputs.yaml", b"name: original1\ncount: 1\n")
+    replacement = _write_inputs(
+        tmp_path / "replacement.yaml", b"name: replace2\ncount: 2\n"
+    )
+    original_inode = path.stat().st_ino
+    replacement_inode = replacement.stat().st_ino
+    original_resolver = run_inputs_module._resolved_input_path
+    original_read = os.read
+    read_inodes: list[int] = []
+
+    def replace_after_resolve(target: Path) -> tuple[Path, os.stat_result]:
+        resolved = original_resolver(target)
+        replacement.replace(path)
+        return resolved
+
+    def tracked_read(fd: int, size: int) -> bytes:
+        read_inodes.append(os.fstat(fd).st_ino)
+        return original_read(fd, size)
+
+    monkeypatch.setattr(
+        run_inputs_module, "_resolved_input_path", replace_after_resolve
+    )
+    monkeypatch.setattr(run_inputs_module.os, "read", tracked_read)
+
+    with pytest.raises(ValueError, match="changed"):
+        load_run_inputs(path, FixtureInputs)
+
+    assert original_inode != replacement_inode
+    assert path.stat().st_ino == replacement_inode
+    assert read_inodes == []
+
+
+@pytest.mark.parametrize("mutation", ["grow", "mtime"])
+def test_rejects_same_inode_change_after_resolve_without_reading_mutated_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    path = _write_inputs(tmp_path / "inputs.yaml", b"name: original1\ncount: 1\n")
+    original_inode = path.stat().st_ino
+    original_resolver = run_inputs_module._resolved_input_path
+    original_read = os.read
+    read_inodes: list[int] = []
+
+    def mutate_after_resolve(target: Path) -> tuple[Path, os.stat_result]:
+        resolved = original_resolver(target)
+        if mutation == "grow":
+            with path.open("ab") as handle:
+                handle.write(b"options: {}\n")
+        else:
+            metadata = path.stat()
+            os.utime(
+                path,
+                ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000_000),
+            )
+        assert path.stat().st_ino == original_inode
+        return resolved
+
+    def tracked_read(fd: int, size: int) -> bytes:
+        read_inodes.append(os.fstat(fd).st_ino)
+        return original_read(fd, size)
+
+    monkeypatch.setattr(run_inputs_module, "_resolved_input_path", mutate_after_resolve)
+    monkeypatch.setattr(run_inputs_module.os, "read", tracked_read)
+
+    with pytest.raises(ValueError, match="changed"):
+        load_run_inputs(path, FixtureInputs)
+
+    assert path.stat().st_ino == original_inode
+    assert read_inodes == []
+
+
 def test_rejects_namespace_replacement_after_open_and_closes_descriptors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

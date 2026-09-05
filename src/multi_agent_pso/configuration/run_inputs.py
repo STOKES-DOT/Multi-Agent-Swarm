@@ -60,7 +60,7 @@ def _require_secure_open_support() -> None:
         raise RuntimeError("secure run-input loading is unsupported on this platform")
 
 
-def _resolved_input_path(path: Path) -> Path:
+def _resolved_input_path(path: Path) -> tuple[Path, os.stat_result]:
     if not isinstance(path, Path):
         raise TypeError("path must be a pathlib.Path")
     try:
@@ -78,7 +78,7 @@ def _resolved_input_path(path: Path) -> Path:
         raise ValueError("run-input path must resolve to an existing regular file")
     if _snapshot_identity(raw_metadata) != _snapshot_identity(resolved_metadata):
         raise ValueError("run-input file changed while resolving its path")
-    return resolved
+    return resolved, resolved_metadata
 
 
 def _close_descriptors(
@@ -101,7 +101,11 @@ def _close_descriptors(
         raise first_error
 
 
-def _read_snapshot(path: Path, max_bytes: int) -> tuple[bytes, str]:
+def _read_snapshot(
+    path: Path,
+    initial_snapshot: os.stat_result,
+    max_bytes: int,
+) -> tuple[bytes, str]:
     _require_secure_open_support()
     directory_fd: int | None = None
     file_fd: int | None = None
@@ -124,6 +128,8 @@ def _read_snapshot(path: Path, max_bytes: int) -> tuple[bytes, str]:
         before = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
         if not stat.S_ISREG(before.st_mode):
             raise ValueError("run-input path must identify a regular non-symlink file")
+        if _snapshot_identity(before) != _snapshot_identity(initial_snapshot):
+            raise ValueError("run-input file changed after path resolution")
         if before.st_size > max_bytes:
             raise ValueError("run-input file exceeds max_bytes")
         file_fd = os.open(
@@ -135,7 +141,10 @@ def _read_snapshot(path: Path, max_bytes: int) -> tuple[bytes, str]:
             dir_fd=directory_fd,
         )
         opened = os.fstat(file_fd)
-        if not stat.S_ISREG(opened.st_mode) or _snapshot_identity(opened) != _snapshot_identity(before):
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _snapshot_identity(opened) != _snapshot_identity(initial_snapshot)
+        ):
             raise ValueError("run-input file changed before open")
 
         contents = bytearray()
@@ -206,9 +215,13 @@ def load_run_inputs(
         raise TypeError("max_bytes must be an integer")
     if max_bytes <= 0:
         raise ValueError("max_bytes must be positive")
-    resolved = _resolved_input_path(path)
+    resolved, initial_snapshot = _resolved_input_path(path)
     try:
-        contents, raw_sha256 = _read_snapshot(resolved, max_bytes)
+        contents, raw_sha256 = _read_snapshot(
+            resolved,
+            initial_snapshot,
+            max_bytes,
+        )
     except OSError as error:
         raise ValueError("run-input file could not be read safely") from error
     try:
