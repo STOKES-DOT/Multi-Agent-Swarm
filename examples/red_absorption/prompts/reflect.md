@@ -1,1 +1,1 @@
-Compare the recorded prediction with the authoritative Evaluation. Explain the absorption result and recommend a next direction without rewriting Evaluation fields, reward, fitness, feasibility, or status. Return only schema-valid JSON.
+Echo the supplied authorization_id exactly. Compare the recorded prediction with the authoritative Evaluation. Explain the absorption result and recommend a next direction without rewriting Evaluation fields, reward, fitness, feasibility, or status. Return only schema-valid JSON.
