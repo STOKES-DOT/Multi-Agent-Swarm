@@ -7,27 +7,37 @@ from types import SimpleNamespace
 
 import pytest
 
-from examples.red_absorption.flame_adapter import FlameRedAbsorptionTaskAdapter
+from examples.red_absorption.flame_adapter import (
+    FlameRedAbsorptionTaskAdapter,
+    create_position_space,
+)
 from examples.red_absorption.flame_inputs import FlameRunInputs
 from examples.red_absorption.flame_proxy import FlamePrediction, FlameProxyEvaluator
+from examples.red_absorption.flame_stage_context import FlameStageContextProvider
 from examples.red_absorption.flame_workflow import (
     FlameWorkflowResources,
     FlameWorkflowToolProvider,
     flame_cache_key,
 )
 from multi_agent_pso.core import AgentStage, EvaluationStatus
+from multi_agent_pso.core.topology import RingTopology
+from multi_agent_pso.core.update_rule import ConstrictedUpdateRule
+from multi_agent_pso.orchestration import AgentLoop, SynchronousSwarmRunner
 from multi_agent_pso.orchestration.agent_loop import _bounded_json_copy
-from multi_agent_pso.protocols import ToolContext, ToolRequest, ToolStatus
+from multi_agent_pso.protocols import ToolContext, ToolRequest, ToolResult, ToolStatus
 from multi_agent_pso.resources import DurableBudgetLedger
 from multi_agent_pso.storage import FileArtifactStore
 from multi_agent_pso.tools import JsonCommandStatus
 from tests.integration.test_red_absorption_flow import (
     CANDIDATE_HASH,
     FakeEditor,
+    FakeWiki,
     PARENT_GEOMETRY_HASH,
     PARENT_HASH,
+    SchemaRuntime,
     parent_graph,
 )
+from tests.orchestration.fakes import FakeResources, FakeRunStore
 
 
 MODEL_HASHES = {
@@ -80,7 +90,7 @@ class FakeFlameCommand:
     async def execute_json(self, payload, **kwargs):
         self.calls.append((payload, kwargs))
         prediction = FlamePrediction(
-            dye_smiles="N",
+            dye_smiles=payload["dye_smiles"],
             solvent_smiles="ClCCl",
             absorption_nm=650.0,
             emission_nm=700.0,
@@ -99,7 +109,7 @@ class FakeFlameCommand:
         self.close_calls += 1
 
 
-def authorized_request(tmp_path: Path):
+def authorized_request(tmp_path: Path, *, attempt: int = 0):
     commands = [{"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}]
     payload = {
         "inspected_source_hash": PARENT_HASH,
@@ -128,7 +138,7 @@ def authorized_request(tmp_path: Path):
         "p0",
         0,
         AgentStage.EXECUTING,
-        0,
+        attempt,
         tmp_path.resolve(),
         metadata={"proposal": proposal},
     )
@@ -231,6 +241,109 @@ async def test_workflow_externalizes_full_molecule_result_as_artifact(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_third_rejection_rolls_back_and_evaluates_parent(tmp_path: Path):
+    run_inputs = inputs(tmp_path)
+
+    class RejectingEditor(FakeEditor):
+        async def inspect(self, *args, **kwargs):
+            result = await super().inspect(*args, **kwargs)
+            result.payload["canonical_isomeric_smiles"] = "C"
+            return result
+
+    editor = RejectingEditor([], parent_graph(), edit_mode="invalid")
+    command = FakeFlameCommand()
+    resources = FlameWorkflowResources.from_inputs(
+        run_inputs, max_new_evaluations=10
+    )
+    artifact_root = tmp_path / "artifacts"
+    provider = FlameWorkflowToolProvider.bind(
+        run_inputs,
+        editor,
+        resources,
+        flame=command,
+        artifact_store=FileArtifactStore(artifact_root),
+        rollback_after_rejections=3,
+    )
+
+    first_request, first_context = authorized_request(tmp_path, attempt=0)
+    second_request, second_context = authorized_request(tmp_path, attempt=1)
+    third_request, third_context = authorized_request(tmp_path, attempt=2)
+    first = await provider.execute(first_request, first_context)
+    second = await provider.execute(second_request, second_context)
+    third = await provider.execute(third_request, third_context)
+
+    assert first.status is ToolStatus.REJECTED
+    assert second.status is ToolStatus.REJECTED
+    assert third.status is ToolStatus.SUCCESS
+    rollback = third.payload["rollback"]
+    assert rollback["performed"] is True
+    assert rollback["reason"] == "MoleculeEditor rejected edit"
+    assert rollback["failed_proposal_attempt"] == 2
+    assert rollback["rejection_count"] == 3
+    assert len(rollback["rejected_commands_sha256"]) == 64
+    assert third.payload["state_hash"] == PARENT_HASH
+    assert third.payload["chemical_identity_hash"] == "f" * 64
+    assert third.payload["canonical_isomeric_smiles"] == "C"
+    assert third.payload["committed_commands"] == ()
+    assert command.calls[0][0]["dye_smiles"] == "C"
+    assert len(command.calls) == 1
+    assert len(third.artifacts) == 1
+    assert "graph" not in third.payload
+
+
+@pytest.mark.asyncio
+async def test_rollback_candidate_preserves_parent_for_next_generation(
+    tmp_path: Path,
+) -> None:
+    run_inputs = inputs(tmp_path)
+
+    class RejectingEditor(FakeEditor):
+        async def inspect(self, *args, **kwargs):
+            result = await super().inspect(*args, **kwargs)
+            result.payload["canonical_isomeric_smiles"] = "C"
+            return result
+
+    provider = FlameWorkflowToolProvider.bind(
+        run_inputs,
+        RejectingEditor([], parent_graph(), edit_mode="invalid"),
+        FlameWorkflowResources.from_inputs(
+            run_inputs, max_new_evaluations=10
+        ),
+        flame=FakeFlameCommand(),
+        artifact_store=FileArtifactStore(tmp_path / "artifacts"),
+        rollback_after_rejections=3,
+    )
+    request, context = authorized_request(tmp_path, attempt=2)
+    result = await provider.execute(request, context)
+
+    candidate = FlameRedAbsorptionTaskAdapter().candidate_from_tool_result(
+        result, context
+    )
+
+    assert candidate.reference == PARENT_HASH
+    assert candidate.candidate_hash == "f" * 64
+    assert candidate.metadata["committed_commands"] == ()
+    assert candidate.metadata["rollback"]["performed"] is True
+    assert candidate.metadata["continuation_state"] == {
+        "kind": "canonical_smiles",
+        "canonical_isomeric_smiles": "C",
+        "chemical_identity_hash": "f" * 64,
+        "state_hash": PARENT_HASH,
+    }
+    tampered_payload = result.to_json()["payload"]
+    tampered_payload["rollback"]["rejected_commands_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="rollback candidate authority"):
+        FlameRedAbsorptionTaskAdapter().candidate_from_tool_result(
+            ToolResult(
+                ToolStatus.SUCCESS,
+                tampered_payload,
+                result.artifacts,
+            ),
+            context,
+        )
+
+
+@pytest.mark.asyncio
 async def test_workflow_recovers_flame_commit_after_artifact_interruption(
     tmp_path: Path,
 ) -> None:
@@ -281,3 +394,122 @@ async def test_workflow_recovers_flame_commit_after_artifact_interruption(
     assert len(command.calls) == 1
     assert recovered_resources.execution_count == 1
     ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_rollback_parent_is_reflected_then_edited_again_next_generation(
+    tmp_path: Path,
+) -> None:
+    run_inputs = inputs(tmp_path)
+    order: list[str] = []
+
+    class RejectingEditor(FakeEditor):
+        async def inspect(self, *args, **kwargs):
+            result = await super().inspect(*args, **kwargs)
+            result.payload["canonical_isomeric_smiles"] = "C"
+            return result
+
+    class RecordingRuntime(SchemaRuntime):
+        def __init__(self, events):
+            super().__init__(events)
+            self.reflection_contexts = []
+            self.hypothesis_contexts = []
+
+        async def run_stage(self, thread, request):
+            boundary = json.loads(
+                request.prompt.split("Canonical task context:\n", 1)[1]
+            )
+            if request.stage is AgentStage.HYPOTHESIZING:
+                self.hypothesis_contexts.append(boundary["context"])
+            if request.stage is AgentStage.REFLECTING:
+                self.reflection_contexts.append(boundary["context"])
+            return await super().run_stage(thread, request)
+
+    editor = RejectingEditor(order, parent_graph(), edit_mode="invalid")
+    runtime = RecordingRuntime(order)
+    adapter = FlameRedAbsorptionTaskAdapter()
+    artifacts = FileArtifactStore(tmp_path / "artifacts")
+    workflow_resources = FlameWorkflowResources.from_inputs(
+        run_inputs, max_new_evaluations=10
+    )
+    flame = FakeFlameCommand()
+    tool = FlameWorkflowToolProvider.bind(
+        run_inputs,
+        editor,
+        workflow_resources,
+        flame=flame,
+        artifact_store=artifacts,
+        rollback_after_rejections=3,
+    )
+    store = FakeRunStore()
+    slots = FakeResources()
+    stage_context = FlameStageContextProvider(
+        run_inputs,
+        FakeWiki(order),
+        editor,
+        inherit_previous_candidate=True,
+        run_store=store,
+    )
+
+    def make_loop(particle_id, target, continuation_state=None):
+        return AgentLoop(
+            runtime=runtime,
+            task_adapter=adapter,
+            evaluator=FlameProxyEvaluator(),
+            tool_provider=tool,
+            artifact_store=artifacts,
+            resource_manager=slots,
+            run_store=store,
+            target_position=target,
+            workspace=tmp_path.resolve(),
+            protocol_snapshot_hash="1" * 64,
+            stage_context_provider=stage_context,
+            initial_context=(
+                {"parent_continuation_state": continuation_state}
+                if continuation_state is not None
+                else None
+            ),
+            capture_candidate_continuation=True,
+            max_proposal_attempts=3,
+            reproposal_on_tool_rejection=True,
+        )
+
+    runner = SynchronousSwarmRunner(
+        run_id="rollback-run",
+        run_seed=7,
+        config_snapshot_hash="1" * 64,
+        space=create_position_space(),
+        adapter=adapter,
+        topology=RingTopology(),
+        update_rule=ConstrictedUpdateRule(),
+        store=store,
+        episode_factory=lambda target: make_loop("p0", target),
+        continuation_episode_factory=make_loop,
+        particle_ids=("p0",),
+        resource_budget={"evaluations": 2},
+        failure_threshold=2,
+    )
+
+    result = await runner.run(iterations=2)
+
+    assert result.final_snapshot.iteration_id == 2
+    assert editor.edit_calls == 6
+    assert len(runtime.reflection_contexts) == 2
+    assert all(
+        context["candidate"]["metadata"]["rollback"]["performed"] is True
+        for context in runtime.reflection_contexts
+    )
+    assert "previous_reflection" not in runtime.hypothesis_contexts[0]
+    assert runtime.hypothesis_contexts[1]["previous_reflection"][
+        "recommended_next_direction"
+    ] == "Repeat with a related atom."
+    assert result.final_snapshot.particles[0].continuation_state == {
+        "kind": "canonical_smiles",
+        "canonical_isomeric_smiles": "C",
+        "chemical_identity_hash": "f" * 64,
+        "state_hash": PARENT_HASH,
+    }
+    assert {source.get("value") for source in editor.sources if source.get("kind") == "smiles"} == {
+        "C"
+    }
+    assert len(flame.calls) == 1

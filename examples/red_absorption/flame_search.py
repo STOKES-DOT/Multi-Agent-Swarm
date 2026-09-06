@@ -218,6 +218,7 @@ async def run_flame_search(
             wiki,
             editor,
             inherit_previous_candidate=True,
+            run_store=store,
         )
         async def run_attempt(runtime):
             def make_loop(particle_id, target, continuation_state=None):
@@ -229,6 +230,7 @@ async def run_flame_search(
                     resources,
                     flame=flame,
                     artifact_store=artifacts,
+                    rollback_after_rejections=task.spec.retry.proposal_attempts,
                     own_flame=False,
                 )
                 tools.append(tool)

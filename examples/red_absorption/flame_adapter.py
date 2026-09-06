@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import hashlib
+import json
 from types import MappingProxyType
 from pathlib import Path
 
@@ -42,6 +44,8 @@ class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
         candidate_hash = payload.get("chemical_identity_hash")
         canonical_smiles = payload.get("canonical_isomeric_smiles")
         commands = payload.get("committed_commands")
+        rollback = payload.get("rollback")
+        rolled_back = isinstance(rollback, dict) and rollback.get("performed") is True
         try:
             prediction = FlamePrediction.model_validate(payload.get("flame_prediction"))
         except (TypeError, ValueError) as error:
@@ -54,7 +58,7 @@ class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
             or not self._text(canonical_smiles)
             or prediction.dye_smiles != canonical_smiles
             or not isinstance(commands, list)
-            or not commands
+            or (not rolled_back and not commands)
         ):
             raise ValueError("candidate FLAME identity is invalid")
         proposal = context.metadata.get("proposal")
@@ -76,13 +80,48 @@ class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
             )
         except (TypeError, ValueError) as error:
             raise ValueError("candidate molecule artifact is invalid") from error
+        if rolled_back:
+            inspected_graph = authorized.get("inspected_graph")
+            rejected_commands = _plain(authorized.get("commands"))
+            rejected_commands_sha256 = hashlib.sha256(
+                json.dumps(
+                    rejected_commands,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            if (
+                set(rollback)
+                != {
+                    "performed",
+                    "reason",
+                    "failed_proposal_attempt",
+                    "rejection_count",
+                    "rejected_commands_sha256",
+                }
+                or rollback.get("reason") != "MoleculeEditor rejected edit"
+                or rollback.get("failed_proposal_attempt") != context.attempt
+                or rollback.get("rejection_count") != context.attempt + 1
+                or rollback.get("rejected_commands_sha256")
+                != rejected_commands_sha256
+                or commands
+                or state_hash != authorized.get("inspected_source_hash")
+                or not isinstance(inspected_graph, Mapping)
+                or candidate_hash != inspected_graph.get("chemical_identity_hash")
+            ):
+                raise ValueError("rollback candidate authority is invalid")
+        elif (
+            payload.get("parent_state_hash")
+            != authorized.get("inspected_source_hash")
+            or _plain(commands) != _plain(authorized.get("commands"))
+        ):
+            raise ValueError("edited candidate authority is invalid")
         if (
             not isinstance(cache_key, list)
             or tuple(cache_key) != expected_key
             or type(payload.get("cache_hit")) is not bool
             or result.artifacts != (molecule_artifact,)
-            or payload.get("parent_state_hash") != authorized.get("inspected_source_hash")
-            or _plain(commands) != _plain(authorized.get("commands"))
             or authorized.get("edit_budget") != decoded["edit_budget"]
         ):
             raise ValueError("candidate FLAME authority or cache identity is invalid")
@@ -101,6 +140,8 @@ class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
                 "state_hash": state_hash,
             },
         }
+        if rolled_back:
+            metadata["rollback"] = rollback
         return CandidateRef(state_hash, candidate_hash, result.artifacts, metadata)
 
 

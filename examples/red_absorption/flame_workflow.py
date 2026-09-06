@@ -151,6 +151,7 @@ class FlameWorkflowToolProvider:
         self.resources = None
         self.flame = None
         self.artifact_store = None
+        self.rollback_after_rejections = None
         self.own_flame = False
 
     @classmethod
@@ -162,14 +163,21 @@ class FlameWorkflowToolProvider:
         *,
         flame,
         artifact_store: ArtifactStore,
+        rollback_after_rejections: int | None = None,
         own_flame=False,
     ):
+        if rollback_after_rejections is not None and (
+            type(rollback_after_rejections) is not int
+            or rollback_after_rejections <= 0
+        ):
+            raise ValueError("rollback_after_rejections must be positive or None")
         instance = cls()
         instance.inputs = inputs
         instance.editor = editor
         instance.resources = resources
         instance.flame = flame
         instance.artifact_store = artifact_store
+        instance.rollback_after_rejections = rollback_after_rejections
         instance.own_flame = own_flame
         return instance
 
@@ -236,8 +244,89 @@ class FlameWorkflowToolProvider:
             or not edit.ready_for_evaluator
             or edit.payload is None
         ):
+            if (
+                self.rollback_after_rejections is not None
+                and context.attempt + 1 >= self.rollback_after_rejections
+            ):
+                return await self._evaluate_rollback_parent(
+                    inspection, authoritative, context
+                )
             return ToolResult(ToolStatus.REJECTED, error="MoleculeEditor rejected edit")
-        payload = _plain_json(edit.payload)
+        return await self._evaluate_payload(_plain_json(edit.payload), context)
+
+    async def _evaluate_rollback_parent(
+        self,
+        inspection,
+        authoritative: Mapping[str, object],
+        context: ToolContext,
+    ) -> ToolResult:
+        graph = _plain_json(inspection.candidate)
+        inspection_payload = _plain_json(inspection.payload)
+        commands = _plain_json(authoritative.get("commands"))
+        if (
+            not isinstance(graph, dict)
+            or not isinstance(inspection_payload, dict)
+            or not isinstance(commands, list)
+        ):
+            return ToolResult(
+                ToolStatus.FAILED, error="rollback parent record is invalid"
+            )
+        state_hash = graph.get("state_hash")
+        chemical_hash = graph.get("chemical_identity_hash")
+        smiles = inspection_payload.get("canonical_isomeric_smiles")
+        if (
+            state_hash != authoritative.get("inspected_source_hash")
+            or not isinstance(chemical_hash, str)
+            or not isinstance(smiles, str)
+            or not smiles
+        ):
+            return ToolResult(
+                ToolStatus.FAILED, error="rollback parent identity is missing"
+            )
+        commands_sha256 = hashlib.sha256(
+            json.dumps(
+                commands,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        rollback = {
+            "performed": True,
+            "reason": "MoleculeEditor rejected edit",
+            "failed_proposal_attempt": context.attempt,
+            "rejection_count": self.rollback_after_rejections,
+            "rejected_commands_sha256": commands_sha256,
+        }
+        parent_payload = dict(inspection_payload)
+        parent_payload.update(
+            {
+                "chemical_status": "VALID",
+                "geometry_status": "READY",
+                "ready_for_evaluator": True,
+                "graph": graph,
+                "state_hash": state_hash,
+                "chemical_identity_hash": chemical_hash,
+                "parent_state_hash": graph.get("parent_state_hash"),
+                "committed_commands": [],
+                "canonical_isomeric_smiles": smiles,
+                "rollback": {**rollback, "rejected_commands": commands},
+            }
+        )
+        return await self._evaluate_payload(
+            parent_payload, context, rollback=rollback
+        )
+
+    async def _evaluate_payload(
+        self,
+        payload: object,
+        context: ToolContext,
+        *,
+        rollback: Mapping[str, object] | None = None,
+    ) -> ToolResult:
+        payload = _plain_json(payload)
+        if not isinstance(payload, dict):
+            return ToolResult(ToolStatus.FAILED, error="molecule payload is invalid")
         chemical_hash = payload.get("chemical_identity_hash")
         smiles = payload.get("canonical_isomeric_smiles")
         if not isinstance(chemical_hash, str) or not isinstance(smiles, str) or not smiles:
@@ -305,6 +394,8 @@ class FlameWorkflowToolProvider:
             "cache_hit": cache_hit,
             "molecule_artifact": artifact.model_dump(mode="json"),
         }
+        if rollback is not None:
+            compact_payload["rollback"] = _plain_json(rollback)
         return ToolResult(ToolStatus.SUCCESS, compact_payload, (artifact,))
 
     async def aclose(self) -> None:
