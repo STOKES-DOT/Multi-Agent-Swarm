@@ -143,14 +143,14 @@ git diff --check
 
 Expected: all tests and checks pass.
 
-- [ ] **Step 2: Commit and merge the isolated branch**
+- [x] **Step 2: Commit and merge the isolated branch**
 
 Commit only the rollback implementation, tests, and this plan. Fast-forward merge into `main`, rerun the full non-live suite on the merged source, then remove the owned worktree and merged branch. Preserve the user's modified `docs/superpowers/plans/2026-09-02-multi-agent-pso-core.md`.
 
-- [ ] **Step 3: Run a fresh live rollback preflight**
+- [x] **Step 3: Run a fresh live rollback preflight**
 
 Use a new protocol/run identity. Verify normal edited candidates still publish compact artifacts and a deterministic fixture verifies third-rejection parent evaluation without consuming a second cached-parent budget item.
 
-- [ ] **Step 4: Relaunch one 10x100 job**
+- [x] **Step 4: Relaunch one 10x100 job**
 
 Create a one-shot `KeepAlive=false` LaunchAgent using the merged commit. Confirm `runs=1`, ten particles, advancing events, zero node-limit failures, zero stderr, and retain the previous run directory as read-only evidence.
