@@ -551,11 +551,15 @@ class EpisodeCheckpoint(_FrozenModel):
                 raise ValueError(f"checkpoint context {key} does not match checkpoint")
         schema_stages = {
             AgentStage.HYPOTHESIZING,
-            AgentStage.PROPOSING_ACTION,
             AgentStage.REFLECTING,
         }
         bounded_attempt_stages = schema_stages | {AgentStage.EXECUTING}
-        if self.completed_stage in bounded_attempt_stages:
+        if self.completed_stage is AgentStage.PROPOSING_ACTION:
+            if self.completed_attempt > 8:
+                raise ValueError(
+                    "proposal stage attempts must be between zero and eight"
+                )
+        elif self.completed_stage in bounded_attempt_stages:
             if self.completed_attempt > 2:
                 raise ValueError("bounded stage attempts must be between zero and two")
         elif self.completed_attempt != 0:
@@ -574,11 +578,17 @@ class EpisodeCheckpoint(_FrozenModel):
             if self.next_stage is not expected_next or self.next_attempt != 0:
                 raise ValueError("completed checkpoint must advance to the fixed next stage")
         elif self.terminal_event_type == "failed" and self.next_stage is self.completed_stage:
-            if (
-                self.completed_stage not in schema_stages
-                or self.completed_attempt >= 2
-                or self.next_attempt != self.completed_attempt + 1
-            ):
+            valid_schema_retry = (
+                self.completed_stage in schema_stages
+                and self.completed_attempt < 2
+                and self.next_attempt == self.completed_attempt + 1
+            )
+            valid_proposal_retry = (
+                self.completed_stage is AgentStage.PROPOSING_ACTION
+                and self.completed_attempt % 3 < 2
+                and self.next_attempt == self.completed_attempt + 1
+            )
+            if not (valid_schema_retry or valid_proposal_retry):
                 raise ValueError("schema correction must advance exactly one bounded attempt")
         elif self.terminal_event_type == "interrupted":
             if (
@@ -593,7 +603,7 @@ class EpisodeCheckpoint(_FrozenModel):
         ):
             if (
                 self.completed_attempt >= 2
-                or self.next_attempt != self.completed_attempt + 1
+                or self.next_attempt != (self.completed_attempt + 1) * 3
             ):
                 raise ValueError(
                     "tool reproposal must advance exactly one bounded attempt"

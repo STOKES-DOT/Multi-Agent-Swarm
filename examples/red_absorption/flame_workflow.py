@@ -7,9 +7,16 @@ import hashlib
 import json
 from collections.abc import Mapping, MutableMapping
 import threading
+import uuid
 
 from multi_agent_pso.core import AgentStage
-from multi_agent_pso.protocols import ToolContext, ToolRequest, ToolResult, ToolStatus
+from multi_agent_pso.protocols import (
+    ArtifactStore,
+    ToolContext,
+    ToolRequest,
+    ToolResult,
+    ToolStatus,
+)
 from multi_agent_pso.resources import BudgetClaimStatus, DurableBudgetLedger
 from multi_agent_pso.tools import JsonCommandStatus
 
@@ -143,20 +150,39 @@ class FlameWorkflowToolProvider:
         self.editor = None
         self.resources = None
         self.flame = None
+        self.artifact_store = None
         self.own_flame = False
 
     @classmethod
-    def bind(cls, inputs, editor, resources, *, flame, own_flame=False):
+    def bind(
+        cls,
+        inputs,
+        editor,
+        resources,
+        *,
+        flame,
+        artifact_store: ArtifactStore,
+        own_flame=False,
+    ):
         instance = cls()
         instance.inputs = inputs
         instance.editor = editor
         instance.resources = resources
         instance.flame = flame
+        instance.artifact_store = artifact_store
         instance.own_flame = own_flame
         return instance
 
     async def execute(self, request: ToolRequest, context: ToolContext) -> ToolResult:
-        if not all((self.inputs, self.editor, self.resources, self.flame)):
+        if not all(
+            (
+                self.inputs,
+                self.editor,
+                self.resources,
+                self.flame,
+                self.artifact_store,
+            )
+        ):
             return ToolResult(ToolStatus.REJECTED, error="FLAME workflow is unbound")
         self.resources.bind_loop()
         proposal = context.to_json()["metadata"].get("proposal")
@@ -260,14 +286,26 @@ class FlameWorkflowToolProvider:
                     self.resources.cache[key] = prediction
             if cache_hit:
                 self.resources.cache_hit_count += 1
-        payload.update(
-            {
-                "flame_prediction": prediction.model_dump(mode="json"),
-                "cache_key": list(key),
-                "cache_hit": cache_hit,
-            }
+        artifact = self.artifact_store.publish_json(
+            (
+                f"molecules/{context.run_id}/{context.particle_id}/"
+                f"{context.iteration_id}-{context.attempt}-{uuid.uuid4().hex}.json"
+            ),
+            payload,
         )
-        return ToolResult(ToolStatus.SUCCESS, payload)
+        compact_payload = {
+            "chemical_status": "VALID",
+            "state_hash": payload["state_hash"],
+            "chemical_identity_hash": chemical_hash,
+            "parent_state_hash": payload["parent_state_hash"],
+            "canonical_isomeric_smiles": smiles,
+            "committed_commands": payload["committed_commands"],
+            "flame_prediction": prediction.model_dump(mode="json"),
+            "cache_key": list(key),
+            "cache_hit": cache_hit,
+            "molecule_artifact": artifact.model_dump(mode="json"),
+        }
+        return ToolResult(ToolStatus.SUCCESS, compact_payload, (artifact,))
 
     async def aclose(self) -> None:
         if self.own_flame and self.flame is not None:

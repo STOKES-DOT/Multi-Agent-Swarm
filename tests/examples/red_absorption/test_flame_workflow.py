@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,7 +16,10 @@ from examples.red_absorption.flame_workflow import (
     flame_cache_key,
 )
 from multi_agent_pso.core import AgentStage, EvaluationStatus
+from multi_agent_pso.orchestration.agent_loop import _bounded_json_copy
 from multi_agent_pso.protocols import ToolContext, ToolRequest, ToolStatus
+from multi_agent_pso.resources import DurableBudgetLedger
+from multi_agent_pso.storage import FileArtifactStore
 from multi_agent_pso.tools import JsonCommandStatus
 from tests.integration.test_red_absorption_flow import (
     CANDIDATE_HASH,
@@ -140,7 +144,11 @@ async def test_workflow_builds_flame_candidate_and_proxy_reward(tmp_path: Path):
         run_inputs, max_new_evaluations=10
     )
     provider = FlameWorkflowToolProvider.bind(
-        run_inputs, editor, resources, flame=command
+        run_inputs,
+        editor,
+        resources,
+        flame=command,
+        artifact_store=FileArtifactStore(tmp_path / "artifacts"),
     )
     request, context = authorized_request(tmp_path)
 
@@ -164,3 +172,112 @@ async def test_workflow_builds_flame_candidate_and_proxy_reward(tmp_path: Path):
     assert command.calls[0][1]["timeout_seconds"] is None
     assert result.payload["cache_key"] == flame_cache_key(run_inputs, CANDIDATE_HASH)
     await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_workflow_externalizes_full_molecule_result_as_artifact(tmp_path: Path):
+    run_inputs = inputs(tmp_path)
+
+    class LargeResultEditor(FakeEditor):
+        async def edit(self, *args, **kwargs):
+            result = await super().edit(*args, **kwargs)
+            result.payload["large_diagnostics"] = [
+                {"atom": index, "score": float(index)} for index in range(3_500)
+            ]
+            return result
+
+    editor = LargeResultEditor([], parent_graph())
+    command = FakeFlameCommand()
+    resources = FlameWorkflowResources.from_inputs(
+        run_inputs, max_new_evaluations=10
+    )
+    artifact_root = tmp_path / "artifacts"
+    provider = FlameWorkflowToolProvider.bind(
+        run_inputs,
+        editor,
+        resources,
+        flame=command,
+        artifact_store=FileArtifactStore(artifact_root),
+    )
+    request, context = authorized_request(tmp_path)
+
+    result = await provider.execute(request, context)
+
+    assert result.status is ToolStatus.SUCCESS
+    assert len(result.artifacts) == 1
+    molecule_artifact = result.artifacts[0]
+    assert result.payload["molecule_artifact"] == molecule_artifact.model_dump(
+        mode="json"
+    )
+    assert not {
+        "graph",
+        "topology",
+        "atom_table",
+        "bond_table",
+        "geometry",
+    } & set(result.payload)
+    stored = json.loads(
+        (artifact_root / molecule_artifact.relative_path).read_text(encoding="utf-8")
+    )
+    with pytest.raises(ValueError, match="node limit exceeded"):
+        _bounded_json_copy(stored, boundary="large molecule artifact")
+    _bounded_json_copy(result.to_json(), boundary="compact FLAME tool result")
+    assert stored["graph"]["chemical_identity_hash"] == CANDIDATE_HASH
+    assert stored["canonical_isomeric_smiles"] == "N"
+    candidate = FlameRedAbsorptionTaskAdapter().candidate_from_tool_result(
+        result, context
+    )
+    assert candidate.artifacts == (molecule_artifact,)
+
+
+@pytest.mark.asyncio
+async def test_workflow_recovers_flame_commit_after_artifact_interruption(
+    tmp_path: Path,
+) -> None:
+    run_inputs = inputs(tmp_path)
+    editor = FakeEditor([], parent_graph())
+    command = FakeFlameCommand()
+    ledger = DurableBudgetLedger(tmp_path / "budget.jsonl")
+
+    class InterruptingArtifactStore:
+        def publish_json(self, relative_path, payload):
+            raise asyncio.CancelledError("interrupted after FLAME commit")
+
+    first_resources = FlameWorkflowResources.from_inputs(
+        run_inputs,
+        max_new_evaluations=10,
+        ledger=ledger,
+        run_id="run",
+    )
+    first = FlameWorkflowToolProvider.bind(
+        run_inputs,
+        editor,
+        first_resources,
+        flame=command,
+        artifact_store=InterruptingArtifactStore(),
+    )
+    request, context = authorized_request(tmp_path)
+
+    with pytest.raises(asyncio.CancelledError):
+        await first.execute(request, context)
+
+    recovered_resources = FlameWorkflowResources.from_inputs(
+        run_inputs,
+        max_new_evaluations=10,
+        ledger=ledger,
+        run_id="run",
+    )
+    recovered = FlameWorkflowToolProvider.bind(
+        run_inputs,
+        editor,
+        recovered_resources,
+        flame=command,
+        artifact_store=FileArtifactStore(tmp_path / "recovered-artifacts"),
+    )
+    result = await recovered.execute(request, context)
+
+    assert result.status is ToolStatus.SUCCESS
+    assert result.payload["cache_hit"] is True
+    assert len(command.calls) == 1
+    assert recovered_resources.execution_count == 1
+    ledger.close()

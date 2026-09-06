@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from pathlib import Path
 
-from multi_agent_pso.core import AgentStage
+from multi_agent_pso.core import AgentStage, ArtifactRef
 from multi_agent_pso.protocols import CandidateRef, ToolContext, ToolResult, ToolStatus
 
 from .adapter import RedAbsorptionTaskAdapter, _HASH, _plain, create_position_space
@@ -70,10 +70,17 @@ class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
             FLAME_PROXY_EVALUATOR_VERSION,
         )
         cache_key = payload.get("cache_key")
+        try:
+            molecule_artifact = ArtifactRef.model_validate(
+                payload.get("molecule_artifact")
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("candidate molecule artifact is invalid") from error
         if (
             not isinstance(cache_key, list)
             or tuple(cache_key) != expected_key
             or type(payload.get("cache_hit")) is not bool
+            or result.artifacts != (molecule_artifact,)
             or payload.get("parent_state_hash") != authorized.get("inspected_source_hash")
             or _plain(commands) != _plain(authorized.get("commands"))
             or authorized.get("edit_budget") != decoded["edit_budget"]
@@ -86,6 +93,7 @@ class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
             "flame_prediction": prediction.model_dump(mode="json"),
             "cache_key": cache_key,
             "cache_hit": payload["cache_hit"],
+            "molecule_artifact": molecule_artifact.model_dump(mode="json"),
             "continuation_state": {
                 "kind": "canonical_smiles",
                 "canonical_isomeric_smiles": canonical_smiles,

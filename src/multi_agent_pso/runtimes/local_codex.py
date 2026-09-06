@@ -45,6 +45,25 @@ class ProviderThreadNotFoundError(RuntimeError):
     """The provider no longer has a thread referenced by a checkpoint."""
 
 
+class CodexTransportInterruptedError(asyncio.CancelledError):
+    """The SDK transport stopped without caller-initiated task cancellation."""
+
+
+def _raise_if_transport_interrupted(error: BaseException, sdk: object) -> None:
+    if isinstance(error, asyncio.CancelledError):
+        task = asyncio.current_task()
+        if task is None or task.cancelling() == 0:
+            raise CodexTransportInterruptedError(
+                "Codex SDK operation was interrupted without caller cancellation"
+            ) from error
+        return
+    transport_closed = getattr(sdk, "TransportClosedError", ())
+    if isinstance(transport_closed, type) and isinstance(error, transport_closed):
+        raise CodexTransportInterruptedError(
+            "Codex app-server transport closed"
+        ) from error
+
+
 class CodexThreadPort(Protocol):
     id: str
 
@@ -84,12 +103,16 @@ class _SDKThreadAdapter:
         output_schema: Mapping[str, JsonValue] | None,
         sandbox: str,
     ) -> CodexTurnResult:
-        result = await self._thread.run(
-            prompt,
-            cwd=str(cwd),
-            output_schema=output_schema,
-            sandbox=self._sandbox(sandbox),
-        )
+        try:
+            result = await self._thread.run(
+                prompt,
+                cwd=str(cwd),
+                output_schema=output_schema,
+                sandbox=self._sandbox(sandbox),
+            )
+        except BaseException as error:
+            _raise_if_transport_interrupted(error, self._sdk)
+            raise
         usage_value = getattr(result, "usage", None)
         breakdown = None if usage_value is None else getattr(usage_value, "last", None)
         usage = (
@@ -151,12 +174,16 @@ class OpenAICodexClientAdapter:
 
     async def thread_start(self, *, model: str, cwd: Path, sandbox: str):
         await self._ensure_open()
-        thread = await self._client.thread_start(
-            model=model,
-            cwd=str(cwd),
-            sandbox=self._sandbox(sandbox),
-            approval_mode=self._sdk.ApprovalMode.deny_all,
-        )
+        try:
+            thread = await self._client.thread_start(
+                model=model,
+                cwd=str(cwd),
+                sandbox=self._sandbox(sandbox),
+                approval_mode=self._sdk.ApprovalMode.deny_all,
+            )
+        except BaseException as error:
+            _raise_if_transport_interrupted(error, self._sdk)
+            raise
         return _SDKThreadAdapter(thread, self._sdk)
 
     async def thread_resume(
@@ -171,7 +198,10 @@ class OpenAICodexClientAdapter:
                 sandbox=self._sandbox(sandbox),
                 approval_mode=self._sdk.ApprovalMode.deny_all,
             )
-        except Exception as error:
+        except BaseException as error:
+            _raise_if_transport_interrupted(error, self._sdk)
+            if not isinstance(error, Exception):
+                raise
             message = str(error).lower()
             not_found = "thread" in message and any(
                 phrase in message
@@ -834,6 +864,7 @@ def _canonical_checkpoint(value: object) -> str:
 
 __all__ = [
     "CodexClientPort",
+    "CodexTransportInterruptedError",
     "CodexThreadPort",
     "CodexTurnResult",
     "CodexUsage",

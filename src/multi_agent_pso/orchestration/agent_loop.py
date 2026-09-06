@@ -55,6 +55,8 @@ _ACTIVE_STAGE_CONTEXT = "_active_stage_context"
 _ACTIVE_STAGE_REQUEST = "_active_stage_request"
 _ACTIVE_STAGE_ATTEMPT = "_active_stage_attempt"
 _ACTIVE_STAGE_ADDITIONS = "_active_stage_additions"
+_AGENT_SCHEMA_ATTEMPTS = 3
+_MAX_PROPOSAL_ATTEMPTS = 3
 V1_JSON_MAX_UTF8_BYTES = 256 * 1024
 V1_JSON_MAX_DEPTH = 32
 V1_JSON_MAX_NODES = 10_000
@@ -651,7 +653,8 @@ class AgentLoop:
                             thread=thread,
                             owner=owner,
                             next_stage=AgentStage.PROPOSING_ACTION,
-                            next_attempt=proposal_attempt + 1,
+                            next_attempt=(proposal_attempt + 1)
+                            * _AGENT_SCHEMA_ATTEMPTS,
                         )
                         current_stage = AgentStage.PROPOSING_ACTION
                         parsed = await self._agent_stage(
@@ -660,7 +663,8 @@ class AgentLoop:
                             current_stage,
                             context,
                             events,
-                            start_attempt=proposal_attempt + 1,
+                            start_attempt=(proposal_attempt + 1)
+                            * _AGENT_SCHEMA_ATTEMPTS,
                         )
                         if parsed is None:
                             return await self._finish_episode(
@@ -1286,7 +1290,8 @@ class AgentLoop:
             checkpoint.completed_stage is AgentStage.EXECUTING
             and checkpoint.terminal_event_type == "invalid"
             and checkpoint.next_stage is AgentStage.PROPOSING_ACTION
-            and checkpoint.next_attempt == checkpoint.completed_attempt + 1
+            and checkpoint.next_attempt
+            == (checkpoint.completed_attempt + 1) * _AGENT_SCHEMA_ATTEMPTS
         )
         requires_tool_result = not is_tool_reproposal_boundary and (
             any(
@@ -1520,7 +1525,8 @@ class AgentLoop:
             ]
             if (
                 not proposal_events
-                or context["proposal_attempt"] != proposal_events[-1].attempt
+                or context["proposal_attempt"]
+                != proposal_events[-1].attempt // _AGENT_SCHEMA_ATTEMPTS
             ):
                 raise IncompatibleCheckpointError(
                     "checkpoint proposal attempt differs from stage evidence"
@@ -1759,7 +1765,9 @@ class AgentLoop:
                 == ToolStatus.REJECTED.value
                 and any(
                     later.stage is AgentStage.PROPOSING_ACTION
-                    and later.attempt == event.attempt + 1
+                    and later.attempt
+                    // _AGENT_SCHEMA_ATTEMPTS
+                    == event.attempt + 1
                     and later.event_type == "completed"
                     for later in business_events[index + 1 :]
                 )
@@ -2336,11 +2344,31 @@ class AgentLoop:
         *,
         start_attempt: int = 0,
     ) -> Mapping[str, JsonValue] | None:
-        if type(start_attempt) is not int or not 0 <= start_attempt <= 2:
+        max_attempt = (
+            _AGENT_SCHEMA_ATTEMPTS * _MAX_PROPOSAL_ATTEMPTS - 1
+            if stage is AgentStage.PROPOSING_ACTION
+            else _AGENT_SCHEMA_ATTEMPTS - 1
+        )
+        if type(start_attempt) is not int or not 0 <= start_attempt <= max_attempt:
             raise IncompatibleCheckpointError(
-                "checkpoint agent-stage attempt must be between zero and two"
+                "checkpoint agent-stage attempt is outside its bounded range"
             )
-        for attempt in range(start_attempt, 3):
+        proposal_attempt = (
+            start_attempt // _AGENT_SCHEMA_ATTEMPTS
+            if stage is AgentStage.PROPOSING_ACTION
+            else None
+        )
+        schema_start = (
+            start_attempt % _AGENT_SCHEMA_ATTEMPTS
+            if stage is AgentStage.PROPOSING_ACTION
+            else start_attempt
+        )
+        for schema_attempt in range(schema_start, _AGENT_SCHEMA_ATTEMPTS):
+            attempt = (
+                proposal_attempt * _AGENT_SCHEMA_ATTEMPTS + schema_attempt
+                if proposal_attempt is not None
+                else schema_attempt
+            )
             context_additions: Mapping[str, JsonValue] = {}
             try:
                 stage_context = self._copy_json(context)
@@ -2580,7 +2608,7 @@ class AgentLoop:
                 completed_context = self._checkpoint_context(context)
                 completed_context[output_key] = parsed
                 if stage is AgentStage.PROPOSING_ACTION:
-                    completed_context["proposal_attempt"] = attempt
+                    completed_context["proposal_attempt"] = proposal_attempt
                 completed_payload: dict[str, JsonValue] = {
                     "request": request_payload,
                     "output": parsed,
@@ -2616,7 +2644,7 @@ class AgentLoop:
                     "context_additions": dict(context_additions),
                 }
                 context["correction"] = diagnostic
-                if attempt == 2:
+                if schema_attempt == _AGENT_SCHEMA_ATTEMPTS - 1:
                     self._terminal_event(
                         str(context["run_id"]),
                         str(context["particle_id"]),
@@ -2655,7 +2683,7 @@ class AgentLoop:
             context.pop("correction", None)
             context[output_key] = parsed
             if stage is AgentStage.PROPOSING_ACTION:
-                context["proposal_attempt"] = attempt
+                context["proposal_attempt"] = proposal_attempt
             self._terminal_event(
                 str(context["run_id"]),
                 str(context["particle_id"]),

@@ -147,6 +147,58 @@ async def test_rejected_molecule_edit_gets_three_hypothesis_bound_proposals(tmp_
 
 
 @pytest.mark.asyncio
+async def test_proposal_schema_corrections_do_not_consume_molecule_attempts(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path, tool_status=ToolStatus.REJECTED)
+    delegate = dependencies["runtime"]
+
+    class InvalidFirstProposalRuntime:
+        def __init__(self):
+            self.invalid_proposal = True
+
+        async def start_thread(self, particle_id, workspace):
+            return await delegate.start_thread(particle_id, workspace)
+
+        async def restore_thread(self, particle_id, workspace, checkpoint):
+            return await delegate.restore_thread(particle_id, workspace, checkpoint)
+
+        async def run_stage(self, thread, request):
+            if (
+                request.stage is AgentStage.PROPOSING_ACTION
+                and self.invalid_proposal
+            ):
+                self.invalid_proposal = False
+                return StageResponse("not-json", TokenUsage(1, 1))
+            return await delegate.run_stage(thread, request)
+
+        async def rotate_thread(self, thread, checkpoint):
+            return await delegate.rotate_thread(thread, checkpoint)
+
+        async def close_thread(self, thread):
+            return await delegate.close_thread(thread)
+
+    dependencies["runtime"] = InvalidFirstProposalRuntime()
+    episode = await AgentLoop(
+        **dependencies,
+        max_proposal_attempts=3,
+        reproposal_on_tool_rejection=True,
+    ).run_particle("run-1", "p0", 0)
+
+    assert episode.status is EpisodeStatus.INVALID
+    assert [context.attempt for context in dependencies["tool_provider"].contexts] == [
+        0,
+        1,
+        2,
+    ]
+    completed_proposal_attempts = [
+        event.attempt
+        for event in dependencies["run_store"].events
+        if event.stage is AgentStage.PROPOSING_ACTION
+        and event.event_type == "completed"
+    ]
+    assert completed_proposal_attempts == [1, 3, 6]
+
+
+@pytest.mark.asyncio
 async def test_second_molecule_proposal_can_recover_after_first_rejection(tmp_path):
     dependencies = make_fake_dependencies(tmp_path)
 
@@ -229,7 +281,7 @@ async def test_resume_continues_after_committed_molecule_reproposal_boundary(tmp
     assert checkpoint.completed_stage is AgentStage.EXECUTING
     assert checkpoint.completed_attempt == 0
     assert checkpoint.next_stage is AgentStage.PROPOSING_ACTION
-    assert checkpoint.next_attempt == 1
+    assert checkpoint.next_attempt == 3
 
     episode = await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
 

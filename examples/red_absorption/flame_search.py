@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 import hashlib
 import json
 from pathlib import Path
 import sys
+from typing import TypeVar
 
 from multi_agent_pso.configuration import load_run_inputs, load_task_package
 from multi_agent_pso.core.topology import RingTopology
@@ -16,7 +17,10 @@ from multi_agent_pso.core.update_rule import ConstrictedUpdateRule
 from multi_agent_pso.orchestration import AgentLoop, SynchronousSwarmRunner
 from multi_agent_pso.resources import AsyncSemaphoreResourceManager, DurableBudgetLedger
 from multi_agent_pso.retrieval import LocalWikiRetriever
-from multi_agent_pso.runtimes import LocalCodexRuntime
+from multi_agent_pso.runtimes import (
+    CodexTransportInterruptedError,
+    LocalCodexRuntime,
+)
 from multi_agent_pso.storage import FileArtifactStore, SQLiteRunStore
 from multi_agent_pso.tools import JsonCommandProvider, JsonCommandStatus, MoleculeEditorProvider
 
@@ -31,6 +35,49 @@ from .search import _make_private_run_root
 EXPECTED_PARTICLES = 10
 EXPECTED_ITERATIONS = 100
 EXPECTED_EVALUATIONS = 1000
+_T = TypeVar("_T")
+
+
+async def _run_with_runtime_recovery(
+    runtime_factory: Callable[[], object],
+    run_attempt: Callable[[object], Awaitable[_T]],
+    *,
+    transient_retries: int,
+    close_grace_seconds: float,
+) -> _T:
+    if type(transient_retries) is not int or transient_retries < 0:
+        raise ValueError("transient_retries must be a nonnegative integer")
+    if (
+        type(close_grace_seconds) not in {int, float}
+        or close_grace_seconds <= 0
+    ):
+        raise ValueError("close_grace_seconds must be positive")
+    for attempt in range(transient_retries + 1):
+        runtime = runtime_factory()
+        close = getattr(runtime, "close", None)
+        if not callable(close):
+            raise TypeError("runtime must provide async close")
+        try:
+            result = await run_attempt(runtime)
+        except CodexTransportInterruptedError:
+            close_task = asyncio.create_task(close())
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(close_task), timeout=close_grace_seconds
+                )
+            except TimeoutError:
+                close_task.add_done_callback(
+                    lambda task: task.exception() if not task.cancelled() else None
+                )
+            if attempt == transient_retries:
+                raise
+            continue
+        except BaseException:
+            await close()
+            raise
+        await close()
+        return result
+    raise AssertionError("runtime recovery loop is unreachable")
 
 
 def _identity(task, loaded) -> str:
@@ -172,13 +219,17 @@ async def run_flame_search(
             editor,
             inherit_previous_candidate=True,
         )
-        runtime = LocalCodexRuntime(model=task.spec.agent.model)
-        async with runtime:
+        async def run_attempt(runtime):
             def make_loop(particle_id, target, continuation_state=None):
                 workspace = root / "workspaces" / run_id / particle_id
                 workspace.mkdir(parents=True, exist_ok=True)
                 tool = FlameWorkflowToolProvider.bind(
-                    inputs, editor, resources, flame=flame, own_flame=False
+                    inputs,
+                    editor,
+                    resources,
+                    flame=flame,
+                    artifact_store=artifacts,
+                    own_flame=False,
                 )
                 tools.append(tool)
                 return AgentLoop(
@@ -230,7 +281,14 @@ async def run_flame_search(
                 },
                 failure_threshold=task.spec.retry.consecutive_failures_before_resample,
             )
-            result = await runner.run(iterations=EXPECTED_ITERATIONS)
+            return await runner.run(iterations=EXPECTED_ITERATIONS)
+
+        result = await _run_with_runtime_recovery(
+            lambda: LocalCodexRuntime(model=task.spec.agent.model),
+            run_attempt,
+            transient_retries=task.spec.retry.transient_resource_retries,
+            close_grace_seconds=5.0,
+        )
         summary = {
             "schema_version": "flame-search-summary:v1",
             "run_id": run_id,

@@ -6,7 +6,7 @@ import pytest
 
 from multi_agent_pso.core import AgentStage
 from multi_agent_pso.orchestration import IncompatibleCheckpointError
-from tests.orchestration.fakes import make_interruptible_runner
+from tests.orchestration.fakes import make_fake_runner, make_interruptible_runner
 
 
 @pytest.mark.asyncio
@@ -80,3 +80,25 @@ def test_recovery_config_mismatch_has_no_external_calls(tmp_path) -> None:
         runner.with_config_hash("f" * 64).resume()
 
     assert runner.external_call_counts() == before
+
+
+@pytest.mark.asyncio
+async def test_resume_preserves_specialized_factories(tmp_path) -> None:
+    runner = make_fake_runner(tmp_path, delays={}, seed=5)
+    calls = []
+
+    def particle_factory(particle_id, target):
+        raise AssertionError("continuation factory has priority")
+
+    def continuation_factory(particle_id, target, continuation_state):
+        calls.append((particle_id, continuation_state))
+        return runner.episode_factory(target)
+
+    runner.particle_episode_factory = particle_factory
+    runner.continuation_episode_factory = continuation_factory
+    runner.ensure_initial_snapshot()
+
+    result = await runner.resume().run(iterations=1)
+
+    assert result.final_snapshot.iteration_id == 1
+    assert calls == [("p0", None), ("p1", None)]

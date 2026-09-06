@@ -7,9 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
+import multi_agent_pso.runtimes.local_codex as local_codex_module
 from multi_agent_pso.core import AgentStage
 from multi_agent_pso.protocols import StageRequest, ThreadRef
 from multi_agent_pso.runtimes.local_codex import (
+    CodexTransportInterruptedError,
     CodexTurnResult,
     LocalCodexRuntime,
     OpenAICodexClientAdapter,
@@ -17,6 +19,124 @@ from multi_agent_pso.runtimes.local_codex import (
 )
 
 from .fakes import FakeCodexClient
+
+
+@pytest.mark.parametrize("failure_kind", ["transport_closed", "sdk_cancelled"])
+async def test_sdk_transport_interrupted_is_typed_for_runtime_recovery(
+    tmp_path, failure_kind
+) -> None:
+    class TransportClosedError(Exception):
+        pass
+
+    primary = (
+        TransportClosedError("app-server stdout closed")
+        if failure_kind == "transport_closed"
+        else asyncio.CancelledError("SDK turn was cancelled")
+    )
+
+    class SDKThread:
+        id = "provider-1"
+
+        async def run(self, *args, **kwargs):
+            raise primary
+
+    sdk = SimpleNamespace(
+        TransportClosedError=TransportClosedError,
+        Sandbox=SimpleNamespace(workspace_write="write", read_only="read"),
+    )
+    adapter = local_codex_module._SDKThreadAdapter(SDKThread(), sdk)
+
+    with pytest.raises(
+        local_codex_module.CodexTransportInterruptedError
+    ) as raised:
+        await adapter.run(
+            "prompt",
+            cwd=tmp_path.resolve(),
+            output_schema=None,
+            sandbox="workspace-write",
+        )
+
+    assert raised.value.__cause__ is primary
+
+
+async def test_sdk_adapter_preserves_external_task_cancellation(tmp_path) -> None:
+    started = asyncio.Event()
+
+    class SDKThread:
+        id = "provider-1"
+
+        async def run(self, *args, **kwargs):
+            started.set()
+            await asyncio.sleep(60)
+
+    sdk = SimpleNamespace(
+        TransportClosedError=RuntimeError,
+        Sandbox=SimpleNamespace(workspace_write="write", read_only="read"),
+    )
+    adapter = local_codex_module._SDKThreadAdapter(SDKThread(), sdk)
+    running = asyncio.create_task(
+        adapter.run(
+            "prompt",
+            cwd=tmp_path.resolve(),
+            output_schema=None,
+            sandbox="workspace-write",
+        )
+    )
+    await started.wait()
+
+    running.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await running
+    assert not isinstance(
+        raised.value,
+        getattr(local_codex_module, "CodexTransportInterruptedError", ()),
+    )
+
+
+@pytest.mark.parametrize("operation", ["thread_start", "thread_resume"])
+async def test_sdk_thread_identity_transport_failure_is_typed(
+    tmp_path, operation
+) -> None:
+    class TransportClosedError(Exception):
+        pass
+
+    primary = TransportClosedError("app-server identity call disconnected")
+
+    class Client:
+        async def thread_start(self, **kwargs):
+            raise primary
+
+        async def thread_resume(self, *args, **kwargs):
+            raise primary
+
+    adapter = object.__new__(OpenAICodexClientAdapter)
+    adapter._client = Client()
+    adapter._lock = asyncio.Lock()
+    adapter._open = True
+    adapter._closed = False
+    adapter._sdk = SimpleNamespace(
+        TransportClosedError=TransportClosedError,
+        CodexRpcError=RuntimeError,
+        InvalidParamsError=ValueError,
+        ApprovalMode=SimpleNamespace(deny_all="deny"),
+        Sandbox=SimpleNamespace(workspace_write="write", read_only="read"),
+    )
+
+    with pytest.raises(CodexTransportInterruptedError) as raised:
+        if operation == "thread_start":
+            await adapter.thread_start(
+                model="gpt-5", cwd=tmp_path.resolve(), sandbox="workspace-write"
+            )
+        else:
+            await adapter.thread_resume(
+                "provider-1",
+                model="gpt-5",
+                cwd=tmp_path.resolve(),
+                sandbox="workspace-write",
+            )
+
+    assert raised.value.__cause__ is primary
 
 
 async def test_fake_injection_does_not_import_optional_sdk(tmp_path, monkeypatch) -> None:
