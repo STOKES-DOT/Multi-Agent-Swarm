@@ -84,6 +84,46 @@ def assert_checkpoints_within_v1_budget(dependencies) -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_loop_transports_and_captures_candidate_continuation(tmp_path):
+    parent = {"kind": "canonical_smiles", "value": "C"}
+    child = {"kind": "canonical_smiles", "value": "CC"}
+    dependencies = make_fake_dependencies(
+        tmp_path, candidate_metadata={"continuation_state": child}
+    )
+
+    episode = await AgentLoop(
+        **dependencies,
+        initial_context={"parent_continuation_state": parent},
+        capture_candidate_continuation=True,
+    ).run_particle("run-1", "p0", 0)
+
+    assert episode.status is EpisodeStatus.COMPLETED
+    assert episode.continuation_state == child
+    adapter = dependencies["task_adapter"]
+    assert adapter.contexts[AgentStage.HYPOTHESIZING][0][
+        "parent_continuation_state"
+    ] == parent
+    terminal = dependencies["run_store"].get_latest_stage_checkpoint_json(
+        "run-1", "p0", 0
+    )
+    assert terminal["context"]["continuation_state"] == child
+    checkpoint = EpisodeCheckpoint.model_validate(terminal)
+    rebuilt = await AgentLoop(
+        **dependencies,
+        initial_context={"parent_continuation_state": parent},
+        capture_candidate_continuation=True,
+    ).run_particle("run-1", "p0", 0, resume=checkpoint)
+    assert rebuilt.continuation_state == child
+
+
+def test_agent_loop_initial_context_cannot_overwrite_core_identity(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path)
+
+    with pytest.raises(ValueError, match="initial_context"):
+        AgentLoop(**dependencies, initial_context={"run_id": "forged"})
+
+
+@pytest.mark.asyncio
 async def test_agent_loop_runs_terminal_stages_in_order_and_pairs_persistence(tmp_path):
     dependencies = make_fake_dependencies(tmp_path)
     episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)

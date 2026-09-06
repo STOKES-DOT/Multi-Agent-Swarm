@@ -50,6 +50,7 @@ def _episode(
     quality: int | None,
     candidate_hash: str = "a" * 64,
     fitness: float | None = None,
+    continuation_state: object | None = None,
 ) -> AgentEpisode:
     success = quality is not None
     evaluation = Evaluation(
@@ -77,9 +78,95 @@ def _episode(
         realized_position=[float(iteration_id)],
         evaluated_position=[float(iteration_id)],
         evaluation=evaluation,
+        continuation_state=continuation_state,
         status=EpisodeStatus.COMPLETED if success else EpisodeStatus.FAILED,
         **references,
     )
+
+
+def test_snapshot_adopts_only_latest_successful_candidate_continuation() -> None:
+    space = ContinuousBoxPositionSpace([-1.0], [1.0])
+    initial = initial_snapshot(
+        run_id="run-1",
+        run_seed=5,
+        config_snapshot_hash="a" * 64,
+        particle_ids=("p0",),
+        space=space,
+    )
+    assert initial.particles[0].continuation_state is None
+    first = advance_snapshot(
+        initial,
+        (
+            _episode(
+                "p0",
+                0,
+                quality=1,
+                continuation_state={"molecule": "candidate-0"},
+            ),
+        ),
+        run_seed=5,
+        space=space,
+        adapter=QualityAdapter(),
+        topology=RingTopology(),
+        update_rule=ConstrictedUpdateRule(),
+        failure_threshold=2,
+    )
+    assert first.particles[0].continuation_state == {"molecule": "candidate-0"}
+    second = advance_snapshot(
+        first,
+        (
+            _episode(
+                "p0",
+                1,
+                quality=None,
+                continuation_state={"molecule": "failed-candidate"},
+            ),
+        ),
+        run_seed=5,
+        space=space,
+        adapter=QualityAdapter(),
+        topology=RingTopology(),
+        update_rule=ConstrictedUpdateRule(),
+        failure_threshold=2,
+    )
+    assert second.particles[0].continuation_state == {"molecule": "candidate-0"}
+
+
+@pytest.mark.asyncio
+async def test_runner_passes_particle_continuation_to_next_generation(tmp_path) -> None:
+    runner = make_fake_runner(tmp_path, delays={}, seed=6)
+    received = []
+
+    class ContinuationLoop:
+        def __init__(self, previous) -> None:
+            self.previous = previous
+
+        async def run_particle(
+            self, run_id, particle_id, iteration_id, *, resume=None
+        ) -> AgentEpisode:
+            received.append((particle_id, iteration_id, self.previous))
+            return _episode(
+                particle_id,
+                iteration_id,
+                quality=1,
+                continuation_state={
+                    "particle_id": particle_id,
+                    "source_iteration": iteration_id,
+                },
+            )
+
+    runner.continuation_episode_factory = (
+        lambda particle_id, target, previous: ContinuationLoop(previous)
+    )
+
+    result = await runner.run(iterations=2)
+
+    assert result.final_snapshot.iteration_id == 2
+    assert received[:2] == [("p0", 0, None), ("p1", 0, None)]
+    assert received[2:] == [
+        ("p0", 1, {"particle_id": "p0", "source_iteration": 0}),
+        ("p1", 1, {"particle_id": "p1", "source_iteration": 0}),
+    ]
 
 
 def test_initial_snapshot_is_stable_sorted_and_seed_replayable() -> None:

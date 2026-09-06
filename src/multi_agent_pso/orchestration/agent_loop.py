@@ -285,6 +285,8 @@ class AgentLoop:
         workspace: Path,
         protocol_snapshot_hash: str,
         stage_context_provider: StageContextProvider | None = None,
+        initial_context: Mapping[str, JsonValue] | None = None,
+        capture_candidate_continuation: bool = False,
     ) -> None:
         if not all(
             (
@@ -317,6 +319,26 @@ class AgentLoop:
             raise TypeError(
                 "stage_context_provider must implement StageContextProvider"
             )
+        if type(capture_candidate_continuation) is not bool:
+            raise TypeError("capture_candidate_continuation must be a boolean")
+        protected_context = {
+            "run_id",
+            "particle_id",
+            "iteration_id",
+            "target_position",
+            "protocol_snapshot_hash",
+        }
+        if initial_context is None:
+            copied_initial_context: Mapping[str, JsonValue] = {}
+        else:
+            copied = self._copy_json(initial_context)
+            if (
+                not isinstance(copied, Mapping)
+                or protected_context.intersection(copied)
+                or not set(copied) <= {"parent_continuation_state"}
+            ):
+                raise ValueError("initial_context cannot overwrite core identity")
+            copied_initial_context = copied
         self._runtime = runtime
         self._adapter = task_adapter
         self._evaluator = evaluator
@@ -328,6 +350,8 @@ class AgentLoop:
         self._workspace = workspace
         self._protocol_hash = protocol_snapshot_hash
         self._stage_context_provider = stage_context_provider
+        self._initial_context = dict(copied_initial_context)
+        self._capture_candidate_continuation = capture_candidate_continuation
 
     async def run_particle(
         self,
@@ -614,6 +638,13 @@ class AgentLoop:
                     )
                     candidate_json = self._copy_json(candidate.to_json())
                     context["candidate"] = candidate_json
+                    if self._capture_candidate_continuation:
+                        continuation = candidate.metadata.get("continuation_state")
+                        if continuation is None:
+                            raise ValueError(
+                                "candidate continuation_state is required when capture is enabled"
+                            )
+                        context["continuation_state"] = self._copy_json(continuation)
                     realized = self._adapter.realized_position(candidate)
                     evaluated = self._adapter.evaluated_position(
                         self._copy_json(self._target), self._copy_json(realized)
@@ -1157,6 +1188,15 @@ class AgentLoop:
             raise IncompatibleCheckpointError(
                 "checkpoint target position is incompatible"
             )
+        expected_parent_continuation = self._initial_context.get(
+            "parent_continuation_state"
+        )
+        if self._canonical_json(context.get("parent_continuation_state")) != (
+            self._canonical_json(expected_parent_continuation)
+        ):
+            raise IncompatibleCheckpointError(
+                "checkpoint parent continuation is incompatible"
+            )
         requires_tool_result = any(
             event.stage is AgentStage.EXECUTING and event.event_type == "completed"
             for event in events
@@ -1341,6 +1381,33 @@ class AgentLoop:
                     f"checkpoint {context_key} differs from stage evidence"
                 )
 
+        continuation_state = context.get("continuation_state")
+        if continuation_state is not None:
+            matching_candidates = [
+                event
+                for event in events
+                if event.stage is AgentStage.EXECUTING
+                and event.event_type == "completed"
+                and isinstance(event.payload.get("candidate"), Mapping)
+            ]
+            candidate_metadata = (
+                matching_candidates[-1].payload["candidate"].get("metadata")
+                if matching_candidates
+                else None
+            )
+            if (
+                not matching_candidates
+                or matching_candidates[-1].payload.get("truncated") is True
+                or not isinstance(candidate_metadata, Mapping)
+                or self._canonical_json(
+                    candidate_metadata.get("continuation_state")
+                )
+                != self._canonical_json(continuation_state)
+            ):
+                raise IncompatibleCheckpointError(
+                    "checkpoint continuation differs from candidate evidence"
+                )
+
         started_additions: dict[tuple[AgentStage, int], Mapping[str, JsonValue]] = {}
         terminal_additions: dict[str, JsonValue] = {}
         for event in audit_events:
@@ -1401,6 +1468,8 @@ class AgentLoop:
             "checkpoint_truncated",
             "thread_logical_id",
             "thread_generation",
+            "parent_continuation_state",
+            "continuation_state",
         }
         checkpoint_addition_keys = set(context) - core_context_keys
         if checkpoint_addition_keys != set(terminal_additions):
@@ -1702,6 +1771,7 @@ class AgentLoop:
                 "terminal checkpoint target position is incompatible"
             )
         try:
+            continuation_state = self._copy_json(context.get("continuation_state"))
             return self._terminal_episode(
                 run_id,
                 particle_id,
@@ -1713,6 +1783,7 @@ class AgentLoop:
                 realized,
                 adherence,
                 *references,
+                continuation_state=continuation_state,
             )
         except (TypeError, ValueError) as error:
             raise IncompatibleCheckpointError(
@@ -1952,6 +2023,7 @@ class AgentLoop:
             "candidate_hash": candidate_hash,
             "hypothesis_reference": hypothesis_reference,
             "evaluation_reference": evaluation_reference,
+            "continuation_state": context.get("continuation_state"),
         }
         try:
             copied_rebuild_state = self._copy_json(rebuild_state)
@@ -2063,6 +2135,9 @@ class AgentLoop:
             realized,
             adherence,
             *references,
+            continuation_state=self._copy_json(
+                final_context.get("continuation_state")
+            ),
         )
 
     def _record_finalization_terminal(
@@ -2633,13 +2708,15 @@ class AgentLoop:
     def _context(
         self, run_id: str, particle_id: str, iteration_id: int
     ) -> Mapping[str, JsonValue]:
-        return {
+        context = {
             "run_id": run_id,
             "particle_id": particle_id,
             "iteration_id": iteration_id,
             "target_position": self._copy_json(self._target),
             "protocol_snapshot_hash": self._protocol_hash,
         }
+        context.update(self._copy_json(self._initial_context))
+        return context
 
     @staticmethod
     def _copy_json(value: JsonValue) -> JsonValue:
@@ -2951,6 +3028,8 @@ class AgentLoop:
         candidate_hash: str | None,
         hypothesis_reference: str | None,
         evaluation_reference: str | None,
+        *,
+        continuation_state: JsonValue | None = None,
     ) -> AgentEpisode:
         return AgentEpisode(
             episode_id=self._identity("episode", run_id, particle_id, iteration_id),
@@ -2962,6 +3041,7 @@ class AgentLoop:
             evaluated_position=evaluated,
             position_adherence=adherence,
             evaluation=evaluation,
+            continuation_state=continuation_state,
             candidate_reference=candidate_reference,
             candidate_hash=candidate_hash,
             hypothesis_reference=hypothesis_reference,

@@ -223,6 +223,9 @@ def advance_snapshot(
         particle_id = particle.particle_id
         episode = episode_by_id[particle_id]
         success = _episode_best(episode) is not None
+        continuation_state = particle.continuation_state
+        if success and episode.continuation_state is not None:
+            continuation_state = episode.continuation_state
         failures = 0 if success else particle.consecutive_failures + 1
         cognitive_seed = derive_seed(run_seed, particle_id, next_iteration, "cognitive")
         social_seed = derive_seed(run_seed, particle_id, next_iteration, "social")
@@ -301,6 +304,7 @@ def advance_snapshot(
                 position=space.serialize_position(position),
                 velocity=space.serialize_velocity(velocity),
                 pbest=updated_bests[particle_id],
+                continuation_state=continuation_state,
                 latest_episode_id=episode.episode_id,
                 consecutive_failures=failures,
                 rng_state={

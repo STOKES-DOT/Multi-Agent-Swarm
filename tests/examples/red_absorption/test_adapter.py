@@ -57,6 +57,7 @@ def spectrum_fields() -> dict[str, object]:
     )
     key = [HASH2, GEOMETRY_HASH, protocol.protocol_hash, EVALUATOR_VERSION]
     return {
+        "canonical_isomeric_smiles": "C",
         "spectrum_result": spectrum.model_dump(mode="json"),
         "cache_key": key,
         "cache_hit": False,
@@ -393,6 +394,12 @@ def test_candidate_realized_adherence_and_compare() -> None:
     candidate = adapter.candidate_from_tool_result(result, tool_context)
     realized = adapter.realized_position(candidate)
     assert candidate.candidate_hash == HASH2
+    assert candidate.metadata["continuation_state"] == {
+        "kind": "canonical_smiles",
+        "canonical_isomeric_smiles": "C",
+        "chemical_identity_hash": HASH2,
+        "state_hash": HASH,
+    }
     assert realized is not None and len(realized) == 8
     adherence = adapter.position_adherence(
         [1, 0.5, 0.4, 0.1, 0.4, 0.1, 0.8, 0.2], realized

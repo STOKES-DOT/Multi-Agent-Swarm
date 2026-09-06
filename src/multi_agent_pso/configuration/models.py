@@ -58,6 +58,7 @@ class PsoConfig(StrictFrozenModel):
     population_size: PositiveInt
     iterations: PositiveInt
     run_seed: NonNegativeInt
+    inherit_previous_candidate: Annotated[bool, Field(strict=True)] = False
     cognitive_coefficient: NonNegativeFloat = 2.05
     social_coefficient: NonNegativeFloat = 2.05
     constriction_factor: PositiveFloat = 0.72984

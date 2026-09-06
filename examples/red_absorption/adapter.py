@@ -560,6 +560,7 @@ class RedAbsorptionTaskAdapter:
             raise ValueError("valid molecule result required")
         state_hash = payload.get("state_hash")
         candidate_hash = payload.get("chemical_identity_hash")
+        canonical_smiles = payload.get("canonical_isomeric_smiles")
         commands = payload.get("committed_commands")
         try:
             spectrum = SpectrumResult.model_validate(payload.get("spectrum_result"))
@@ -570,6 +571,8 @@ class RedAbsorptionTaskAdapter:
             or not _HASH.fullmatch(state_hash)
             or not isinstance(candidate_hash, str)
             or not _HASH.fullmatch(candidate_hash)
+            or not self._text(canonical_smiles)
+            or len(canonical_smiles.encode("utf-8")) > 8192
             or not isinstance(commands, list)
             or not commands
         ):
@@ -632,6 +635,12 @@ class RedAbsorptionTaskAdapter:
             "spectrum_result": spectrum.model_dump(mode="json"),
             "cache_key": list(expected_cache_key),
             "cache_hit": payload["cache_hit"],
+            "continuation_state": {
+                "kind": "canonical_smiles",
+                "canonical_isomeric_smiles": canonical_smiles,
+                "chemical_identity_hash": candidate_hash,
+                "state_hash": state_hash,
+            },
         }
         return CandidateRef(state_hash, candidate_hash, result.artifacts, metadata)
 

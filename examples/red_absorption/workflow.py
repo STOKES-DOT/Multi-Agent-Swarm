@@ -541,9 +541,18 @@ class RedAbsorptionWorkflowToolProvider:
             )
         resources = self._resources
         geometry = inputs.geometry.model_dump(mode="json")
+        inspected_graph = authoritative.get("inspected_graph")
+        if not isinstance(inspected_graph, Mapping):
+            return ToolResult(
+                ToolStatus.REJECTED,
+                error="persisted proposal lacks an inspected parent graph",
+            )
         try:
             inspection = await self._editor.inspect(
-                _parent_source(inputs),
+                {
+                    "kind": "chemical_graph",
+                    "value": _plain_json(inspected_graph),
+                },
                 cwd=context.workspace,
                 geometry=geometry,
                 timeout=inputs.spectrum_timeout_seconds,

@@ -86,18 +86,33 @@ class FakeEditor:
         self.edit_calls = 0
         self.geometry_configs = []
         self.edit_mode = edit_mode
+        self.sources = []
+        self.latest_graph = None
 
     async def inspect(self, source, *, cwd, geometry=None, artifacts=None, timeout=60):
         self.order.append("inspect")
         self.calls += 1
+        self.sources.append(copy.deepcopy(source))
         self.geometry_configs.append(copy.deepcopy(geometry))
+        if source.get("kind") == "chemical_graph":
+            inspected_graph = copy.deepcopy(source["value"])
+        elif source.get("kind") == "smiles" and source.get("value") == "N":
+            inspected_graph = copy.deepcopy(self.latest_graph)
+        else:
+            inspected_graph = copy.deepcopy(self.graph)
+        geometry_hash = (
+            GEOMETRY_HASH
+            if inspected_graph is not None
+            and inspected_graph.get("state_hash") == HASH
+            else PARENT_GEOMETRY_HASH
+        )
         return SimpleNamespace(
             processed=True,
             chemical_status="VALID",
             geometry_status="READY",
             ready_for_evaluator=True,
-            candidate=copy.deepcopy(self.graph),
-            payload={"geometry_hash": PARENT_GEOMETRY_HASH},
+            candidate=inspected_graph,
+            payload={"geometry_hash": geometry_hash},
         )
 
     async def edit(
@@ -114,7 +129,8 @@ class FakeEditor:
         self.order.append("edit")
         self.edit_calls += 1
         self.geometry_configs.append(copy.deepcopy(geometry))
-        commands = validate_commands(commands, self.graph)
+        parent = copy.deepcopy(inspection.candidate)
+        commands = validate_commands(commands, parent)
         if self.edit_mode == "invalid":
             return SimpleNamespace(
                 processed=True,
@@ -124,11 +140,11 @@ class FakeEditor:
                 candidate=None,
                 payload={},
             )
-        child = copy.deepcopy(self.graph)
+        child = copy.deepcopy(parent)
         child.update(
             state_hash=HASH,
             chemical_identity_hash=CANDIDATE_HASH,
-            parent_state_hash=PARENT_HASH,
+            parent_state_hash=parent["state_hash"],
             committed_commands=copy.deepcopy(list(commands)),
             geometry_status="READY",
         )
@@ -139,10 +155,12 @@ class FakeEditor:
             "graph": child,
             "state_hash": HASH,
             "chemical_identity_hash": CANDIDATE_HASH,
-            "parent_state_hash": PARENT_HASH,
+            "parent_state_hash": parent["state_hash"],
             "geometry_hash": GEOMETRY_HASH,
             "committed_commands": copy.deepcopy(list(commands)),
+            "canonical_isomeric_smiles": "N",
         }
+        self.latest_graph = copy.deepcopy(child)
         if self.edit_mode == "geometry_failed":
             return SimpleNamespace(
                 processed=True,
@@ -159,6 +177,26 @@ class FakeEditor:
             ready_for_evaluator=True,
             candidate=child,
             payload=payload,
+        )
+
+
+class InheritedParentEditor:
+    def __init__(self, expected_hash: str):
+        self.expected_hash = expected_hash
+        self.sources = []
+
+    async def inspect(self, source, *, cwd, geometry=None, artifacts=None, timeout=60):
+        self.sources.append(copy.deepcopy(source))
+        graph = parent_graph()
+        graph["state_hash"] = HASH
+        graph["chemical_identity_hash"] = self.expected_hash
+        return SimpleNamespace(
+            processed=True,
+            chemical_status="VALID",
+            geometry_status="READY",
+            ready_for_evaluator=True,
+            candidate=graph,
+            payload={"geometry_hash": PARENT_GEOMETRY_HASH},
         )
 
 
@@ -291,13 +329,18 @@ def authorized_request_context(commands, workspace: Path):
     return request, context
 
 
-def make_runner(tmp_path: Path):
+def make_runner(tmp_path: Path, *, inherit_previous_candidate: bool = False):
     inputs = load_valid_inputs(tmp_path)
     order = []
     graph = parent_graph()
     wiki = FakeWiki(order)
     editor = FakeEditor(order, graph)
-    stage_provider = RedAbsorptionStageContextProvider(inputs, wiki, editor)
+    stage_provider = RedAbsorptionStageContextProvider(
+        inputs,
+        wiki,
+        editor,
+        inherit_previous_candidate=inherit_previous_candidate,
+    )
     runtime = SchemaRuntime(order)
     cache = {}
     workflow_resources = RedAbsorptionWorkflowResources.from_inputs(inputs, cache)
@@ -314,7 +357,7 @@ def make_runner(tmp_path: Path):
     artifacts = FakeArtifactStore()
     config = "f" * 64
 
-    def factory(target):
+    def factory(target, continuation_state=None):
         return AgentLoop(
             runtime=runtime,
             task_adapter=adapter,
@@ -327,6 +370,12 @@ def make_runner(tmp_path: Path):
             workspace=tmp_path.resolve(),
             protocol_snapshot_hash=config,
             stage_context_provider=stage_provider,
+            initial_context=(
+                {"parent_continuation_state": continuation_state}
+                if inherit_previous_candidate and continuation_state is not None
+                else None
+            ),
+            capture_candidate_continuation=inherit_previous_candidate,
         )
 
     runner = SynchronousSwarmRunner(
@@ -339,11 +388,153 @@ def make_runner(tmp_path: Path):
         update_rule=ConstrictedUpdateRule(),
         store=store,
         episode_factory=factory,
+        continuation_episode_factory=(
+            (lambda particle_id, target, continuation: factory(target, continuation))
+            if inherit_previous_candidate
+            else None
+        ),
         particle_ids=("p0", "p1", "p2"),
         resource_budget={"evaluations": 6},
         failure_threshold=2,
     )
     return runner, tool, order, store, editor, cache
+
+
+@pytest.mark.asyncio
+async def test_two_generation_flow_inherits_each_particles_previous_molecule(
+    tmp_path: Path,
+):
+    runner, tool, order, store, editor, cache = make_runner(
+        tmp_path, inherit_previous_candidate=True
+    )
+
+    result = await runner.run(iterations=2)
+
+    assert result.final_snapshot.iteration_id == 2
+    assert all(
+        particle.continuation_state["canonical_isomeric_smiles"] == "N"
+        for particle in result.final_snapshot.particles
+    )
+    inherited_stage_inspections = [
+        source
+        for source in editor.sources
+        if source == {"kind": "smiles", "value": "N"}
+    ]
+    assert len(inherited_stage_inspections) == 3
+    inherited_execution_inspections = [
+        source
+        for source in editor.sources
+        if source.get("kind") == "chemical_graph"
+        and source["value"].get("state_hash") == HASH
+    ]
+    assert len(inherited_execution_inspections) == 3
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stage_context_reinspects_inherited_canonical_smiles(tmp_path: Path):
+    inputs = load_valid_inputs(tmp_path)
+    editor = InheritedParentEditor(CANDIDATE_HASH)
+    provider = RedAbsorptionStageContextProvider(
+        inputs,
+        FakeWiki([]),
+        editor,
+        inherit_previous_candidate=True,
+    )
+    continuation = {
+        "kind": "canonical_smiles",
+        "canonical_isomeric_smiles": "N",
+        "chemical_identity_hash": CANDIDATE_HASH,
+        "state_hash": HASH,
+    }
+    context = ToolContext(
+        "run",
+        "p0",
+        1,
+        AgentStage.PROPOSING_ACTION,
+        0,
+        tmp_path.resolve(),
+    )
+
+    additions = await provider.prepare(
+        AgentStage.PROPOSING_ACTION,
+        {"parent_continuation_state": continuation},
+        context,
+    )
+
+    assert editor.sources == [{"kind": "smiles", "value": "N"}]
+    assert additions["inspected_graph"]["chemical_identity_hash"] == CANDIDATE_HASH
+
+
+@pytest.mark.asyncio
+async def test_stage_context_ignores_continuation_when_switch_is_disabled(
+    tmp_path: Path,
+):
+    inputs = load_valid_inputs(tmp_path)
+    editor = InheritedParentEditor("f" * 64)
+    provider = RedAbsorptionStageContextProvider(
+        inputs,
+        FakeWiki([]),
+        editor,
+        inherit_previous_candidate=False,
+    )
+    context = ToolContext(
+        "run",
+        "p0",
+        1,
+        AgentStage.PROPOSING_ACTION,
+        0,
+        tmp_path.resolve(),
+    )
+
+    await provider.prepare(
+        AgentStage.PROPOSING_ACTION,
+        {
+            "parent_continuation_state": {
+                "kind": "canonical_smiles",
+                "canonical_isomeric_smiles": "N",
+                "chemical_identity_hash": CANDIDATE_HASH,
+                "state_hash": HASH,
+            }
+        },
+        context,
+    )
+
+    assert editor.sources == [{"kind": "smiles", "value": inputs.parent.value}]
+
+
+@pytest.mark.asyncio
+async def test_stage_context_rejects_inherited_chemical_hash_mismatch(tmp_path: Path):
+    inputs = load_valid_inputs(tmp_path)
+    editor = InheritedParentEditor("9" * 64)
+    provider = RedAbsorptionStageContextProvider(
+        inputs,
+        FakeWiki([]),
+        editor,
+        inherit_previous_candidate=True,
+    )
+    context = ToolContext(
+        "run",
+        "p0",
+        1,
+        AgentStage.PROPOSING_ACTION,
+        0,
+        tmp_path.resolve(),
+    )
+
+    with pytest.raises(ValueError, match="chemical identity"):
+        await provider.prepare(
+            AgentStage.PROPOSING_ACTION,
+            {
+                "parent_continuation_state": {
+                    "kind": "canonical_smiles",
+                    "canonical_isomeric_smiles": "N",
+                    "chemical_identity_hash": CANDIDATE_HASH,
+                    "state_hash": HASH,
+                }
+            },
+            context,
+        )
 
 
 @pytest.mark.asyncio

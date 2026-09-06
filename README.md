@@ -304,6 +304,18 @@ Python PSO Orchestrator
 
 50 个逻辑粒子不等于必须同时启动 50 个 Agent。实际并发度应由模型请求、TDDFT/MOMAP 计算资源和预算共同决定。
 
+每个粒子是否沿用自己上一轮成功候选，可通过任务配置控制：
+
+~~~yaml
+pso:
+  inherit_previous_candidate: true  # 默认 false：每轮从初始母体重新设计
+~~~
+
+开启后，失败、无效或超时的轮次不会替换父体；粒子继续保留最近一次成功候选。
+该状态与 pbest/gbest 分离：pbest/gbest 控制 PSO 数值引导，候选继承只控制下一轮
+任务适配器的起始对象。分子任务保存 MoleculeEditor 输出的 canonical SMILES 与哈希，
+下一轮仍须重新通过 MoleculeEditor inspection，不能绕过化学合法性验证。
+
 ### 7.1 CLI 原型
 
 Codex CLI 可以用非交互模式启动单个粒子：

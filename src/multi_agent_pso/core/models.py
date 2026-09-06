@@ -227,12 +227,15 @@ class ParticleState(_FrozenModel):
     position: JsonValue
     velocity: JsonValue
     pbest: PersonalBest | None = None
+    continuation_state: JsonValue | None = None
     latest_episode_id: str | None = Field(default=None, min_length=1)
     consecutive_failures: int = Field(default=0, ge=0)
     rng_state: JsonValue
     lifecycle_status: EpisodeStatus = EpisodeStatus.PENDING
 
-    @field_validator("position", "velocity", "rng_state", mode="before")
+    @field_validator(
+        "position", "velocity", "rng_state", "continuation_state", mode="before"
+    )
     @classmethod
     def normalize_json_fields(cls, value: object) -> object:
         return _normalize_json_input(value)
@@ -242,12 +245,12 @@ class ParticleState(_FrozenModel):
     def validate_positions(cls, value: JsonValue) -> JsonValue:
         return _freeze_finite_json(value, allow_none=False)
 
-    @field_validator("rng_state")
+    @field_validator("rng_state", "continuation_state")
     @classmethod
     def validate_rng_state(cls, value: JsonValue) -> JsonValue:
         return _freeze_finite_json(value)
 
-    @field_serializer("position", "velocity", "rng_state")
+    @field_serializer("position", "velocity", "rng_state", "continuation_state")
     def serialize_json_fields(self, value: JsonValue) -> JsonValue:
         return _thaw_json(value)  # type: ignore[return-value]
 
@@ -286,6 +289,7 @@ class AgentEpisode(_FrozenModel):
     evaluated_position: JsonValue
     position_adherence: Mapping[str, JsonValue] = Field(default_factory=dict)
     evaluation: Evaluation | None = None
+    continuation_state: JsonValue | None = None
     candidate_reference: str | None = Field(default=None, min_length=1)
     candidate_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     hypothesis_reference: str | None = Field(default=None, min_length=1)
@@ -298,6 +302,7 @@ class AgentEpisode(_FrozenModel):
         "realized_position",
         "evaluated_position",
         "position_adherence",
+        "continuation_state",
         mode="before",
     )
     @classmethod
@@ -309,7 +314,7 @@ class AgentEpisode(_FrozenModel):
     def validate_required_positions(cls, value: JsonValue) -> JsonValue:
         return _freeze_finite_json(value, allow_none=False)
 
-    @field_validator("realized_position", "position_adherence")
+    @field_validator("realized_position", "position_adherence", "continuation_state")
     @classmethod
     def validate_json_fields(cls, value: JsonValue) -> JsonValue:
         return _freeze_finite_json(value)
@@ -319,6 +324,7 @@ class AgentEpisode(_FrozenModel):
         "realized_position",
         "evaluated_position",
         "position_adherence",
+        "continuation_state",
     )
     def serialize_json_fields(self, value: JsonValue) -> JsonValue:
         return _thaw_json(value)  # type: ignore[return-value]

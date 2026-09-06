@@ -58,6 +58,10 @@ class SynchronousSwarmRunner(Generic[P, V]):
         store: RunStore,
         episode_factory: Callable[[JsonValue], AgentLoop],
         particle_episode_factory: Callable[[str, JsonValue], AgentLoop] | None = None,
+        continuation_episode_factory: Callable[
+            [str, JsonValue, JsonValue | None], AgentLoop
+        ]
+        | None = None,
         particle_ids: Sequence[str] = (),
         initial_snapshot: IterationSnapshot | None = None,
         resource_budget: Mapping[str, JsonValue] | None = None,
@@ -83,6 +87,7 @@ class SynchronousSwarmRunner(Generic[P, V]):
         self.store = store
         self.episode_factory = episode_factory
         self.particle_episode_factory = particle_episode_factory
+        self.continuation_episode_factory = continuation_episode_factory
         self.particle_ids = tuple(particle_ids)
         self._initial_snapshot = initial_snapshot
         self.resource_budget = dict(resource_budget or {})
@@ -162,13 +167,18 @@ class SynchronousSwarmRunner(Generic[P, V]):
             particle_id = serialized_particle["particle_id"]
             if not isinstance(particle_id, str):
                 raise ValueError("serialized particle_id must be a string")
-            loop = (
-                self.episode_factory(serialized_particle["position"])
-                if self.particle_episode_factory is None
-                else self.particle_episode_factory(
+            if self.continuation_episode_factory is not None:
+                loop = self.continuation_episode_factory(
+                    particle_id,
+                    serialized_particle["position"],
+                    serialized_particle.get("continuation_state"),
+                )
+            elif self.particle_episode_factory is not None:
+                loop = self.particle_episode_factory(
                     particle_id, serialized_particle["position"]
                 )
-            )
+            else:
+                loop = self.episode_factory(serialized_particle["position"])
             return await loop.run_particle(
                 self.run_id,
                 particle_id,

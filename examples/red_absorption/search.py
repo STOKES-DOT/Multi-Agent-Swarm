@@ -183,7 +183,13 @@ async def run_red_absorption_search(
             agent_concurrency=spec.concurrency.agents,
             evaluation_concurrency=spec.concurrency.evaluations,
         )
-        stage_context = RedAbsorptionStageContextProvider(inputs, wiki, editor)
+        inherit_previous_candidate = spec.pso.inherit_previous_candidate
+        stage_context = RedAbsorptionStageContextProvider(
+            inputs,
+            wiki,
+            editor,
+            inherit_previous_candidate=inherit_previous_candidate,
+        )
         tools: list[RedAbsorptionWorkflowToolProvider] = []
         runtime = LocalCodexRuntime(model=spec.agent.model)
     except BaseException as primary:
@@ -208,7 +214,7 @@ async def run_red_absorption_search(
         raise
     try:
         async with runtime:
-            def make_loop(particle_id, target):
+            def make_loop(particle_id, target, continuation_state=None):
                 workspace = _particle_workspace(root, run_id, particle_id)
                 tool = RedAbsorptionWorkflowToolProvider.bind(
                     inputs,
@@ -230,6 +236,13 @@ async def run_red_absorption_search(
                     workspace=workspace,
                     protocol_snapshot_hash=config_hash,
                     stage_context_provider=stage_context,
+                    initial_context=(
+                        {"parent_continuation_state": continuation_state}
+                        if inherit_previous_candidate
+                        and continuation_state is not None
+                        else None
+                    ),
+                    capture_candidate_continuation=inherit_previous_candidate,
                 )
 
             runner = SynchronousSwarmRunner(
@@ -248,6 +261,9 @@ async def run_red_absorption_search(
                 store=store,
                 episode_factory=lambda target: make_loop("p0", target),
                 particle_episode_factory=make_loop,
+                continuation_episode_factory=(
+                    make_loop if inherit_previous_candidate else None
+                ),
                 particle_ids=tuple(
                     f"p{index}" for index in range(spec.pso.population_size)
                 ),

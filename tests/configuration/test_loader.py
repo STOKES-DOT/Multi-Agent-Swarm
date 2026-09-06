@@ -33,6 +33,26 @@ FIXTURE_TASK = Path("tests/fixtures/tasks/quadratic/task.yaml")
 PLUGIN_MODULE = "tests.fixtures.tasks.quadratic.plugin"
 
 
+def test_pso_candidate_inheritance_is_strict_and_disabled_by_default() -> None:
+    defaults = PsoConfig(population_size=3, iterations=2, run_seed=42)
+    enabled = PsoConfig(
+        population_size=3,
+        iterations=2,
+        run_seed=42,
+        inherit_previous_candidate=True,
+    )
+
+    assert defaults.inherit_previous_candidate is False
+    assert enabled.inherit_previous_candidate is True
+    with pytest.raises(ValidationError):
+        PsoConfig(
+            population_size=3,
+            iterations=2,
+            run_seed=42,
+            inherit_previous_candidate=1,
+        )
+
+
 def _task_yaml(
     *,
     prompt: str = "prompt.md",
