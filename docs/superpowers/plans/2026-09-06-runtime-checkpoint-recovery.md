@@ -216,18 +216,18 @@ git diff --check
 
 Expected: all tests and checks pass.
 
-- [ ] **Step 2: Commit the isolated branch**
+- [x] **Step 2: Commit the isolated branch**
 
 Commit only the plan, implementation, and tests on `fix/runtime-checkpoint-recovery`. Do not stage the user's modified `docs/superpowers/plans/2026-09-02-multi-agent-pso-core.md` from `main`.
 
-- [ ] **Step 3: Merge locally after verification**
+- [x] **Step 3: Merge locally after verification**
 
 From the main checkout, merge `fix/runtime-checkpoint-recovery`, rerun the focused recovery tests on the merged result, then remove the owned worktree and delete the merged branch.
 
-- [ ] **Step 4: Run a fresh real preflight and short recovery smoke test**
+- [x] **Step 4: Run a fresh real preflight and short recovery smoke test**
 
 Use a new run directory because source hashes change. Verify the preflight artifact, one large-molecule artifact, no node-limit failure, and a forced or fixture transport interruption that resumes without another FLAME budget commit.
 
-- [ ] **Step 5: Relaunch the 10x100 job only after the live gates pass**
+- [x] **Step 5: Relaunch the 10x100 job only after the live gates pass**
 
 Create a one-shot `KeepAlive=false` LaunchAgent using the new commit and run identity. Confirm `runs=1`, active PID, 10 particle checkpoints, advancing events, and empty stderr before reporting the new search as running.
