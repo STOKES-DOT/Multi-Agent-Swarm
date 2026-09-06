@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import errno
 import stat
@@ -123,6 +124,13 @@ def _json_ready(value: object) -> object:
     return value
 
 
+def _finite_float(token: str) -> float:
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError("nonfinite JSON number")
+    return value
+
+
 class FileArtifactStore:
     """Publish content once without allowing an existing artifact to be replaced.
 
@@ -234,6 +242,29 @@ class FileArtifactStore:
         return self.publish_bytes(relative_path, serialized, "application/json")
 
     def verify(self, reference: ArtifactRef) -> None:
+        self._read_verified_bytes(reference)
+
+    def read_json(self, reference: ArtifactRef) -> Mapping[str, JsonValue]:
+        if not isinstance(reference, ArtifactRef):
+            raise TypeError("reference must be an ArtifactRef")
+        if reference.media_type != "application/json":
+            raise ArtifactIntegrityError("artifact media type is not application/json")
+        payload = self._read_verified_bytes(reference)
+        try:
+            document = json.loads(
+                payload.decode("utf-8"),
+                parse_float=_finite_float,
+                parse_constant=lambda token: (_ for _ in ()).throw(
+                    ValueError(f"nonfinite JSON token: {token}")
+                ),
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise ValueError("artifact must contain a finite JSON object") from error
+        if not isinstance(document, dict):
+            raise ValueError("artifact must contain a finite JSON object")
+        return document
+
+    def _read_verified_bytes(self, reference: ArtifactRef) -> bytes:
         """Verify one immutable artifact through a single opened file descriptor.
 
         V1 assumes external writers do not mutate artifact paths or contents outside
@@ -271,6 +302,7 @@ class FileArtifactStore:
                 metadata.st_ctime_ns,
             )
             digest = hashlib.sha256()
+            payload = bytearray()
             size = 0
             while True:
                 remaining_with_sentinel = reference.size_bytes - size + 1
@@ -283,6 +315,7 @@ class FileArtifactStore:
                 if size > reference.size_bytes:
                     raise ArtifactIntegrityError("artifact size exceeds reference")
                 digest.update(chunk)
+                payload.extend(chunk)
             final_metadata = os.fstat(artifact_fd)
             final_identity = (
                 final_metadata.st_dev,
@@ -297,6 +330,7 @@ class FileArtifactStore:
                 raise ArtifactIntegrityError("artifact size does not match reference")
             if digest.hexdigest() != reference.sha256:
                 raise ArtifactIntegrityError("artifact hash does not match reference")
+            return bytes(payload)
         except ArtifactIntegrityError:
             raise
         except Exception as error:

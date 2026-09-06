@@ -138,6 +138,7 @@ class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
                 "canonical_isomeric_smiles": canonical_smiles,
                 "chemical_identity_hash": candidate_hash,
                 "state_hash": state_hash,
+                "molecule_artifact": molecule_artifact.model_dump(mode="json"),
             },
         }
         if rolled_back:

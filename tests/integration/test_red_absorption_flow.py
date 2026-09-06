@@ -106,13 +106,19 @@ class FakeEditor:
             and inspected_graph.get("state_hash") == HASH
             else PARENT_GEOMETRY_HASH
         )
+        geometry_status = "READY" if geometry is not None else "NOT_REQUESTED"
+        inspected_graph["geometry_status"] = geometry_status
         return SimpleNamespace(
             processed=True,
             chemical_status="VALID",
-            geometry_status="READY",
-            ready_for_evaluator=True,
+            geometry_status=geometry_status,
+            ready_for_evaluator=geometry is not None,
             candidate=inspected_graph,
-            payload={"geometry_hash": geometry_hash},
+            payload=(
+                {"geometry_hash": geometry_hash}
+                if geometry is not None
+                else {}
+            ),
         )
 
     async def edit(

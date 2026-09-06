@@ -875,6 +875,9 @@ class FakeArtifactStore:
     def publish_json(self, relative_path: str, payload: Mapping[str, object]) -> ArtifactRef:
         raise NotImplementedError
 
+    def read_json(self, reference: ArtifactRef) -> Mapping[str, object]:
+        raise NotImplementedError
+
 
 class FakeEvaluator:
     fixed_fitness = 1.25

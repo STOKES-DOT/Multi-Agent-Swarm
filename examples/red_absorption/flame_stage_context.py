@@ -6,11 +6,18 @@ from collections.abc import Mapping
 
 from pydantic import JsonValue
 
-from multi_agent_pso.core import AgentStage
-from multi_agent_pso.protocols import RunStore, ToolContext, WikiQuery, WikiRetriever
+from multi_agent_pso.core import AgentStage, ArtifactRef
+from multi_agent_pso.protocols import (
+    ArtifactIntegrityError,
+    ArtifactStore,
+    RunStore,
+    ToolContext,
+    WikiQuery,
+    WikiRetriever,
+)
 
 from .flame_inputs import FlameRunInputs
-from .stage_context import RedAbsorptionStageContextProvider
+from .stage_context import RedAbsorptionStageContextProvider, _HASH
 
 
 class FlameStageContextProvider(RedAbsorptionStageContextProvider):
@@ -21,6 +28,7 @@ class FlameStageContextProvider(RedAbsorptionStageContextProvider):
         molecule_editor,
         *,
         inherit_previous_candidate: bool = False,
+        artifact_store: ArtifactStore | None = None,
         run_store: RunStore | None = None,
     ) -> None:
         if not isinstance(inputs, FlameRunInputs):
@@ -29,6 +37,7 @@ class FlameStageContextProvider(RedAbsorptionStageContextProvider):
         self._wiki = wiki
         self._editor = molecule_editor
         self._inherit_previous_candidate = inherit_previous_candidate
+        self._artifact_store = artifact_store
         self._run_store = run_store
 
     async def prepare(
@@ -60,7 +69,89 @@ class FlameStageContextProvider(RedAbsorptionStageContextProvider):
             if previous_reflection is not None:
                 additions["previous_reflection"] = previous_reflection
             return additions
+        if stage is AgentStage.PROPOSING_ACTION:
+            if all(
+                key in context
+                for key in (
+                    "inspected_graph",
+                    "inspected_source_hash",
+                    "inspected_geometry_hash",
+                )
+            ):
+                additions = {
+                    "inspected_graph": context["inspected_graph"],
+                    "inspected_source_hash": context["inspected_source_hash"],
+                    "inspected_geometry_hash": context["inspected_geometry_hash"],
+                }
+                if "inspected_artifact" in context:
+                    additions["inspected_artifact"] = context["inspected_artifact"]
+                return additions
+            continuation = context.get("parent_continuation_state")
+            if (
+                self._inherit_previous_candidate
+                and isinstance(continuation, Mapping)
+                and "molecule_artifact" in continuation
+            ):
+                return self._restore_artifact_parent(continuation)
         return await super().prepare(stage, context, tool_context)
+
+    def _restore_artifact_parent(
+        self, continuation: Mapping[str, JsonValue]
+    ) -> Mapping[str, JsonValue]:
+        if (
+            set(continuation)
+            != {
+                "kind",
+                "canonical_isomeric_smiles",
+                "chemical_identity_hash",
+                "state_hash",
+                "molecule_artifact",
+            }
+            or continuation.get("kind") != "canonical_smiles"
+            or not isinstance(continuation.get("canonical_isomeric_smiles"), str)
+            or not continuation["canonical_isomeric_smiles"]
+            or len(continuation["canonical_isomeric_smiles"].encode("utf-8"))
+            > 8192
+            or not isinstance(continuation.get("chemical_identity_hash"), str)
+            or not isinstance(continuation.get("state_hash"), str)
+            or not _HASH.fullmatch(continuation["chemical_identity_hash"])
+            or not _HASH.fullmatch(continuation["state_hash"])
+        ):
+            raise ValueError("parent continuation state is invalid")
+        if self._artifact_store is None:
+            raise ValueError("artifact-backed parent requires an artifact store")
+        try:
+            artifact = ArtifactRef.model_validate(continuation["molecule_artifact"])
+            record = self._artifact_store.read_json(artifact)
+        except (ArtifactIntegrityError, TypeError, ValueError) as error:
+            raise ValueError("parent molecule artifact is invalid") from error
+
+        graph = record.get("graph")
+        geometry_hash = record.get("geometry_hash")
+        state_hash = continuation["state_hash"]
+        chemical_hash = continuation["chemical_identity_hash"]
+        canonical_smiles = continuation["canonical_isomeric_smiles"]
+        if (
+            record.get("chemical_status") != "VALID"
+            or record.get("geometry_status") != "READY"
+            or record.get("ready_for_evaluator") is not True
+            or not isinstance(graph, Mapping)
+            or record.get("state_hash") != state_hash
+            or record.get("chemical_identity_hash") != chemical_hash
+            or record.get("canonical_isomeric_smiles") != canonical_smiles
+            or graph.get("state_hash") != state_hash
+            or graph.get("chemical_identity_hash") != chemical_hash
+            or graph.get("geometry_status") != "READY"
+            or not isinstance(geometry_hash, str)
+            or not _HASH.fullmatch(geometry_hash)
+        ):
+            raise ValueError("parent molecule artifact identity is invalid")
+        return {
+            "inspected_graph": dict(graph),
+            "inspected_source_hash": state_hash,
+            "inspected_geometry_hash": geometry_hash,
+            "inspected_artifact": artifact.model_dump(mode="json"),
+        }
 
     def _previous_reflection(
         self, context: Mapping[str, JsonValue]

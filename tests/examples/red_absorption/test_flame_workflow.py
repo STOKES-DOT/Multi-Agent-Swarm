@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,12 +20,19 @@ from examples.red_absorption.flame_workflow import (
     FlameWorkflowToolProvider,
     flame_cache_key,
 )
-from multi_agent_pso.core import AgentStage, EvaluationStatus
+from multi_agent_pso.core import AgentStage, ArtifactRef, EvaluationStatus
 from multi_agent_pso.core.topology import RingTopology
 from multi_agent_pso.core.update_rule import ConstrictedUpdateRule
 from multi_agent_pso.orchestration import AgentLoop, SynchronousSwarmRunner
 from multi_agent_pso.orchestration.agent_loop import _bounded_json_copy
-from multi_agent_pso.protocols import ToolContext, ToolRequest, ToolResult, ToolStatus
+from multi_agent_pso.protocols import (
+    StageResponse,
+    TokenUsage,
+    ToolContext,
+    ToolRequest,
+    ToolResult,
+    ToolStatus,
+)
 from multi_agent_pso.resources import DurableBudgetLedger
 from multi_agent_pso.storage import FileArtifactStore
 from multi_agent_pso.tools import JsonCommandStatus
@@ -32,6 +40,8 @@ from tests.integration.test_red_absorption_flow import (
     CANDIDATE_HASH,
     FakeEditor,
     FakeWiki,
+    GEOMETRY_HASH,
+    HASH,
     PARENT_GEOMETRY_HASH,
     PARENT_HASH,
     SchemaRuntime,
@@ -174,6 +184,9 @@ async def test_workflow_builds_flame_candidate_and_proxy_reward(tmp_path: Path):
     assert result.status is ToolStatus.SUCCESS
     assert candidate.candidate_hash == CANDIDATE_HASH
     assert candidate.metadata["continuation_state"]["canonical_isomeric_smiles"] == "N"
+    assert candidate.metadata["continuation_state"]["molecule_artifact"] == (
+        result.artifacts[0].model_dump(mode="json")
+    )
     assert evaluation.status is EvaluationStatus.SUCCESS
     assert evaluation.feasible is True
     assert evaluation.fitness > 1.0
@@ -182,6 +195,260 @@ async def test_workflow_builds_flame_candidate_and_proxy_reward(tmp_path: Path):
     assert command.calls[0][1]["timeout_seconds"] is None
     assert result.payload["cache_key"] == flame_cache_key(run_inputs, CANDIDATE_HASH)
     await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stage_context_restores_artifact_backed_parent_without_smiles_rebuild(
+    tmp_path: Path,
+) -> None:
+    run_inputs = inputs(tmp_path)
+    artifact_store = FileArtifactStore(tmp_path / "artifacts")
+    editor = FakeEditor([], parent_graph())
+    provider = FlameWorkflowToolProvider.bind(
+        run_inputs,
+        editor,
+        FlameWorkflowResources.from_inputs(
+            run_inputs, max_new_evaluations=10
+        ),
+        flame=FakeFlameCommand(),
+        artifact_store=artifact_store,
+    )
+    request, tool_context = authorized_request(tmp_path)
+    result = await provider.execute(request, tool_context)
+    candidate = FlameRedAbsorptionTaskAdapter().candidate_from_tool_result(
+        result, tool_context
+    )
+
+    class FailIfInspected:
+        async def inspect(self, *args, **kwargs):
+            raise AssertionError("artifact-backed parent must not rebuild from SMILES")
+
+    stage_context = FlameStageContextProvider(
+        run_inputs,
+        FakeWiki([]),
+        FailIfInspected(),
+        inherit_previous_candidate=True,
+        artifact_store=artifact_store,
+    )
+    context = {
+        "run_id": "run",
+        "particle_id": "p0",
+        "iteration_id": 1,
+        "protocol_snapshot_hash": "1" * 64,
+        "target_position": [0.0] * 8,
+        "parent_continuation_state": candidate.metadata["continuation_state"],
+    }
+
+    additions = await stage_context.prepare(
+        AgentStage.PROPOSING_ACTION,
+        context,
+        ToolContext(
+            "run",
+            "p0",
+            1,
+            AgentStage.PROPOSING_ACTION,
+            0,
+            tmp_path.resolve(),
+        ),
+    )
+
+    assert additions["inspected_graph"]["chemical_identity_hash"] == CANDIDATE_HASH
+    assert additions["inspected_source_hash"] == HASH
+    assert additions["inspected_geometry_hash"] == GEOMETRY_HASH
+    assert additions["inspected_artifact"] == result.artifacts[0].model_dump(
+        mode="json"
+    )
+
+    adapter = FlameRedAbsorptionTaskAdapter()
+    stage_request = adapter.build_stage_request(
+        AgentStage.PROPOSING_ACTION, {**context, **additions}
+    )
+    authorization_id = stage_request.response_schema["properties"][
+        "authorization_id"
+    ]["const"]
+    proposal = adapter.parse_stage_response(
+        AgentStage.PROPOSING_ACTION,
+        StageResponse(
+            json.dumps(
+                {
+                    "authorization_id": authorization_id,
+                    "provider": "molecule_editor",
+                    "operation": "edit",
+                    "tool_payload": {
+                        "inspected_source_hash": HASH,
+                        "commands": [
+                            {
+                                "operation": "replace_atom",
+                                "atom_id": "a0001",
+                                "atomic_number": 8,
+                            }
+                        ],
+                    },
+                }
+            ),
+            TokenUsage(0, 0),
+        ),
+    )
+    assert proposal["tool_payload"]["inspected_artifact"] == additions[
+        "inspected_artifact"
+    ]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "artifact_hash",
+        "continuation_chemical_hash",
+        "continuation_state_hash",
+        "continuation_smiles",
+        "malformed_graph",
+        "unready_record",
+    ],
+)
+@pytest.mark.asyncio
+async def test_stage_context_rejects_mismatched_inheritance_artifact(
+    tmp_path: Path, mutation: str
+) -> None:
+    run_inputs = inputs(tmp_path)
+    artifact_store = FileArtifactStore(tmp_path / "artifacts")
+    graph = copy.deepcopy(parent_graph())
+    record = {
+        "chemical_status": "VALID",
+        "geometry_status": "READY",
+        "ready_for_evaluator": True,
+        "graph": graph,
+        "state_hash": PARENT_HASH,
+        "chemical_identity_hash": "f" * 64,
+        "geometry_hash": PARENT_GEOMETRY_HASH,
+        "canonical_isomeric_smiles": "C",
+    }
+    if mutation == "malformed_graph":
+        record["graph"] = []
+    elif mutation == "unready_record":
+        record["geometry_status"] = "FAILED"
+        record["ready_for_evaluator"] = False
+    artifact = artifact_store.publish_json(f"{mutation}.json", record)
+    continuation = {
+        "kind": "canonical_smiles",
+        "canonical_isomeric_smiles": "C",
+        "chemical_identity_hash": "f" * 64,
+        "state_hash": PARENT_HASH,
+        "molecule_artifact": artifact.model_dump(mode="json"),
+    }
+    if mutation == "artifact_hash":
+        continuation["molecule_artifact"]["sha256"] = "0" * 64
+    elif mutation == "continuation_chemical_hash":
+        continuation["chemical_identity_hash"] = "0" * 64
+    elif mutation == "continuation_state_hash":
+        continuation["state_hash"] = "0" * 64
+    elif mutation == "continuation_smiles":
+        continuation["canonical_isomeric_smiles"] = "N"
+    stage_context = FlameStageContextProvider(
+        run_inputs,
+        FakeWiki([]),
+        FakeEditor([], parent_graph()),
+        inherit_previous_candidate=True,
+        artifact_store=artifact_store,
+    )
+
+    with pytest.raises(ValueError, match="parent molecule artifact"):
+        await stage_context.prepare(
+            AgentStage.PROPOSING_ACTION,
+            {"parent_continuation_state": continuation},
+            ToolContext(
+                "run",
+                "p0",
+                1,
+                AgentStage.PROPOSING_ACTION,
+                0,
+                tmp_path.resolve(),
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_inherited_parent_skips_geometry_preparation(tmp_path: Path) -> None:
+    run_inputs = inputs(tmp_path)
+    artifact_store = FileArtifactStore(tmp_path / "artifacts")
+    first = FlameWorkflowToolProvider.bind(
+        run_inputs,
+        FakeEditor([], parent_graph()),
+        FlameWorkflowResources.from_inputs(run_inputs, max_new_evaluations=10),
+        flame=FakeFlameCommand(),
+        artifact_store=artifact_store,
+    )
+    first_request, first_context = authorized_request(tmp_path)
+    first_result = await first.execute(first_request, first_context)
+    artifact = first_result.artifacts[0]
+    parent_record = artifact_store.read_json(artifact)
+    inherited_graph = parent_record["graph"]
+
+    class NoParentGeometryEditor(FakeEditor):
+        async def inspect(self, source, *, cwd, geometry=None, artifacts=None, timeout=60):
+            assert geometry is None
+            self.geometry_configs.append(geometry)
+            graph = copy.deepcopy(source["value"])
+            graph["geometry_status"] = "NOT_REQUESTED"
+            return SimpleNamespace(
+                processed=True,
+                chemical_status="VALID",
+                geometry_status="NOT_REQUESTED",
+                ready_for_evaluator=False,
+                candidate=graph,
+                payload={"canonical_isomeric_smiles": "N"},
+            )
+
+        async def edit(self, inspection, commands, **kwargs):
+            assert kwargs["geometry"] == run_inputs.geometry.model_dump(mode="json")
+            return await super().edit(inspection, commands, **kwargs)
+
+    editor = NoParentGeometryEditor([], inherited_graph)
+    payload = {
+        "inspected_source_hash": HASH,
+        "commands": [
+            {"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 8}
+        ],
+        "target_position": [0.0] * 8,
+        "edit_budget": 1,
+        "fragment_heavy_atom_cap": 1,
+        "operation_policy": {
+            "replace_atom": 0.25,
+            "change_bond": 0.25,
+            "attach_fragment": 0.25,
+            "substitute_fragment": 0.25,
+        },
+        "inspected_graph": inherited_graph,
+        "inspected_geometry_hash": GEOMETRY_HASH,
+        "inspected_artifact": artifact.model_dump(mode="json"),
+    }
+    proposal = {
+        "authorization_id": "9" * 64,
+        "provider": "molecule_editor",
+        "operation": "edit",
+        "tool_payload": payload,
+    }
+    request = ToolRequest("id", "molecule_editor", "edit", payload, "key")
+    context = ToolContext(
+        "run",
+        "p0",
+        1,
+        AgentStage.EXECUTING,
+        0,
+        tmp_path.resolve(),
+        metadata={"proposal": proposal},
+    )
+    provider = FlameWorkflowToolProvider.bind(
+        run_inputs,
+        editor,
+        FlameWorkflowResources.from_inputs(run_inputs, max_new_evaluations=10),
+        flame=FakeFlameCommand(),
+        artifact_store=artifact_store,
+    )
+
+    result = await provider.execute(request, context)
+
+    assert result.status is ToolStatus.SUCCESS
+    assert editor.geometry_configs == [None, run_inputs.geometry.model_dump(mode="json")]
 
 
 @pytest.mark.asyncio
@@ -329,6 +596,7 @@ async def test_rollback_candidate_preserves_parent_for_next_generation(
         "canonical_isomeric_smiles": "C",
         "chemical_identity_hash": "f" * 64,
         "state_hash": PARENT_HASH,
+        "molecule_artifact": result.artifacts[0].model_dump(mode="json"),
     }
     tampered_payload = result.to_json()["payload"]
     tampered_payload["rollback"]["rejected_commands_sha256"] = "0" * 64
@@ -448,6 +716,7 @@ async def test_rollback_parent_is_reflected_then_edited_again_next_generation(
         FakeWiki(order),
         editor,
         inherit_previous_candidate=True,
+        artifact_store=artifacts,
         run_store=store,
     )
 
@@ -503,12 +772,22 @@ async def test_rollback_parent_is_reflected_then_edited_again_next_generation(
     assert runtime.hypothesis_contexts[1]["previous_reflection"][
         "recommended_next_direction"
     ] == "Repeat with a related atom."
-    assert result.final_snapshot.particles[0].continuation_state == {
+    final_continuation = result.final_snapshot.particles[0].continuation_state
+    assert {
+        key: final_continuation[key]
+        for key in (
+            "kind",
+            "canonical_isomeric_smiles",
+            "chemical_identity_hash",
+            "state_hash",
+        )
+    } == {
         "kind": "canonical_smiles",
         "canonical_isomeric_smiles": "C",
         "chemical_identity_hash": "f" * 64,
         "state_hash": PARENT_HASH,
     }
+    ArtifactRef.model_validate(final_continuation["molecule_artifact"])
     assert {source.get("value") for source in editor.sources if source.get("kind") == "smiles"} == {
         "C"
     }

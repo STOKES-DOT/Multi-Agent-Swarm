@@ -19,6 +19,7 @@ from pydantic import JsonValue
 
 from multi_agent_pso.core import (
     AgentStage,
+    ArtifactRef,
     ContinuousBoxPositionSpace,
     Evaluation,
     EvaluationStatus,
@@ -241,6 +242,7 @@ class RedAbsorptionTaskAdapter:
         inspected_graph = copied.get("inspected_graph")
         inspection = copied.get("inspected_source_hash")
         inspection_geometry = copied.get("inspected_geometry_hash")
+        inspection_artifact = copied.get("inspected_artifact")
         if stage is AgentStage.PROPOSING_ACTION:
             if (
                 not isinstance(inspected_graph, dict)
@@ -256,6 +258,17 @@ class RedAbsorptionTaskAdapter:
             inspected_graph = validated["value"]
             if inspected_graph.get("state_hash") != inspection:
                 raise ValueError("inspected graph/hash mismatch")
+            if inspection_artifact is not None:
+                try:
+                    artifact = ArtifactRef.model_validate(inspection_artifact)
+                except (TypeError, ValueError) as error:
+                    raise ValueError("inspected artifact is invalid") from error
+                if (
+                    not artifact.committed
+                    or artifact.media_type != "application/json"
+                ):
+                    raise ValueError("inspected artifact is invalid")
+                inspection_artifact = artifact.model_dump(mode="json")
         entry = {
             "created": time.monotonic(),
             "stage": stage,
@@ -268,6 +281,7 @@ class RedAbsorptionTaskAdapter:
             "evidence": allowed,
             "inspection": inspection,
             "inspection_geometry": inspection_geometry,
+            "inspection_artifact": inspection_artifact,
             "graph": inspected_graph,
             "wiki_query": copied.get("wiki_query"),
         }
@@ -533,6 +547,8 @@ class RedAbsorptionTaskAdapter:
                 "inspected_geometry_hash": entry["inspection_geometry"],
             }
         )
+        if entry["inspection_artifact"] is not None:
+            payload["inspected_artifact"] = entry["inspection_artifact"]
 
     def _reflection(self, value: dict[str, object]) -> None:
         expected = {
@@ -607,9 +623,7 @@ class RedAbsorptionTaskAdapter:
             or type(payload.get("cache_hit")) is not bool
         ):
             raise ValueError("candidate spectrum cache identity is invalid")
-        if (
-            set(authorized)
-            != {
+        expected_authority = {
                 "inspected_source_hash",
                 "commands",
                 "target_position",
@@ -619,6 +633,10 @@ class RedAbsorptionTaskAdapter:
                 "inspected_graph",
                 "inspected_geometry_hash",
             }
+        if authorized.get("inspected_artifact") is not None:
+            expected_authority.add("inspected_artifact")
+        if (
+            set(authorized) != expected_authority
             or authorized.get("edit_budget") != decoded["edit_budget"]
             or authorized.get("fragment_heavy_atom_cap")
             != decoded["fragment_heavy_atoms"]

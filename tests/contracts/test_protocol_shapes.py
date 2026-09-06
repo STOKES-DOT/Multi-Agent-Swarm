@@ -167,6 +167,7 @@ def test_protocol_method_names_and_async_boundaries_are_exact() -> None:
         "publish_bytes",
         "publish_text",
         "publish_json",
+        "read_json",
         "verify",
     }
     assert _protocol_methods(TaskAdapter) == {
@@ -212,7 +213,10 @@ def test_protocol_method_names_and_async_boundaries_are_exact() -> None:
             ),
         ),
         (RunStore, tuple(_protocol_methods(RunStore))),
-        (ArtifactStore, ("publish_bytes", "publish_text", "publish_json", "verify")),
+        (
+            ArtifactStore,
+            ("publish_bytes", "publish_text", "publish_json", "read_json", "verify"),
+        ),
         (TaskAdapter, tuple(_protocol_methods(TaskAdapter))),
         (WikiRetriever, ("search",)),
     ):
@@ -358,6 +362,9 @@ def test_protocol_and_fake_signatures_and_resolved_hints_match() -> None:
             self, relative_path: str, payload: Mapping[str, JsonValue]
         ) -> ArtifactRef:
             return ARTIFACT
+
+        def read_json(self, reference: ArtifactRef) -> Mapping[str, JsonValue]:
+            return {"artifact": reference.relative_path}
 
         def verify(self, reference: ArtifactRef) -> None:
             return None

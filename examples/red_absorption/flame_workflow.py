@@ -9,8 +9,9 @@ from collections.abc import Mapping, MutableMapping
 import threading
 import uuid
 
-from multi_agent_pso.core import AgentStage
+from multi_agent_pso.core import AgentStage, ArtifactRef
 from multi_agent_pso.protocols import (
+    ArtifactIntegrityError,
     ArtifactStore,
     ToolContext,
     ToolRequest,
@@ -207,22 +208,71 @@ class FlameWorkflowToolProvider:
         if not isinstance(graph, Mapping):
             return ToolResult(ToolStatus.REJECTED, error="inspected graph is missing")
         geometry = self.inputs.geometry.model_dump(mode="json")
+        parent_record = None
+        inspection_geometry = geometry
+        inspected_artifact = authoritative.get("inspected_artifact")
+        if inspected_artifact is not None:
+            try:
+                artifact = ArtifactRef.model_validate(inspected_artifact)
+                parent_record = self.artifact_store.read_json(artifact)
+            except (ArtifactIntegrityError, TypeError, ValueError) as error:
+                return ToolResult(
+                    ToolStatus.REJECTED,
+                    error=f"parent artifact is invalid: {type(error).__name__}",
+                )
+            artifact_graph = parent_record.get("graph")
+            if (
+                not artifact.committed
+                or artifact.media_type != "application/json"
+                or parent_record.get("chemical_status") != "VALID"
+                or parent_record.get("geometry_status") != "READY"
+                or parent_record.get("ready_for_evaluator") is not True
+                or not isinstance(artifact_graph, Mapping)
+                or _plain_json(artifact_graph) != _plain_json(graph)
+                or parent_record.get("state_hash")
+                != authoritative.get("inspected_source_hash")
+                or artifact_graph.get("state_hash")
+                != authoritative.get("inspected_source_hash")
+                or parent_record.get("chemical_identity_hash")
+                != artifact_graph.get("chemical_identity_hash")
+                or parent_record.get("geometry_hash")
+                != authoritative.get("inspected_geometry_hash")
+            ):
+                return ToolResult(
+                    ToolStatus.REJECTED, error="parent artifact identity mismatch"
+                )
+            inspection_geometry = None
         try:
             inspection = await self.editor.inspect(
                 {"kind": "chemical_graph", "value": _plain_json(graph)},
                 cwd=context.workspace,
-                geometry=geometry,
+                geometry=inspection_geometry,
                 timeout=self.inputs.flame_backend.timeout_seconds,
             )
+            if parent_record is None:
+                inspection_matches = (
+                    inspection.geometry_status == "READY"
+                    and inspection.ready_for_evaluator
+                    and inspection.payload is not None
+                    and inspection.payload.get("geometry_hash")
+                    == authoritative.get("inspected_geometry_hash")
+                    and _plain_json(inspection.candidate) == _plain_json(graph)
+                )
+            else:
+                live_graph = _plain_json(inspection.candidate)
+                expected_graph = _plain_json(graph)
+                if isinstance(live_graph, dict):
+                    live_graph["geometry_status"] = "READY"
+                inspection_matches = (
+                    inspection.geometry_status == "NOT_REQUESTED"
+                    and not inspection.ready_for_evaluator
+                    and live_graph == expected_graph
+                )
             if (
                 not inspection.processed
                 or inspection.chemical_status != "VALID"
-                or inspection.geometry_status != "READY"
-                or not inspection.ready_for_evaluator
                 or inspection.candidate is None
-                or inspection.payload.get("geometry_hash")
-                != authoritative.get("inspected_geometry_hash")
-                or _plain_json(inspection.candidate) != _plain_json(graph)
+                or not inspection_matches
             ):
                 return ToolResult(ToolStatus.REJECTED, error="parent inspection mismatch")
             edit = await self.editor.edit(
@@ -249,7 +299,10 @@ class FlameWorkflowToolProvider:
                 and context.attempt + 1 >= self.rollback_after_rejections
             ):
                 return await self._evaluate_rollback_parent(
-                    inspection, authoritative, context
+                    inspection,
+                    authoritative,
+                    context,
+                    parent_record=parent_record,
                 )
             return ToolResult(ToolStatus.REJECTED, error="MoleculeEditor rejected edit")
         return await self._evaluate_payload(_plain_json(edit.payload), context)
@@ -259,9 +312,17 @@ class FlameWorkflowToolProvider:
         inspection,
         authoritative: Mapping[str, object],
         context: ToolContext,
+        *,
+        parent_record: Mapping[str, object] | None = None,
     ) -> ToolResult:
-        graph = _plain_json(inspection.candidate)
-        inspection_payload = _plain_json(inspection.payload)
+        graph = _plain_json(
+            inspection.candidate
+            if parent_record is None
+            else parent_record.get("graph")
+        )
+        inspection_payload = _plain_json(
+            inspection.payload if parent_record is None else parent_record
+        )
         commands = _plain_json(authoritative.get("commands"))
         if (
             not isinstance(graph, dict)

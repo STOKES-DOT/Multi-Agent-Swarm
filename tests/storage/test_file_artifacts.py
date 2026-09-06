@@ -455,6 +455,60 @@ def test_artifact_verify_accepts_exact_published_content_without_mutation(tmp_pa
     )
 
 
+def test_artifact_read_json_returns_verified_object(tmp_path: Path) -> None:
+    store = FileArtifactStore(tmp_path)
+    reference = store.publish_json(
+        "nested/value.json", {"graph": {"state_hash": "a" * 64}}
+    )
+
+    document = store.read_json(reference)
+
+    assert document == {"graph": {"state_hash": "a" * 64}}
+
+
+def test_artifact_read_json_rejects_non_json_media_type(tmp_path: Path) -> None:
+    store = FileArtifactStore(tmp_path)
+    reference = store.publish_bytes(
+        "value.json", b'{"value":1}\n', "application/octet-stream"
+    )
+
+    with pytest.raises(storage_module.ArtifactIntegrityError, match="media type"):
+        store.read_json(reference)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"[]\n", b'{"value":NaN}\n', b'{"value":1e400}\n', b"not-json\n"],
+)
+def test_artifact_read_json_rejects_non_object_or_invalid_json(
+    tmp_path: Path, payload: bytes
+) -> None:
+    store = FileArtifactStore(tmp_path)
+    reference = store.publish_bytes("value.json", payload, "application/json")
+
+    with pytest.raises(ValueError, match="JSON object"):
+        store.read_json(reference)
+
+
+@pytest.mark.parametrize("mutation", ["content", "symlink"])
+def test_artifact_read_json_rejects_tampered_or_symlinked_target(
+    tmp_path: Path, mutation: str
+) -> None:
+    store = FileArtifactStore(tmp_path)
+    reference = store.publish_json("value.json", {"value": 1})
+    target = tmp_path / reference.relative_path
+    if mutation == "content":
+        target.write_text('{"value":2}\n', encoding="utf-8")
+    else:
+        target.unlink()
+        external = tmp_path / "external.json"
+        external.write_text('{"value":1}\n', encoding="utf-8")
+        target.symlink_to(external)
+
+    with pytest.raises(storage_module.ArtifactIntegrityError):
+        store.read_json(reference)
+
+
 @pytest.mark.parametrize("failure", ["committed", "size", "hash", "tamper"])
 def test_artifact_verify_rejects_uncommitted_or_mismatched_content(
     tmp_path: Path, failure: str

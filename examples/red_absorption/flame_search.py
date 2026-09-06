@@ -218,6 +218,7 @@ async def run_flame_search(
             wiki,
             editor,
             inherit_previous_candidate=True,
+            artifact_store=artifacts,
             run_store=store,
         )
         async def run_attempt(runtime):
