@@ -110,6 +110,15 @@ async def test_happy_path_uses_canonical_stdin_and_preserves_process_record(
     assert result.elapsed_seconds >= 0
 
 
+async def test_json_command_can_run_without_an_outer_deadline(tmp_path: Path) -> None:
+    result = await _provider("--sleep", "0.05").execute_json(
+        {"value": 1}, cwd=tmp_path.resolve(), timeout_seconds=None
+    )
+
+    assert result.status is JsonCommandStatus.SUCCESS
+    assert result.payload == {"value": 1}
+
+
 async def test_nonzero_exit_is_process_error_and_preserves_streams(
     tmp_path: Path,
 ) -> None:

@@ -74,6 +74,7 @@ class ConcurrencyConfig(StrictFrozenModel):
 class RetryConfig(StrictFrozenModel):
     agent_schema_corrections: NonNegativeInt = 1
     transient_resource_retries: NonNegativeInt = 1
+    proposal_attempts: Annotated[int, Field(strict=True, ge=1, le=3)] = 1
     consecutive_failures_before_resample: PositiveInt = 2
 
 

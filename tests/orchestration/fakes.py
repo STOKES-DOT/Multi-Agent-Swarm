@@ -847,14 +847,13 @@ class FakeTool:
     def executions_for(
         self, run_id: str, particle_id: str, iteration_id: int, stage: str
     ) -> int:
-        encoded = json.dumps(
-            ["tool", run_id, particle_id, iteration_id, stage],
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        key = hashlib.sha256(encoded).hexdigest()
-        return self.executed_keys.count(key)
+        return sum(
+            context.run_id == run_id
+            and context.particle_id == particle_id
+            and context.iteration_id == iteration_id
+            and context.stage.value == stage
+            for context in self.contexts
+        )
 
 
 class FakeArtifactStore:

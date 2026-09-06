@@ -287,6 +287,8 @@ class AgentLoop:
         stage_context_provider: StageContextProvider | None = None,
         initial_context: Mapping[str, JsonValue] | None = None,
         capture_candidate_continuation: bool = False,
+        max_proposal_attempts: int = 1,
+        reproposal_on_tool_rejection: bool = False,
     ) -> None:
         if not all(
             (
@@ -321,6 +323,10 @@ class AgentLoop:
             )
         if type(capture_candidate_continuation) is not bool:
             raise TypeError("capture_candidate_continuation must be a boolean")
+        if type(max_proposal_attempts) is not int or not 1 <= max_proposal_attempts <= 3:
+            raise ValueError("max_proposal_attempts must be between one and three")
+        if type(reproposal_on_tool_rejection) is not bool:
+            raise TypeError("reproposal_on_tool_rejection must be a boolean")
         protected_context = {
             "run_id",
             "particle_id",
@@ -352,6 +358,8 @@ class AgentLoop:
         self._stage_context_provider = stage_context_provider
         self._initial_context = dict(copied_initial_context)
         self._capture_candidate_continuation = capture_candidate_continuation
+        self._max_proposal_attempts = max_proposal_attempts
+        self._reproposal_on_tool_rejection = reproposal_on_tool_rejection
 
     async def run_particle(
         self,
@@ -572,24 +580,105 @@ class AgentLoop:
                     context["hypothesis"] = parsed
 
             if start_index <= _STAGE_ORDER.index(AgentStage.EXECUTING):
-                current_stage = AgentStage.EXECUTING
-                self._started(
-                    run_id,
-                    particle_id,
-                    iteration_id,
-                    current_stage,
-                    0,
-                    {"proposal": proposal},
-                )
-                tool_result, request, cached = await self._execute_tool(
-                    run_id, particle_id, iteration_id, proposal
-                )
-                request_json = self._copy_json(request.to_json())
-                tool_result_json = self._copy_json(tool_result.to_json())
-                context["tool_request"] = request_json
-                context["tool_result"] = tool_result_json
-                tool_status = episode_status_for_tool(tool_result.status)
-                if tool_status is not EpisodeStatus.COMPLETED:
+                while True:
+                    proposal_attempt = context.get("proposal_attempt", 0)
+                    if type(proposal_attempt) is not int or not 0 <= proposal_attempt <= 2:
+                        raise IncompatibleCheckpointError(
+                            "proposal attempt is missing or invalid"
+                        )
+                    current_stage = AgentStage.EXECUTING
+                    self._started(
+                        run_id,
+                        particle_id,
+                        iteration_id,
+                        current_stage,
+                        proposal_attempt,
+                        {"proposal": proposal},
+                    )
+                    tool_result, request, cached = await self._execute_tool(
+                        run_id,
+                        particle_id,
+                        iteration_id,
+                        proposal,
+                        proposal_attempt,
+                    )
+                    request_json = self._copy_json(request.to_json())
+                    tool_result_json = self._copy_json(tool_result.to_json())
+                    context["tool_request"] = request_json
+                    context["tool_result"] = tool_result_json
+                    tool_status = episode_status_for_tool(tool_result.status)
+                    if tool_status is EpisodeStatus.COMPLETED:
+                        break
+                    can_repropose = (
+                        self._reproposal_on_tool_rejection
+                        and tool_result.status is ToolStatus.REJECTED
+                        and proposal_attempt + 1 < self._max_proposal_attempts
+                    )
+                    feedback = {
+                        "attempt": proposal_attempt + 1,
+                        "status": tool_result.status.value,
+                        "error": tool_result.error or "tool rejected the molecule edit",
+                    }
+                    terminal_payload = {
+                        "tool_request": request_json,
+                        "tool_result": tool_result_json,
+                        "cached": cached,
+                        "tool_feedback": feedback,
+                    }
+                    if can_repropose:
+                        for key in (
+                            "proposal",
+                            "tool_request",
+                            "tool_result",
+                            "candidate",
+                            "realized_position",
+                            "evaluated_position",
+                            "adherence",
+                            "continuation_state",
+                        ):
+                            context.pop(key, None)
+                        context["tool_feedback"] = feedback
+                        self._terminal_event(
+                            run_id,
+                            particle_id,
+                            iteration_id,
+                            current_stage,
+                            tool_status.value.lower(),
+                            events,
+                            attempt=proposal_attempt,
+                            payload=terminal_payload,
+                            context=context,
+                            thread=thread,
+                            owner=owner,
+                            next_stage=AgentStage.PROPOSING_ACTION,
+                            next_attempt=proposal_attempt + 1,
+                        )
+                        current_stage = AgentStage.PROPOSING_ACTION
+                        parsed = await self._agent_stage(
+                            owner,
+                            thread,
+                            current_stage,
+                            context,
+                            events,
+                            start_attempt=proposal_attempt + 1,
+                        )
+                        if parsed is None:
+                            return await self._finish_episode(
+                                owner,
+                                run_id,
+                                particle_id,
+                                iteration_id,
+                                events,
+                                EpisodeStatus.INVALID,
+                                self._invalid_evaluation(),
+                                evaluated,
+                                realized,
+                                adherence,
+                                context,
+                            )
+                        proposal = parsed
+                        context["proposal"] = parsed
+                        continue
                     self._terminal_event(
                         run_id,
                         particle_id,
@@ -597,12 +686,8 @@ class AgentLoop:
                         current_stage,
                         tool_status.value.lower(),
                         events,
-                        attempt=0,
-                        payload={
-                            "tool_request": request_json,
-                            "tool_result": tool_result_json,
-                            "cached": cached,
-                        },
+                        attempt=proposal_attempt,
+                        payload=terminal_payload,
                         context=context,
                         thread=thread,
                         owner=owner,
@@ -628,7 +713,7 @@ class AgentLoop:
                     particle_id,
                     iteration_id,
                     current_stage,
-                    0,
+                    proposal_attempt,
                     self._workspace,
                     metadata={"proposal": proposal},
                 )
@@ -688,7 +773,7 @@ class AgentLoop:
                         current_stage,
                         "invalid",
                         events,
-                        attempt=0,
+                        attempt=proposal_attempt,
                         payload=invalid_payload,
                         context=context,
                         thread=thread,
@@ -720,7 +805,7 @@ class AgentLoop:
                     current_stage,
                     "completed",
                     events,
-                    attempt=0,
+                    attempt=proposal_attempt,
                     payload={
                         "tool_request": request_json,
                         "tool_result": tool_result_json,
@@ -1197,12 +1282,23 @@ class AgentLoop:
             raise IncompatibleCheckpointError(
                 "checkpoint parent continuation is incompatible"
             )
-        requires_tool_result = any(
-            event.stage is AgentStage.EXECUTING and event.event_type == "completed"
-            for event in events
-        ) or any(
-            event.stage is AgentStage.EXECUTING and "tool_result" in event.payload
-            for event in events
+        is_tool_reproposal_boundary = (
+            checkpoint.completed_stage is AgentStage.EXECUTING
+            and checkpoint.terminal_event_type == "invalid"
+            and checkpoint.next_stage is AgentStage.PROPOSING_ACTION
+            and checkpoint.next_attempt == checkpoint.completed_attempt + 1
+        )
+        requires_tool_result = not is_tool_reproposal_boundary and (
+            any(
+                event.stage is AgentStage.EXECUTING
+                and event.event_type == "completed"
+                for event in events
+            )
+            or any(
+                event.stage is AgentStage.EXECUTING
+                and "tool_result" in event.payload
+                for event in events
+            )
         )
         if checkpoint.next_stage is not None:
             requires_tool_result = requires_tool_result or (
@@ -1215,13 +1311,12 @@ class AgentLoop:
             )
         if "tool_result" in context:
             context_result = self._tool_result_from_context(context)
-            tool_key = self._identity(
-                "tool",
-                checkpoint.run_id,
-                checkpoint.particle_id,
-                checkpoint.iteration_id,
-                AgentStage.EXECUTING.value,
-            )
+            tool_request = self._require_mapping(context, "tool_request")
+            tool_key = tool_request.get("idempotency_key")
+            if not isinstance(tool_key, str) or not tool_key:
+                raise IncompatibleCheckpointError(
+                    "checkpoint tool request has no idempotency key"
+                )
             committed_result = self._store.get_committed_tool_result(tool_key)
             if committed_result is None or self._canonical_json(
                 committed_result.to_json()
@@ -1265,7 +1360,10 @@ class AgentLoop:
             return
         stage_index = _STAGE_ORDER.index(checkpoint.next_stage)
         if checkpoint.next_attempt:
-            self._require_mapping(context, "correction")
+            self._require_mapping(
+                context,
+                "tool_feedback" if is_tool_reproposal_boundary else "correction",
+            )
         if stage_index > _STAGE_ORDER.index(AgentStage.HYPOTHESIZING):
             self._require_mapping(context, "hypothesis")
         if stage_index > _STAGE_ORDER.index(AgentStage.PROPOSING_ACTION):
@@ -1304,12 +1402,16 @@ class AgentLoop:
             }:
                 continue
             index = _STAGE_ORDER.index(event.stage)
-            if event.stage in completed_stages:
+            if (
+                event.stage in completed_stages
+                and event.stage is not AgentStage.PROPOSING_ACTION
+            ):
                 raise IncompatibleCheckpointError(
                     "stage evidence has duplicate completed resolutions"
                 )
             completed_stages.add(event.stage)
-            completed_indices.append(index)
+            if not completed_indices or completed_indices[-1] != index:
+                completed_indices.append(index)
         if completed_indices and completed_indices != list(
             range(max(completed_indices) + 1)
         ):
@@ -1337,6 +1439,7 @@ class AgentLoop:
             "adherence": "adherence",
             "evaluation": "evaluation",
             "reflection": "output",
+            "tool_feedback": "tool_feedback",
         }
         evidence_stages = {
             "hypothesis": AgentStage.HYPOTHESIZING,
@@ -1349,6 +1452,7 @@ class AgentLoop:
             "adherence": AgentStage.EXECUTING,
             "evaluation": AgentStage.EVALUATING,
             "reflection": AgentStage.REFLECTING,
+            "tool_feedback": AgentStage.EXECUTING,
         }
         for context_key, payload_key in evidence_keys.items():
             if context_key not in context:
@@ -1406,6 +1510,20 @@ class AgentLoop:
             ):
                 raise IncompatibleCheckpointError(
                     "checkpoint continuation differs from candidate evidence"
+                )
+        if "proposal_attempt" in context:
+            proposal_events = [
+                event
+                for event in events
+                if event.stage is AgentStage.PROPOSING_ACTION
+                and event.event_type == "completed"
+            ]
+            if (
+                not proposal_events
+                or context["proposal_attempt"] != proposal_events[-1].attempt
+            ):
+                raise IncompatibleCheckpointError(
+                    "checkpoint proposal attempt differs from stage evidence"
                 )
 
         started_additions: dict[tuple[AgentStage, int], Mapping[str, JsonValue]] = {}
@@ -1470,6 +1588,8 @@ class AgentLoop:
             "thread_generation",
             "parent_continuation_state",
             "continuation_state",
+            "proposal_attempt",
+            "tool_feedback",
         }
         checkpoint_addition_keys = set(context) - core_context_keys
         if checkpoint_addition_keys != set(terminal_additions):
@@ -1556,12 +1676,16 @@ class AgentLoop:
                 or not isinstance(payload, Mapping)
             ):
                 return False
+            attempt = context.get("proposal_attempt", checkpoint.completed_attempt)
+            if type(attempt) is not int or attempt != checkpoint.completed_attempt:
+                return False
             tool_key = self._identity(
                 "tool",
                 checkpoint.run_id,
                 checkpoint.particle_id,
                 checkpoint.iteration_id,
                 AgentStage.EXECUTING.value,
+                attempt,
             )
             expected = ToolRequest(
                 self._identity(
@@ -1571,6 +1695,7 @@ class AgentLoop:
                     checkpoint.iteration_id,
                     provider,
                     operation,
+                    attempt,
                 ),
                 provider,
                 operation,
@@ -1584,6 +1709,7 @@ class AgentLoop:
                     checkpoint.particle_id,
                     checkpoint.iteration_id,
                     "cached",
+                    attempt,
                 ),
                 "cache",
                 "reuse",
@@ -1625,7 +1751,20 @@ class AgentLoop:
                     for later in business_events[index + 1 :]
                 )
             )
-            if not is_schema_correction:
+            is_tool_reproposal = (
+                event.event_type == "invalid"
+                and event.stage is AgentStage.EXECUTING
+                and isinstance(event.payload.get("tool_feedback"), Mapping)
+                and event.payload["tool_feedback"].get("status")
+                == ToolStatus.REJECTED.value
+                and any(
+                    later.stage is AgentStage.PROPOSING_ACTION
+                    and later.attempt == event.attempt + 1
+                    and later.event_type == "completed"
+                    for later in business_events[index + 1 :]
+                )
+            )
+            if not (is_schema_correction or is_tool_reproposal):
                 effective_failure = (index, event)
         if effective_failure is None:
             if not any(
@@ -2276,6 +2415,8 @@ class AgentLoop:
                         "checkpoint_truncated",
                         "thread_logical_id",
                         "thread_generation",
+                        "proposal_attempt",
+                        "tool_feedback",
                         _ACTIVE_STAGE_CONTEXT,
                         _ACTIVE_STAGE_REQUEST,
                         _ACTIVE_STAGE_ATTEMPT,
@@ -2438,6 +2579,8 @@ class AgentLoop:
                 }[stage]
                 completed_context = self._checkpoint_context(context)
                 completed_context[output_key] = parsed
+                if stage is AgentStage.PROPOSING_ACTION:
+                    completed_context["proposal_attempt"] = attempt
                 completed_payload: dict[str, JsonValue] = {
                     "request": request_payload,
                     "output": parsed,
@@ -2511,6 +2654,8 @@ class AgentLoop:
                 continue
             context.pop("correction", None)
             context[output_key] = parsed
+            if stage is AgentStage.PROPOSING_ACTION:
+                context["proposal_attempt"] = attempt
             self._terminal_event(
                 str(context["run_id"]),
                 str(context["particle_id"]),
@@ -2627,13 +2772,16 @@ class AgentLoop:
         particle_id: str,
         iteration_id: int,
         proposal: Mapping[str, JsonValue],
+        attempt: int,
     ) -> tuple[ToolResult, ToolRequest, bool]:
         bounded_proposal = self._copy_json(proposal)
         if not isinstance(bounded_proposal, Mapping):
             raise _JsonBoundaryError(
                 "tool proposal JSON boundary rejected: object required"
             )
-        key = self._identity("tool", run_id, particle_id, iteration_id, "EXECUTING")
+        key = self._identity(
+            "tool", run_id, particle_id, iteration_id, "EXECUTING", attempt
+        )
         cached = self._store.get_committed_tool_result(key)
         if cached is not None:
             self._copy_json(cached.to_json())
@@ -2642,7 +2790,7 @@ class AgentLoop:
                 cached,
                 ToolRequest(
                     self._identity(
-                        "request", run_id, particle_id, iteration_id, "cached"
+                        "request", run_id, particle_id, iteration_id, "cached", attempt
                     ),
                     "cache",
                     "reuse",
@@ -2665,7 +2813,7 @@ class AgentLoop:
                 ToolResult(ToolStatus.REJECTED, error="invalid tool proposal"),
                 ToolRequest(
                     self._identity(
-                        "request", run_id, particle_id, iteration_id, "invalid"
+                        "request", run_id, particle_id, iteration_id, "invalid", attempt
                     ),
                     "task",
                     "invalid",
@@ -2676,7 +2824,13 @@ class AgentLoop:
             )
         request = ToolRequest(
             self._identity(
-                "request", run_id, particle_id, iteration_id, provider, operation
+                "request",
+                run_id,
+                particle_id,
+                iteration_id,
+                provider,
+                operation,
+                attempt,
             ),
             provider,
             operation,
@@ -2691,7 +2845,7 @@ class AgentLoop:
                 particle_id,
                 iteration_id,
                 AgentStage.EXECUTING,
-                0,
+                attempt,
                 self._workspace,
                 metadata={"proposal": bounded_proposal},
             ),

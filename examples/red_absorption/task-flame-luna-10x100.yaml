@@ -19,7 +19,7 @@ pso:
   run_seed: 20260906
   topology: {type: ring, neighborhood_radius: 1}
 concurrency: {agents: 10, evaluations: 1}
-retry: {agent_schema_corrections: 2, transient_resource_retries: 1, consecutive_failures_before_resample: 2}
+retry: {agent_schema_corrections: 2, transient_resource_retries: 1, proposal_attempts: 3, consecutive_failures_before_resample: 2}
 thread: {max_turns: 4, max_context_tokens: 8192}
 snapshot: {max_files: 10000, max_file_bytes: 67108864, max_total_bytes: 536870912}
 storage: {runs_directory: runs}

@@ -243,6 +243,10 @@ async def run_red_absorption_search(
                         else None
                     ),
                     capture_candidate_continuation=inherit_previous_candidate,
+                    max_proposal_attempts=spec.retry.proposal_attempts,
+                    reproposal_on_tool_rejection=(
+                        spec.retry.proposal_attempts > 1
+                    ),
                 )
 
             runner = SynchronousSwarmRunner(

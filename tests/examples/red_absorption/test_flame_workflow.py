@@ -161,6 +161,6 @@ async def test_workflow_builds_flame_candidate_and_proxy_reward(tmp_path: Path):
     assert evaluation.fitness > 1.0
     assert resources.execution_count == 1
     assert command.calls[0][0]["dye_smiles"] == "N"
-    assert command.calls[0][1]["timeout_seconds"] == 30.0
+    assert command.calls[0][1]["timeout_seconds"] is None
     assert result.payload["cache_key"] == flame_cache_key(run_inputs, CANDIDATE_HASH)
     await provider.aclose()

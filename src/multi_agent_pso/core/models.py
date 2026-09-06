@@ -554,9 +554,10 @@ class EpisodeCheckpoint(_FrozenModel):
             AgentStage.PROPOSING_ACTION,
             AgentStage.REFLECTING,
         }
-        if self.completed_stage in schema_stages:
+        bounded_attempt_stages = schema_stages | {AgentStage.EXECUTING}
+        if self.completed_stage in bounded_attempt_stages:
             if self.completed_attempt > 2:
-                raise ValueError("agent stage attempts must be between zero and two")
+                raise ValueError("bounded stage attempts must be between zero and two")
         elif self.completed_attempt != 0:
             raise ValueError("non-agent stages only support attempt zero")
 
@@ -585,6 +586,18 @@ class EpisodeCheckpoint(_FrozenModel):
                 or self.next_attempt != self.completed_attempt
             ):
                 raise ValueError("interrupted checkpoint must resume the same stage attempt")
+        elif (
+            self.terminal_event_type == "invalid"
+            and self.completed_stage is AgentStage.EXECUTING
+            and self.next_stage is AgentStage.PROPOSING_ACTION
+        ):
+            if (
+                self.completed_attempt >= 2
+                or self.next_attempt != self.completed_attempt + 1
+            ):
+                raise ValueError(
+                    "tool reproposal must advance exactly one bounded attempt"
+                )
         else:
             if self.next_stage is not None or self.next_attempt != 0:
                 raise ValueError("terminal failure checkpoint must not have a next stage")

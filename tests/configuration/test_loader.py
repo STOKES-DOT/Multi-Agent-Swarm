@@ -53,6 +53,14 @@ def test_pso_candidate_inheritance_is_strict_and_disabled_by_default() -> None:
         )
 
 
+def test_retry_proposal_attempts_are_strict_and_capped_at_three() -> None:
+    assert RetryConfig().proposal_attempts == 1
+    assert RetryConfig(proposal_attempts=3).proposal_attempts == 3
+    for invalid in (0, 4, True, 1.5):
+        with pytest.raises(ValidationError):
+            RetryConfig(proposal_attempts=invalid)
+
+
 def _task_yaml(
     *,
     prompt: str = "prompt.md",

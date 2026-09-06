@@ -235,7 +235,7 @@ class FlameWorkflowToolProvider:
                     result = await self.flame.execute_json(
                         self.inputs.flame_backend.backend_payload(smiles),
                         cwd=context.workspace,
-                        timeout_seconds=self.inputs.flame_backend.timeout_seconds,
+                        timeout_seconds=None,
                     )
                     if result.status is not JsonCommandStatus.SUCCESS:
                         status = "TIMEOUT" if result.status is JsonCommandStatus.TIMEOUT else "FAILED"

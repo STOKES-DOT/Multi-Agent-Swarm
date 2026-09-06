@@ -124,6 +124,126 @@ def test_agent_loop_initial_context_cannot_overwrite_core_identity(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_rejected_molecule_edit_gets_three_hypothesis_bound_proposals(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path, tool_status=ToolStatus.REJECTED)
+
+    loop = AgentLoop(
+        **dependencies,
+        max_proposal_attempts=3,
+        reproposal_on_tool_rejection=True,
+    )
+    episode = await loop.run_particle("run-1", "p0", 0)
+
+    adapter = dependencies["task_adapter"]
+    assert episode.status is EpisodeStatus.INVALID
+    assert len(adapter.contexts[AgentStage.HYPOTHESIZING]) == 1
+    assert len(adapter.contexts[AgentStage.PROPOSING_ACTION]) == 3
+    assert len(dependencies["tool_provider"].executed_keys) == 3
+    assert adapter.contexts[AgentStage.PROPOSING_ACTION][1]["tool_feedback"] == {
+        "attempt": 1,
+        "status": "REJECTED",
+        "error": "fake tool failure",
+    }
+
+
+@pytest.mark.asyncio
+async def test_second_molecule_proposal_can_recover_after_first_rejection(tmp_path):
+    dependencies = make_fake_dependencies(tmp_path)
+
+    class RejectOnceTool:
+        def __init__(self):
+            self.calls = 0
+
+        async def execute(self, request, context):
+            self.calls += 1
+            if self.calls == 1:
+                return ToolResult(
+                    ToolStatus.REJECTED,
+                    error="first molecule edit was invalid",
+                )
+            return ToolResult(ToolStatus.SUCCESS, {"tool": "ok"})
+
+    tool = RejectOnceTool()
+    dependencies["tool_provider"] = tool
+    loop = AgentLoop(
+        **dependencies,
+        max_proposal_attempts=3,
+        reproposal_on_tool_rejection=True,
+    )
+    episode = await loop.run_particle("run-1", "p0", 0)
+
+    assert episode.status is EpisodeStatus.COMPLETED
+    assert tool.calls == 2
+    assert dependencies["evaluator"].calls == 1
+    assert len(
+        dependencies["task_adapter"].contexts[AgentStage.HYPOTHESIZING]
+    ) == 1
+    assert len(
+        dependencies["task_adapter"].contexts[AgentStage.PROPOSING_ACTION]
+    ) == 2
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json(
+            "run-1", "p0", 0
+        )
+    )
+    rebuilt = await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+    assert rebuilt.status is EpisodeStatus.COMPLETED
+    assert tool.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_resume_continues_after_committed_molecule_reproposal_boundary(tmp_path):
+    dependencies = make_fake_dependencies(
+        tmp_path,
+        interrupt_after_transition=(AgentStage.EXECUTING, "invalid"),
+    )
+
+    class RejectOnceTool:
+        def __init__(self):
+            self.calls = 0
+
+        async def execute(self, request, context):
+            self.calls += 1
+            if self.calls == 1:
+                return ToolResult(
+                    ToolStatus.REJECTED,
+                    error="first molecule edit was invalid",
+                )
+            return ToolResult(ToolStatus.SUCCESS, {"tool": "ok"})
+
+    tool = RejectOnceTool()
+    dependencies["tool_provider"] = tool
+    loop = AgentLoop(
+        **dependencies,
+        max_proposal_attempts=3,
+        reproposal_on_tool_rejection=True,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        await loop.run_particle("run-1", "p0", 0)
+    checkpoint = EpisodeCheckpoint.model_validate(
+        dependencies["run_store"].get_latest_stage_checkpoint_json(
+            "run-1", "p0", 0
+        )
+    )
+    assert checkpoint.completed_stage is AgentStage.EXECUTING
+    assert checkpoint.completed_attempt == 0
+    assert checkpoint.next_stage is AgentStage.PROPOSING_ACTION
+    assert checkpoint.next_attempt == 1
+
+    episode = await loop.run_particle("run-1", "p0", 0, resume=checkpoint)
+
+    assert episode.status is EpisodeStatus.COMPLETED
+    assert tool.calls == 2
+    assert len(
+        dependencies["task_adapter"].contexts[AgentStage.HYPOTHESIZING]
+    ) == 1
+    assert len(
+        dependencies["task_adapter"].contexts[AgentStage.PROPOSING_ACTION]
+    ) == 2
+
+
+@pytest.mark.asyncio
 async def test_agent_loop_runs_terminal_stages_in_order_and_pairs_persistence(tmp_path):
     dependencies = make_fake_dependencies(tmp_path)
     episode = await AgentLoop(**dependencies).run_particle("run-1", "p0", 0)

@@ -665,20 +665,25 @@ class JsonCommandProvider:
         payload: object,
         *,
         cwd: Path,
-        timeout_seconds: int | float,
+        timeout_seconds: int | float | None,
     ) -> JsonCommandResult:
         if self._closed:
             raise RuntimeError("JSON command provider is closed")
         started_at = datetime.now(timezone.utc)
         started_clock = time.monotonic()
         directory = _validated_cwd(cwd)
-        timeout = _positive_finite(timeout_seconds, "timeout_seconds")
-        deadline = started_clock + timeout
+        deadline = (
+            None
+            if timeout_seconds is None
+            else started_clock + _positive_finite(timeout_seconds, "timeout_seconds")
+        )
         stdin = _canonical_stdin(payload, self._limits)
         spawn_task = asyncio.create_task(_capture_spawn(*self._argv, cwd=directory))
         ownership = asyncio.Event()
         self._ownerships.add(ownership)
-        remaining = max(0.0, deadline - time.monotonic())
+        remaining = (
+            None if deadline is None else max(0.0, deadline - time.monotonic())
+        )
         try:
             spawn_done, _ = await asyncio.wait((spawn_task,), timeout=remaining)
         except asyncio.CancelledError as cancellation:
@@ -784,7 +789,9 @@ class JsonCommandProvider:
         watched = (*work_tasks, wait_task)
         forced_status: JsonCommandStatus | None = None
         try:
-            remaining = max(0.0, deadline - time.monotonic())
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
             if remaining == 0:
                 done: set[asyncio.Task[Any]] = set()
                 pending = set(watched)

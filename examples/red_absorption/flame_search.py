@@ -114,7 +114,7 @@ async def run_flame_search(
         command_result = await flame.execute_json(
             inputs.flame_backend.backend_payload(parent_smiles),
             cwd=root,
-            timeout_seconds=inputs.flame_backend.timeout_seconds,
+            timeout_seconds=None,
         )
         if command_result.status is not JsonCommandStatus.SUCCESS:
             raise RuntimeError("FLAME preflight command failed")
@@ -199,6 +199,10 @@ async def run_flame_search(
                         else None
                     ),
                     capture_candidate_continuation=True,
+                    max_proposal_attempts=task.spec.retry.proposal_attempts,
+                    reproposal_on_tool_rejection=(
+                        task.spec.retry.proposal_attempts > 1
+                    ),
                 )
 
             runner = SynchronousSwarmRunner(
