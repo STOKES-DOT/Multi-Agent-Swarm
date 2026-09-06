@@ -2,6 +2,7 @@
 
 from .adapter import DIMENSION_NAMES, RedAbsorptionTaskAdapter
 from .evaluator import RedAbsorptionEvaluator
+from .flame_proxy import FlamePrediction, FlameProxyEvaluator
 from .geometry import EvaluatedGeometry, GeometryAtom, GeometryOptimizationRecord
 from .inputs import MoleculeEditorGeometryConfig, ParentSource, RedAbsorptionRunInputs
 from .stage_context import RedAbsorptionStageContextProvider
@@ -23,6 +24,8 @@ __all__ = [
     "EvaluatedGeometry",
     "GeometryAtom",
     "GeometryOptimizationRecord",
+    "FlamePrediction",
+    "FlameProxyEvaluator",
     "MoleculeEditorGeometryConfig",
     "ParentSource",
     "PreflightRecord",
