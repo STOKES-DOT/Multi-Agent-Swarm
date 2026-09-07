@@ -87,6 +87,40 @@ def _publish_content_addressed_json(
     )
 
 
+def _require_config_hash(value: str) -> str:
+    if len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise ValueError("resume_config_hash must be a lowercase SHA-256 digest")
+    return value
+
+
+def _resume_resource_budget(
+    store: SQLiteRunStore,
+    *,
+    run_id: str,
+    config_hash: str,
+) -> dict[str, JsonValue]:
+    if store.get_run_snapshot_hash(run_id) != config_hash:
+        raise ValueError("resume config hash does not match the stored run")
+    snapshot = store.get_latest_committed_snapshot_json(run_id)
+    if not isinstance(snapshot, Mapping):
+        raise ValueError("resume run has no committed snapshot")
+    budget = snapshot.get("resource_budget")
+    if not isinstance(budget, Mapping):
+        raise ValueError("resume snapshot resource budget is invalid")
+    selected = dict(budget)
+    preflight_identity = selected.get("preflight_identity")
+    if (
+        selected.get("max_new_evaluations") != EXPECTED_EVALUATIONS
+        or selected.get("evaluator") != "FLAME/FLSF proxy"
+        or not isinstance(preflight_identity, str)
+    ):
+        raise ValueError("resume snapshot resource budget is incompatible")
+    _require_config_hash(preflight_identity)
+    return selected
+
+
 async def _run_with_runtime_recovery(
     runtime_factory: Callable[[], object],
     run_attempt: Callable[[object], Awaitable[_T]],
@@ -172,12 +206,18 @@ async def run_flame_search(
     runs_dir: Path,
     *,
     preflight_only: bool = False,
+    resume_config_hash: str | None = None,
 ):
     task = load_task_package(task_path)
     loaded = load_run_inputs(inputs_path, FlameRunInputs)
     inputs = loaded.value
     _validate_contract(task, inputs)
-    config_hash = _identity(task, loaded)
+    current_config_hash = _identity(task, loaded)
+    config_hash = (
+        current_config_hash
+        if resume_config_hash is None
+        else _require_config_hash(resume_config_hash)
+    )
     run_id = f"flame-{config_hash[:24]}"
     root = _make_private_run_root(runs_dir)
     artifacts = FileArtifactStore(root / "artifacts")
@@ -225,7 +265,9 @@ async def run_flame_search(
         preflight_evaluation = FlameProxyEvaluator().evaluate_prediction(prediction)
         preflight_payload = {
             "schema_version": "flame-preflight:v1",
-            "identity": config_hash,
+            "identity": current_config_hash,
+            "run_config_hash": config_hash,
+            "resume_config_hash": resume_config_hash,
             "run_id": run_id,
             "passed": True,
             "authentication_method": auth.get("method"),
@@ -240,8 +282,14 @@ async def run_flame_search(
             "prediction": prediction.model_dump(mode="json"),
             "evaluation": preflight_evaluation.model_dump(mode="json"),
         }
-        preflight_ref = _publish_idempotent_json(
-            artifacts, "preflight/flame.json", preflight_payload
+        preflight_ref = (
+            _publish_idempotent_json(
+                artifacts, "preflight/flame.json", preflight_payload
+            )
+            if resume_config_hash is None
+            else _publish_content_addressed_json(
+                artifacts, "preflight/resume", preflight_payload
+            )
         )
         if preflight_only:
             return {
@@ -312,6 +360,19 @@ async def run_flame_search(
                     ),
                 )
 
+            resource_budget = (
+                {
+                    "max_new_evaluations": EXPECTED_EVALUATIONS,
+                    "preflight_identity": preflight_ref.sha256,
+                    "evaluator": "FLAME/FLSF proxy",
+                }
+                if resume_config_hash is None
+                else _resume_resource_budget(
+                    store,
+                    run_id=run_id,
+                    config_hash=config_hash,
+                )
+            )
             runner = SynchronousSwarmRunner(
                 run_id=run_id,
                 run_seed=task.spec.pso.run_seed,
@@ -330,16 +391,12 @@ async def run_flame_search(
                 particle_episode_factory=make_loop,
                 continuation_episode_factory=make_loop,
                 particle_ids=tuple(f"p{index}" for index in range(EXPECTED_PARTICLES)),
-                resource_budget={
-                    "max_new_evaluations": EXPECTED_EVALUATIONS,
-                    "preflight_identity": preflight_ref.sha256,
-                    "evaluator": "FLAME/FLSF proxy",
-                },
+                resource_budget=resource_budget,
                 failure_threshold=task.spec.retry.consecutive_failures_before_resample,
             )
             return await runner.run(
                 iterations=EXPECTED_ITERATIONS,
-                resume_paused=True,
+                resume_paused=resume_config_hash is not None,
             )
 
         result = await _run_with_runtime_recovery(
@@ -356,6 +413,8 @@ async def run_flame_search(
             "population_size": EXPECTED_PARTICLES,
             "target_iterations": EXPECTED_ITERATIONS,
             "max_new_evaluations": EXPECTED_EVALUATIONS,
+            "current_config_hash": current_config_hash,
+            "resume_config_hash": resume_config_hash,
             "flame_execution_count": resources.execution_count,
             "cache_hit_count": resources.cache_hit_count,
             "best": task.plugins.task_adapter.summarize_best(result.final_snapshot.gbest),
@@ -381,6 +440,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runs-dir", type=Path, required=True)
     parser.add_argument("--confirm-max-new-evaluations", type=int, required=True)
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--resume-config-hash")
     args = parser.parse_args(argv)
     if args.confirm_max_new_evaluations != EXPECTED_EVALUATIONS:
         parser.error("exact confirmation required: --confirm-max-new-evaluations 1000")
@@ -391,6 +451,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.inputs,
                 args.runs_dir,
                 preflight_only=args.preflight_only,
+                resume_config_hash=args.resume_config_hash,
             )
         )
     except (OSError, TypeError, ValueError, RuntimeError) as error:

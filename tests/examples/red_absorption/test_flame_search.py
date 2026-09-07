@@ -47,6 +47,33 @@ def test_changed_flame_summaries_use_distinct_content_paths(tmp_path) -> None:
     assert resumed.relative_path.startswith("reports/flame-summary/")
 
 
+def test_explicit_resume_reuses_committed_resource_budget() -> None:
+    config_hash = "a" * 64
+    committed_budget = {
+        "max_new_evaluations": 1000,
+        "preflight_identity": "b" * 64,
+        "evaluator": "FLAME/FLSF proxy",
+    }
+
+    class ResumeStore:
+        def get_run_snapshot_hash(self, run_id):
+            assert run_id == "flame-aaaaaaaaaaaaaaaaaaaaaaaa"
+            return config_hash
+
+        def get_latest_committed_snapshot_json(self, run_id):
+            assert run_id == "flame-aaaaaaaaaaaaaaaaaaaaaaaa"
+            return {"resource_budget": committed_budget}
+
+    selected = flame_search_module._resume_resource_budget(
+        ResumeStore(),
+        run_id="flame-aaaaaaaaaaaaaaaaaaaaaaaa",
+        config_hash=config_hash,
+    )
+
+    assert selected == committed_budget
+    assert selected is not committed_budget
+
+
 @pytest.mark.asyncio
 async def test_runtime_supervisor_recreates_codex_after_transport_interruption() -> None:
     runtimes: list[FakeRuntime] = []
