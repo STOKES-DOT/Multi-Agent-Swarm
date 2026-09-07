@@ -325,6 +325,25 @@ def test_proposal_response_schema_uses_codex_supported_primitives() -> None:
     assert_const_types(request.response_schema)
 
 
+def test_proposal_prompt_requires_error_specific_reproposal() -> None:
+    request = RedAbsorptionTaskAdapter().build_stage_request(
+        AgentStage.PROPOSING_ACTION,
+        context(
+            tool_feedback={
+                "attempt": 1,
+                "status": "REJECTED",
+                "error": (
+                    "MoleculeEditor rejected edit: AROMATICITY_ERROR: "
+                    "cannot kekulize ring"
+                ),
+            }
+        ),
+    )
+
+    assert "exact MoleculeEditor error code" in request.prompt
+    assert "different site or operation" in request.prompt
+
+
 def test_proposal_response_drops_nullable_optional_command_fields() -> None:
     adapter = RedAbsorptionTaskAdapter()
     proposal = {

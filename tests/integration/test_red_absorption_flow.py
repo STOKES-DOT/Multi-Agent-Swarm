@@ -146,26 +146,28 @@ class FakeEditor:
                 candidate=None,
                 payload={},
             )
+        geometry_status = "READY" if geometry is not None else "NOT_REQUESTED"
         child = copy.deepcopy(parent)
         child.update(
             state_hash=HASH,
             chemical_identity_hash=CANDIDATE_HASH,
             parent_state_hash=parent["state_hash"],
             committed_commands=copy.deepcopy(list(commands)),
-            geometry_status="READY",
+            geometry_status=geometry_status,
         )
         payload = {
             "chemical_status": "VALID",
-            "geometry_status": "READY",
-            "ready_for_evaluator": True,
+            "geometry_status": geometry_status,
+            "ready_for_evaluator": geometry is not None,
             "graph": child,
             "state_hash": HASH,
             "chemical_identity_hash": CANDIDATE_HASH,
             "parent_state_hash": parent["state_hash"],
-            "geometry_hash": GEOMETRY_HASH,
             "committed_commands": copy.deepcopy(list(commands)),
             "canonical_isomeric_smiles": "N",
         }
+        if geometry is not None:
+            payload["geometry_hash"] = GEOMETRY_HASH
         self.latest_graph = copy.deepcopy(child)
         if self.edit_mode == "geometry_failed":
             return SimpleNamespace(
@@ -179,8 +181,8 @@ class FakeEditor:
         return SimpleNamespace(
             processed=True,
             chemical_status="VALID",
-            geometry_status="READY",
-            ready_for_evaluator=True,
+            geometry_status=geometry_status,
+            ready_for_evaluator=geometry is not None,
             candidate=child,
             payload=payload,
         )

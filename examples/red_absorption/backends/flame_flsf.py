@@ -115,6 +115,11 @@ def _read_prediction(path: Path, task: str, pair: tuple[str, str]) -> float:
     return value
 
 
+def _failure_tail(stdout: str, stderr: str, *, limit: int = 512) -> str:
+    detail = " ".join((stderr or stdout).split())
+    return detail[-limit:]
+
+
 def run_calculation(
     document: Mapping[str, object] | FlameBackendRequest,
     *,
@@ -184,7 +189,12 @@ def run_calculation(
             ):
                 raise ValueError(f"FLAME {task} process output exceeds its budget")
             if returncode != 0:
-                raise RuntimeError(f"FLAME {task} process failed with exit {returncode}")
+                prefix = f"FLAME {task} process failed with exit {returncode}"
+                detail = _failure_tail(stdout, stderr)
+                if detail:
+                    available = max(0, 600 - len(prefix) - 2)
+                    prefix = f"{prefix}: {detail[-available:]}"
+                raise RuntimeError(prefix)
             values[task] = _read_prediction(output_path, task, pair)
 
     return FlamePrediction(

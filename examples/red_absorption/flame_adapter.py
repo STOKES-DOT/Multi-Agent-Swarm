@@ -13,6 +13,7 @@ from multi_agent_pso.protocols import CandidateRef, ToolContext, ToolResult, Too
 
 from .adapter import RedAbsorptionTaskAdapter, _HASH, _plain, create_position_space
 from .flame_proxy import FLAME_PROXY_EVALUATOR_VERSION, FlamePrediction, FlameProxyEvaluator
+from .flame_workflow import flame_input_hash
 
 
 class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
@@ -31,6 +32,9 @@ class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
             reflection_schema,
         )
         self._assets = MappingProxyType(assets)
+
+    def _inspection_geometry_is_valid(self, value: object) -> bool:
+        return value is None or super()._inspection_geometry_is_valid(value)
 
     def candidate_from_tool_result(
         self, result: ToolResult, context: ToolContext
@@ -68,12 +72,13 @@ class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
         target = authorized.get("target_position")
         decoded = self.decode_position(target)
         expected_key = (
-            candidate_hash,
+            flame_input_hash(canonical_smiles, prediction.solvent_smiles),
             prediction.solvent_smiles,
             payload.get("cache_key", [None, None, None, None])[2],
             FLAME_PROXY_EVALUATOR_VERSION,
         )
         cache_key = payload.get("cache_key")
+        flame_attempts = payload.get("flame_attempts")
         try:
             molecule_artifact = ArtifactRef.model_validate(
                 payload.get("molecule_artifact")
@@ -99,12 +104,15 @@ class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
                     "failed_proposal_attempt",
                     "rejection_count",
                     "rejected_commands_sha256",
+                    "rejection_detail",
                 }
                 or rollback.get("reason") != "MoleculeEditor rejected edit"
                 or rollback.get("failed_proposal_attempt") != context.attempt
                 or rollback.get("rejection_count") != context.attempt + 1
                 or rollback.get("rejected_commands_sha256")
                 != rejected_commands_sha256
+                or not self._text(rollback.get("rejection_detail"))
+                or len(rollback["rejection_detail"].encode("utf-8")) > 512
                 or commands
                 or state_hash != authorized.get("inspected_source_hash")
                 or not isinstance(inspected_graph, Mapping)
@@ -121,6 +129,10 @@ class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
             not isinstance(cache_key, list)
             or tuple(cache_key) != expected_key
             or type(payload.get("cache_hit")) is not bool
+            or type(flame_attempts) is not int
+            or not 0 <= flame_attempts <= 5
+            or (payload["cache_hit"] and flame_attempts != 0)
+            or (not payload["cache_hit"] and flame_attempts == 0)
             or result.artifacts != (molecule_artifact,)
             or authorized.get("edit_budget") != decoded["edit_budget"]
         ):
@@ -132,6 +144,7 @@ class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
             "flame_prediction": prediction.model_dump(mode="json"),
             "cache_key": cache_key,
             "cache_hit": payload["cache_hit"],
+            "flame_attempts": flame_attempts,
             "molecule_artifact": molecule_artifact.model_dump(mode="json"),
             "continuation_state": {
                 "kind": "canonical_smiles",

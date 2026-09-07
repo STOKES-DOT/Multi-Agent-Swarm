@@ -65,6 +65,24 @@ class FakeRunner:
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
 
+def test_backend_child_failure_preserves_bounded_stderr_tail(tmp_path: Path) -> None:
+    class FailingRunner:
+        def __call__(self, argv, **kwargs):
+            return SimpleNamespace(
+                returncode=9,
+                stdout="",
+                stderr="x" * 2_000 + " fatal allocation failure ",
+            )
+
+    with pytest.raises(RuntimeError) as captured:
+        run_calculation(backend_request(tmp_path), process_runner=FailingRunner())
+
+    message = str(captured.value)
+    assert len(message) <= 600
+    assert "FLAME abs process failed with exit 9" in message
+    assert "fatal allocation failure" in message
+
+
 def test_backend_runs_four_hash_bound_models_without_shell(tmp_path: Path) -> None:
     runner = FakeRunner()
 

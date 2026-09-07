@@ -37,6 +37,25 @@ class RedAbsorptionStageContextProvider:
         self._editor = molecule_editor
         self._inherit_previous_candidate = inherit_previous_candidate
 
+    def _inspection_geometry(self) -> Mapping[str, JsonValue] | None:
+        return self._inputs.geometry.model_dump(mode="json")
+
+    @staticmethod
+    def _inspection_is_usable(result: object) -> bool:
+        return bool(
+            getattr(result, "processed", False)
+            and getattr(result, "chemical_status", None) == "VALID"
+            and getattr(result, "geometry_status", None) == "READY"
+            and getattr(result, "ready_for_evaluator", False)
+            and getattr(result, "candidate", None) is not None
+            and getattr(result, "payload", None) is not None
+        )
+
+    @staticmethod
+    def _inspection_geometry_hash(result: object) -> str | None:
+        payload = getattr(result, "payload", None)
+        return payload.get("geometry_hash") if isinstance(payload, Mapping) else None
+
     async def prepare(
         self,
         stage: AgentStage,
@@ -122,17 +141,10 @@ class RedAbsorptionStageContextProvider:
             result = await self._editor.inspect(
                 source,
                 cwd=tool_context.workspace,
-                geometry=self._inputs.geometry.model_dump(mode="json"),
+                geometry=self._inspection_geometry(),
                 timeout=self._inputs.spectrum_timeout_seconds,
             )
-            if (
-                not result.processed
-                or result.chemical_status != "VALID"
-                or result.geometry_status != "READY"
-                or not result.ready_for_evaluator
-                or result.candidate is None
-                or result.payload is None
-            ):
+            if not self._inspection_is_usable(result):
                 raise ValueError("parent MoleculeEditor inspection failed")
             graph = result.candidate
             if (
@@ -145,7 +157,7 @@ class RedAbsorptionStageContextProvider:
             return {
                 "inspected_graph": graph,
                 "inspected_source_hash": graph["state_hash"],
-                "inspected_geometry_hash": result.payload["geometry_hash"],
+                "inspected_geometry_hash": self._inspection_geometry_hash(result),
             }
         return {}
 

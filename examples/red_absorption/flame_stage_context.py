@@ -40,6 +40,24 @@ class FlameStageContextProvider(RedAbsorptionStageContextProvider):
         self._artifact_store = artifact_store
         self._run_store = run_store
 
+    def _inspection_geometry(self) -> None:
+        return None
+
+    @staticmethod
+    def _inspection_is_usable(result: object) -> bool:
+        return bool(
+            getattr(result, "processed", False)
+            and getattr(result, "chemical_status", None) == "VALID"
+            and getattr(result, "geometry_status", None) == "NOT_REQUESTED"
+            and not getattr(result, "ready_for_evaluator", True)
+            and getattr(result, "candidate", None) is not None
+            and getattr(result, "payload", None) is not None
+        )
+
+    @staticmethod
+    def _inspection_geometry_hash(result: object) -> None:
+        return None
+
     async def prepare(
         self,
         stage: AgentStage,
@@ -128,22 +146,31 @@ class FlameStageContextProvider(RedAbsorptionStageContextProvider):
 
         graph = record.get("graph")
         geometry_hash = record.get("geometry_hash")
+        geometry_status = record.get("geometry_status")
+        ready_for_evaluator = record.get("ready_for_evaluator")
         state_hash = continuation["state_hash"]
         chemical_hash = continuation["chemical_identity_hash"]
         canonical_smiles = continuation["canonical_isomeric_smiles"]
         if (
             record.get("chemical_status") != "VALID"
-            or record.get("geometry_status") != "READY"
-            or record.get("ready_for_evaluator") is not True
+            or geometry_status not in {"NOT_REQUESTED", "READY"}
+            or type(ready_for_evaluator) is not bool
+            or ready_for_evaluator != (geometry_status == "READY")
             or not isinstance(graph, Mapping)
             or record.get("state_hash") != state_hash
             or record.get("chemical_identity_hash") != chemical_hash
             or record.get("canonical_isomeric_smiles") != canonical_smiles
             or graph.get("state_hash") != state_hash
             or graph.get("chemical_identity_hash") != chemical_hash
-            or graph.get("geometry_status") != "READY"
-            or not isinstance(geometry_hash, str)
-            or not _HASH.fullmatch(geometry_hash)
+            or graph.get("geometry_status") != geometry_status
+            or (
+                geometry_status == "READY"
+                and (
+                    not isinstance(geometry_hash, str)
+                    or not _HASH.fullmatch(geometry_hash)
+                )
+            )
+            or (geometry_status == "NOT_REQUESTED" and geometry_hash is not None)
         ):
             raise ValueError("parent molecule artifact identity is invalid")
         return {

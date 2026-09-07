@@ -27,11 +27,108 @@ from .workflow import _plain_json
 
 
 FlameCacheKey = tuple[str, str, str, str]
+_TRANSIENT_FLAME_STATUSES = {
+    JsonCommandStatus.PROCESS_ERROR,
+    JsonCommandStatus.SPAWN_ERROR,
+}
 
 
-def flame_cache_key(inputs: FlameRunInputs, chemical_hash: str) -> FlameCacheKey:
+def _flame_failure_message(result, attempt: int, max_attempts: int) -> str:
+    prefix = (
+        f"FLAME command {result.status.value} exit={result.exit_code} "
+        f"attempt={attempt}/{max_attempts}"
+    )
+    raw_detail = result.stderr_text or result.stdout_text or ""
+    detail = " ".join(raw_detail.split())
+    if not detail:
+        return prefix
+    available = max(0, 512 - len(prefix) - 2)
+    return f"{prefix}: {detail[-available:]}"
+
+
+async def execute_flame_command(
+    command,
+    payload: Mapping[str, object],
+    *,
+    cwd,
+    max_attempts: int,
+):
+    for attempt in range(1, max_attempts + 1):
+        result = await command.execute_json(
+            payload,
+            cwd=cwd,
+            timeout_seconds=None,
+        )
+        if result.status is JsonCommandStatus.SUCCESS:
+            return result, attempt, None
+        failure_message = _flame_failure_message(result, attempt, max_attempts)
+        if (
+            result.status not in _TRANSIENT_FLAME_STATUSES
+            or attempt == max_attempts
+        ):
+            return result, attempt, failure_message
+    raise AssertionError("FLAME process attempt loop is unreachable")
+
+
+def _editor_error_details(errors: object) -> list[str]:
+    details = []
+    if isinstance(errors, (list, tuple)):
+        for error in errors[:3]:
+            if not isinstance(error, Mapping):
+                continue
+            code = error.get("code")
+            message = error.get("message")
+            if not isinstance(code, str) or not code:
+                continue
+            normalized = " ".join(message.split()) if isinstance(message, str) else ""
+            details.append(f"{code[:64]}: {normalized[-96:]}")
+    return details
+
+
+def _molecule_editor_rejection(edit: object) -> str:
+    prefix = "MoleculeEditor rejected edit"
+    payload = getattr(edit, "payload", None)
+    errors = payload.get("errors") if isinstance(payload, Mapping) else None
+    details = _editor_error_details(errors)
+    if details:
+        return f"{prefix}: {'; '.join(details)}"[:512]
+    process = getattr(edit, "process", None)
+    status = getattr(getattr(process, "status", None), "value", None)
+    if isinstance(status, str):
+        base = f"{prefix}: command {status} exit={getattr(process, 'exit_code', None)}"
+        stderr = getattr(process, "stderr_text", None)
+        stdout = getattr(process, "stdout_text", None)
+        if isinstance(stdout, str):
+            try:
+                process_payload = json.loads(stdout)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                process_payload = None
+            if isinstance(process_payload, Mapping):
+                details = _editor_error_details(process_payload.get("errors"))
+                if details:
+                    return f"{base}: {'; '.join(details)}"[:512]
+        raw_detail = stderr or stdout or ""
+        detail = " ".join(raw_detail.split())
+        if detail:
+            available = max(0, 512 - len(base) - 2)
+            return f"{base}: {detail[-available:]}"
+        return base
+    return prefix
+
+
+def flame_input_hash(dye_smiles: str, solvent_smiles: str) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {"dye_smiles": dye_smiles, "solvent_smiles": solvent_smiles},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def flame_cache_key(inputs: FlameRunInputs, dye_smiles: str) -> FlameCacheKey:
     return (
-        chemical_hash,
+        flame_input_hash(dye_smiles, inputs.flame_backend.solvent_smiles),
         inputs.flame_backend.solvent_smiles,
         inputs.flame_backend.manifest_hash,
         FLAME_PROXY_EVALUATOR_VERSION,
@@ -58,6 +155,7 @@ class FlameWorkflowResources:
         self.locks_guard = asyncio.Lock()
         self.budget_lock = asyncio.Lock()
         self.slots = asyncio.Semaphore(inputs.evaluation_concurrency)
+        self.max_attempts = inputs.flame_backend.max_attempts
         self.loop = None
         self.loop_guard = threading.Lock()
 
@@ -207,9 +305,7 @@ class FlameWorkflowToolProvider:
         graph = authoritative.get("inspected_graph")
         if not isinstance(graph, Mapping):
             return ToolResult(ToolStatus.REJECTED, error="inspected graph is missing")
-        geometry = self.inputs.geometry.model_dump(mode="json")
         parent_record = None
-        inspection_geometry = geometry
         inspected_artifact = authoritative.get("inspected_artifact")
         if inspected_artifact is not None:
             try:
@@ -221,53 +317,58 @@ class FlameWorkflowToolProvider:
                     error=f"parent artifact is invalid: {type(error).__name__}",
                 )
             artifact_graph = parent_record.get("graph")
+            artifact_geometry_status = parent_record.get("geometry_status")
+            artifact_ready = parent_record.get("ready_for_evaluator")
+            artifact_geometry_hash = parent_record.get("geometry_hash")
             if (
                 not artifact.committed
                 or artifact.media_type != "application/json"
                 or parent_record.get("chemical_status") != "VALID"
-                or parent_record.get("geometry_status") != "READY"
-                or parent_record.get("ready_for_evaluator") is not True
+                or artifact_geometry_status not in {"NOT_REQUESTED", "READY"}
+                or type(artifact_ready) is not bool
+                or artifact_ready != (artifact_geometry_status == "READY")
                 or not isinstance(artifact_graph, Mapping)
                 or _plain_json(artifact_graph) != _plain_json(graph)
+                or artifact_graph.get("geometry_status")
+                != artifact_geometry_status
                 or parent_record.get("state_hash")
                 != authoritative.get("inspected_source_hash")
                 or artifact_graph.get("state_hash")
                 != authoritative.get("inspected_source_hash")
                 or parent_record.get("chemical_identity_hash")
                 != artifact_graph.get("chemical_identity_hash")
-                or parent_record.get("geometry_hash")
+                or artifact_geometry_hash
                 != authoritative.get("inspected_geometry_hash")
+                or (
+                    artifact_geometry_status == "READY"
+                    and not isinstance(artifact_geometry_hash, str)
+                )
+                or (
+                    artifact_geometry_status == "NOT_REQUESTED"
+                    and artifact_geometry_hash is not None
+                )
             ):
                 return ToolResult(
                     ToolStatus.REJECTED, error="parent artifact identity mismatch"
                 )
-            inspection_geometry = None
         try:
             inspection = await self.editor.inspect(
                 {"kind": "chemical_graph", "value": _plain_json(graph)},
                 cwd=context.workspace,
-                geometry=inspection_geometry,
+                geometry=None,
                 timeout=self.inputs.flame_backend.timeout_seconds,
             )
-            if parent_record is None:
-                inspection_matches = (
-                    inspection.geometry_status == "READY"
-                    and inspection.ready_for_evaluator
-                    and inspection.payload is not None
-                    and inspection.payload.get("geometry_hash")
-                    == authoritative.get("inspected_geometry_hash")
-                    and _plain_json(inspection.candidate) == _plain_json(graph)
+            live_graph = _plain_json(inspection.candidate)
+            expected_graph = _plain_json(graph)
+            if isinstance(live_graph, dict) and isinstance(expected_graph, dict):
+                live_graph["geometry_status"] = expected_graph.get(
+                    "geometry_status"
                 )
-            else:
-                live_graph = _plain_json(inspection.candidate)
-                expected_graph = _plain_json(graph)
-                if isinstance(live_graph, dict):
-                    live_graph["geometry_status"] = "READY"
-                inspection_matches = (
-                    inspection.geometry_status == "NOT_REQUESTED"
-                    and not inspection.ready_for_evaluator
-                    and live_graph == expected_graph
-                )
+            inspection_matches = (
+                inspection.geometry_status == "NOT_REQUESTED"
+                and not inspection.ready_for_evaluator
+                and live_graph == expected_graph
+            )
             if (
                 not inspection.processed
                 or inspection.chemical_status != "VALID"
@@ -279,7 +380,7 @@ class FlameWorkflowToolProvider:
                 inspection,
                 authoritative["commands"],
                 cwd=context.workspace,
-                geometry=geometry,
+                geometry=None,
                 timeout=self.inputs.flame_backend.timeout_seconds,
                 attempt=context.attempt + 1,
             )
@@ -290,10 +391,12 @@ class FlameWorkflowToolProvider:
         if (
             not edit.processed
             or edit.chemical_status != "VALID"
-            or edit.geometry_status != "READY"
-            or not edit.ready_for_evaluator
+            or edit.geometry_status != "NOT_REQUESTED"
+            or edit.ready_for_evaluator
+            or edit.candidate is None
             or edit.payload is None
         ):
+            rejection_detail = _molecule_editor_rejection(edit)
             if (
                 self.rollback_after_rejections is not None
                 and context.attempt + 1 >= self.rollback_after_rejections
@@ -303,8 +406,9 @@ class FlameWorkflowToolProvider:
                     authoritative,
                     context,
                     parent_record=parent_record,
+                    rejection_detail=rejection_detail,
                 )
-            return ToolResult(ToolStatus.REJECTED, error="MoleculeEditor rejected edit")
+            return ToolResult(ToolStatus.REJECTED, error=rejection_detail)
         return await self._evaluate_payload(_plain_json(edit.payload), context)
 
     async def _evaluate_rollback_parent(
@@ -314,6 +418,7 @@ class FlameWorkflowToolProvider:
         context: ToolContext,
         *,
         parent_record: Mapping[str, object] | None = None,
+        rejection_detail: str,
     ) -> ToolResult:
         graph = _plain_json(
             inspection.candidate
@@ -358,13 +463,15 @@ class FlameWorkflowToolProvider:
             "failed_proposal_attempt": context.attempt,
             "rejection_count": self.rollback_after_rejections,
             "rejected_commands_sha256": commands_sha256,
+            "rejection_detail": rejection_detail,
         }
         parent_payload = dict(inspection_payload)
+        geometry_status = graph.get("geometry_status")
         parent_payload.update(
             {
                 "chemical_status": "VALID",
-                "geometry_status": "READY",
-                "ready_for_evaluator": True,
+                "geometry_status": geometry_status,
+                "ready_for_evaluator": geometry_status == "READY",
                 "graph": graph,
                 "state_hash": state_hash,
                 "chemical_identity_hash": chemical_hash,
@@ -392,7 +499,8 @@ class FlameWorkflowToolProvider:
         smiles = payload.get("canonical_isomeric_smiles")
         if not isinstance(chemical_hash, str) or not isinstance(smiles, str) or not smiles:
             return ToolResult(ToolStatus.FAILED, error="edited molecule identity is missing")
-        key = flame_cache_key(self.inputs, chemical_hash)
+        key = flame_cache_key(self.inputs, smiles)
+        flame_attempts = 0
         async with await self.resources.lock_for(key):
             prediction = self.resources.cache.get(key) or await self.resources.recover(key)
             cache_hit = prediction is not None
@@ -408,17 +516,27 @@ class FlameWorkflowToolProvider:
                 elif claim is BudgetClaimStatus.FAILED:
                     return ToolResult(ToolStatus.FAILED, error="FLAME evaluation previously failed")
                 if prediction is None:
-                    result = await self.flame.execute_json(
-                        self.inputs.flame_backend.backend_payload(smiles),
-                        cwd=context.workspace,
-                        timeout_seconds=None,
-                    )
-                    if result.status is not JsonCommandStatus.SUCCESS:
-                        status = "TIMEOUT" if result.status is JsonCommandStatus.TIMEOUT else "FAILED"
-                        await self.resources.fail(key, status, f"FLAME command {result.status.value}")
+                    async with self.resources.slots:
+                        result, flame_attempts, failure_message = (
+                            await execute_flame_command(
+                                self.flame,
+                                self.inputs.flame_backend.backend_payload(smiles),
+                                cwd=context.workspace,
+                                max_attempts=self.resources.max_attempts,
+                            )
+                        )
+                    if failure_message is not None:
+                        status = (
+                            "TIMEOUT"
+                            if result.status is JsonCommandStatus.TIMEOUT
+                            else "FAILED"
+                        )
+                        await self.resources.fail(key, status, failure_message)
                         return ToolResult(
-                            ToolStatus.TIMEOUT if status == "TIMEOUT" else ToolStatus.FAILED,
-                            error="FLAME prediction failed",
+                            ToolStatus.TIMEOUT
+                            if status == "TIMEOUT"
+                            else ToolStatus.FAILED,
+                            error=failure_message,
                         )
                     try:
                         prediction = FlamePrediction.model_validate_json(result.stdout_text)
@@ -453,6 +571,7 @@ class FlameWorkflowToolProvider:
             "flame_prediction": prediction.model_dump(mode="json"),
             "cache_key": list(key),
             "cache_hit": cache_hit,
+            "flame_attempts": flame_attempts,
             "molecule_artifact": artifact.model_dump(mode="json"),
         }
         if rollback is not None:
@@ -467,5 +586,7 @@ class FlameWorkflowToolProvider:
 __all__ = [
     "FlameWorkflowResources",
     "FlameWorkflowToolProvider",
+    "execute_flame_command",
     "flame_cache_key",
+    "flame_input_hash",
 ]

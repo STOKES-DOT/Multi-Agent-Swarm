@@ -22,12 +22,16 @@ from multi_agent_pso.runtimes import (
     LocalCodexRuntime,
 )
 from multi_agent_pso.storage import FileArtifactStore, SQLiteRunStore
-from multi_agent_pso.tools import JsonCommandProvider, JsonCommandStatus, MoleculeEditorProvider
+from multi_agent_pso.tools import JsonCommandProvider, MoleculeEditorProvider
 
 from .flame_inputs import FlameRunInputs
 from .flame_proxy import FlamePrediction, FlameProxyEvaluator
 from .flame_stage_context import FlameStageContextProvider
-from .flame_workflow import FlameWorkflowResources, FlameWorkflowToolProvider
+from .flame_workflow import (
+    FlameWorkflowResources,
+    FlameWorkflowToolProvider,
+    execute_flame_command,
+)
 from .preflight import _default_auth_probe, _resolve_probe
 from .search import _make_private_run_root
 
@@ -143,14 +147,14 @@ async def run_flame_search(
         inspection = await editor.inspect(
             _parent_source(inputs),
             cwd=root,
-            geometry=inputs.geometry.model_dump(mode="json"),
+            geometry=None,
             timeout=inputs.flame_backend.timeout_seconds,
         )
         if (
             not inspection.processed
             or inspection.chemical_status != "VALID"
-            or inspection.geometry_status != "READY"
-            or not inspection.ready_for_evaluator
+            or inspection.geometry_status != "NOT_REQUESTED"
+            or inspection.ready_for_evaluator
             or inspection.payload is None
             or inspection.candidate is None
         ):
@@ -158,13 +162,14 @@ async def run_flame_search(
         parent_smiles = inspection.payload.get("canonical_isomeric_smiles")
         if not isinstance(parent_smiles, str) or not parent_smiles:
             raise ValueError("FLAME preflight parent SMILES is missing")
-        command_result = await flame.execute_json(
+        command_result, preflight_attempts, failure_message = await execute_flame_command(
+            flame,
             inputs.flame_backend.backend_payload(parent_smiles),
             cwd=root,
-            timeout_seconds=None,
+            max_attempts=inputs.flame_backend.max_attempts,
         )
-        if command_result.status is not JsonCommandStatus.SUCCESS:
-            raise RuntimeError("FLAME preflight command failed")
+        if failure_message is not None:
+            raise RuntimeError(f"FLAME preflight command failed: {failure_message}")
         prediction = FlamePrediction.model_validate_json(command_result.stdout_text)
         if (
             prediction.dye_smiles != parent_smiles
@@ -186,6 +191,7 @@ async def run_flame_search(
             "parent_chemical_hash": inspection.candidate["chemical_identity_hash"],
             "model_manifest_hash": inputs.flame_backend.manifest_hash,
             "max_new_evaluations": EXPECTED_EVALUATIONS,
+            "flame_attempts": preflight_attempts,
             "prediction": prediction.model_dump(mode="json"),
             "evaluation": preflight_evaluation.model_dump(mode="json"),
         }

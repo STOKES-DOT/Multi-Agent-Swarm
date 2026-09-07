@@ -142,6 +142,9 @@ class RedAbsorptionTaskAdapter:
             )
         self._assets = MappingProxyType(assets)
 
+    def _inspection_geometry_is_valid(self, value: object) -> bool:
+        return isinstance(value, str) and bool(_HASH.fullmatch(value))
+
     def _bounded_put(
         self, registry: OrderedDict, key, entry: dict[str, object]
     ) -> None:
@@ -248,8 +251,7 @@ class RedAbsorptionTaskAdapter:
                 not isinstance(inspected_graph, dict)
                 or not isinstance(inspection, str)
                 or not _HASH.fullmatch(inspection)
-                or not isinstance(inspection_geometry, str)
-                or not _HASH.fullmatch(inspection_geometry)
+                or not self._inspection_geometry_is_valid(inspection_geometry)
             ):
                 raise ValueError("proposal context requires inspected graph and hash")
             validated = validate_source(

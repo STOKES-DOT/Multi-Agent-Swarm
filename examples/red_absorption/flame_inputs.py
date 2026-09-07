@@ -27,6 +27,7 @@ class FlameBackendConfig(BaseModel):
     model_hashes: dict[str, str]
     solvent_smiles: Literal["ClCCl"] = "ClCCl"
     timeout_seconds: float = Field(gt=0, le=3600)
+    max_attempts: int = Field(default=3, ge=1, le=5, strict=True)
 
     @field_validator("repository_path", "runner_path", "python_path")
     @classmethod

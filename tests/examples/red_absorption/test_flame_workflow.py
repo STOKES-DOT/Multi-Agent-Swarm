@@ -4,7 +4,7 @@ import asyncio
 import copy
 import json
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
@@ -86,6 +86,7 @@ def inputs(tmp_path: Path) -> FlameRunInputs:
                 "model_hashes": MODEL_HASHES,
                 "solvent_smiles": "ClCCl",
                 "timeout_seconds": 30.0,
+                "max_attempts": 3,
             },
             "evaluation_concurrency": 1,
         }
@@ -117,6 +118,58 @@ class FakeFlameCommand:
 
     async def aclose(self):
         self.close_calls += 1
+
+
+def chemical_only_payload(
+    chemical_hash: str, smiles: str, *, state_character: str
+) -> dict[str, object]:
+    state_hash = state_character * 64
+    return {
+        "chemical_status": "VALID",
+        "geometry_status": "NOT_REQUESTED",
+        "ready_for_evaluator": False,
+        "graph": {
+            **parent_graph(),
+            "state_hash": state_hash,
+            "chemical_identity_hash": chemical_hash,
+            "geometry_status": "NOT_REQUESTED",
+        },
+        "state_hash": state_hash,
+        "chemical_identity_hash": chemical_hash,
+        "parent_state_hash": PARENT_HASH,
+        "committed_commands": [],
+        "canonical_isomeric_smiles": smiles,
+    }
+
+
+def execution_context(tmp_path: Path, particle_id: str) -> ToolContext:
+    return ToolContext(
+        "run",
+        particle_id,
+        0,
+        AgentStage.EXECUTING,
+        0,
+        tmp_path.resolve(),
+    )
+
+
+def flame_result(payload: dict[str, object], *, absorption_nm: float = 650.0):
+    prediction = FlamePrediction(
+        dye_smiles=payload["dye_smiles"],
+        solvent_smiles="ClCCl",
+        absorption_nm=absorption_nm,
+        emission_nm=700.0,
+        plqy=0.4,
+        epsilon_m1_cm1=2.0e4,
+        model_hashes=MODEL_HASHES,
+    )
+    return SimpleNamespace(
+        status=JsonCommandStatus.SUCCESS,
+        stdout_text=json.dumps(prediction.model_dump(mode="json")),
+        stderr_text="",
+        exit_code=0,
+        elapsed_seconds=0.1,
+    )
 
 
 def authorized_request(tmp_path: Path, *, attempt: int = 0):
@@ -183,6 +236,7 @@ async def test_workflow_builds_flame_candidate_and_proxy_reward(tmp_path: Path):
 
     assert result.status is ToolStatus.SUCCESS
     assert candidate.candidate_hash == CANDIDATE_HASH
+    assert candidate.metadata["flame_attempts"] == 1
     assert candidate.metadata["continuation_state"]["canonical_isomeric_smiles"] == "N"
     assert candidate.metadata["continuation_state"]["molecule_artifact"] == (
         result.artifacts[0].model_dump(mode="json")
@@ -193,8 +247,391 @@ async def test_workflow_builds_flame_candidate_and_proxy_reward(tmp_path: Path):
     assert resources.execution_count == 1
     assert command.calls[0][0]["dye_smiles"] == "N"
     assert command.calls[0][1]["timeout_seconds"] is None
-    assert result.payload["cache_key"] == flame_cache_key(run_inputs, CANDIDATE_HASH)
+    assert result.payload["cache_key"] == flame_cache_key(run_inputs, "N")
     await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_flame_execution_obeys_configured_concurrency(tmp_path: Path) -> None:
+    class ConcurrentFlame:
+        def __init__(self) -> None:
+            self.active = 0
+            self.peak_active = 0
+
+        async def execute_json(self, payload, **kwargs):
+            self.active += 1
+            self.peak_active = max(self.peak_active, self.active)
+            try:
+                await asyncio.sleep(0.02)
+                return flame_result(payload)
+            finally:
+                self.active -= 1
+
+    run_inputs = inputs(tmp_path)
+    command = ConcurrentFlame()
+    resources = FlameWorkflowResources.from_inputs(
+        run_inputs, max_new_evaluations=10
+    )
+    resources.bind_loop()
+    provider = FlameWorkflowToolProvider.bind(
+        run_inputs,
+        FakeEditor([], parent_graph()),
+        resources,
+        flame=command,
+        artifact_store=FileArtifactStore(tmp_path / "artifacts"),
+    )
+
+    results = await asyncio.gather(
+        provider._evaluate_payload(
+            chemical_only_payload("1" * 64, "N", state_character="2"),
+            execution_context(tmp_path, "p0"),
+        ),
+        provider._evaluate_payload(
+            chemical_only_payload("3" * 64, "O", state_character="4"),
+            execution_context(tmp_path, "p1"),
+        ),
+    )
+
+    assert [result.status for result in results] == [
+        ToolStatus.SUCCESS,
+        ToolStatus.SUCCESS,
+    ]
+    assert command.peak_active == 1
+
+
+@pytest.mark.asyncio
+async def test_flame_transient_process_error_retries_before_ledger_failure(
+    tmp_path: Path,
+) -> None:
+    class FlakyFlame:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute_json(self, payload, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(
+                    status=JsonCommandStatus.PROCESS_ERROR,
+                    stdout_text="",
+                    stderr_text="temporary process pressure",
+                    exit_code=9,
+                    elapsed_seconds=0.1,
+                )
+            return flame_result(payload)
+
+    run_inputs = inputs(tmp_path)
+    ledger = DurableBudgetLedger(tmp_path / "budget.jsonl")
+    resources = FlameWorkflowResources.from_inputs(
+        run_inputs,
+        max_new_evaluations=10,
+        ledger=ledger,
+        run_id="run",
+    )
+    resources.bind_loop()
+    command = FlakyFlame()
+    provider = FlameWorkflowToolProvider.bind(
+        run_inputs,
+        FakeEditor([], parent_graph()),
+        resources,
+        flame=command,
+        artifact_store=FileArtifactStore(tmp_path / "artifacts"),
+    )
+
+    result = await provider._evaluate_payload(
+        chemical_only_payload("1" * 64, "N", state_character="2"),
+        execution_context(tmp_path, "p0"),
+    )
+
+    operations = [
+        json.loads(line)["operation"]
+        for line in (tmp_path / "budget.jsonl").read_text().splitlines()
+    ]
+    assert result.status is ToolStatus.SUCCESS
+    assert result.payload["flame_attempts"] == 2
+    assert command.calls == 2
+    assert resources.execution_count == 1
+    assert operations.count("reserve") == 1
+    assert "fail" not in operations
+    ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_flame_exhausted_retries_preserve_bounded_process_diagnostic(
+    tmp_path: Path,
+) -> None:
+    class FailingFlame:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute_json(self, payload, **kwargs):
+            self.calls += 1
+            return SimpleNamespace(
+                status=JsonCommandStatus.PROCESS_ERROR,
+                stdout_text="",
+                stderr_text="x" * 700 + " temporary process pressure ",
+                exit_code=9,
+                elapsed_seconds=0.1,
+            )
+
+    run_inputs = inputs(tmp_path)
+    ledger = DurableBudgetLedger(tmp_path / "budget.jsonl")
+    resources = FlameWorkflowResources.from_inputs(
+        run_inputs,
+        max_new_evaluations=10,
+        ledger=ledger,
+        run_id="run",
+    )
+    resources.bind_loop()
+    command = FailingFlame()
+    provider = FlameWorkflowToolProvider.bind(
+        run_inputs,
+        FakeEditor([], parent_graph()),
+        resources,
+        flame=command,
+        artifact_store=FileArtifactStore(tmp_path / "artifacts"),
+    )
+
+    result = await provider._evaluate_payload(
+        chemical_only_payload("1" * 64, "N", state_character="2"),
+        execution_context(tmp_path, "p0"),
+    )
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "budget.jsonl").read_text().splitlines()
+    ]
+    failure = next(record for record in records if record["operation"] == "fail")
+    assert result.status is ToolStatus.FAILED
+    assert command.calls == 3
+    assert len(result.error) <= 512
+    assert "PROCESS_ERROR" in result.error
+    assert "exit=9" in result.error
+    assert "temporary process pressure" in result.error
+    assert failure["failure"]["message"] == result.error
+    ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_flame_cache_uses_canonical_model_input_not_graph_hash(
+    tmp_path: Path,
+) -> None:
+    run_inputs = inputs(tmp_path)
+    command = FakeFlameCommand()
+    resources = FlameWorkflowResources.from_inputs(
+        run_inputs, max_new_evaluations=10
+    )
+    resources.bind_loop()
+    provider = FlameWorkflowToolProvider.bind(
+        run_inputs,
+        FakeEditor([], parent_graph()),
+        resources,
+        flame=command,
+        artifact_store=FileArtifactStore(tmp_path / "artifacts"),
+    )
+
+    first = await provider._evaluate_payload(
+        chemical_only_payload("1" * 64, "N", state_character="2"),
+        execution_context(tmp_path, "p0"),
+    )
+    second = await provider._evaluate_payload(
+        chemical_only_payload("3" * 64, "N", state_character="4"),
+        execution_context(tmp_path, "p1"),
+    )
+
+    assert first.status is ToolStatus.SUCCESS
+    assert second.status is ToolStatus.SUCCESS
+    assert len(command.calls) == 1
+    assert first.payload["cache_key"] == second.payload["cache_key"]
+    assert second.payload["cache_hit"] is True
+    assert second.payload["flame_attempts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_molecule_editor_rejection_returns_bounded_cli_diagnostic(
+    tmp_path: Path,
+) -> None:
+    class DiagnosticEditor(FakeEditor):
+        async def edit(self, *args, **kwargs):
+            return SimpleNamespace(
+                processed=True,
+                chemical_status="INVALID",
+                geometry_status="NOT_REQUESTED",
+                ready_for_evaluator=False,
+                candidate=None,
+                payload=MappingProxyType(
+                    {
+                        "errors": (
+                            MappingProxyType(
+                                {
+                                    "code": "AROMATICITY_ERROR",
+                                    "message": "x" * 700 + " cannot kekulize ring",
+                                }
+                            ),
+                        )
+                    }
+                ),
+                process=None,
+            )
+
+    run_inputs = inputs(tmp_path)
+    provider = FlameWorkflowToolProvider.bind(
+        run_inputs,
+        DiagnosticEditor([], parent_graph()),
+        FlameWorkflowResources.from_inputs(run_inputs, max_new_evaluations=10),
+        flame=FakeFlameCommand(),
+        artifact_store=FileArtifactStore(tmp_path / "artifacts"),
+    )
+    request, context = authorized_request(tmp_path)
+
+    result = await provider.execute(request, context)
+
+    assert result.status is ToolStatus.REJECTED
+    assert len(result.error) <= 512
+    assert "AROMATICITY_ERROR" in result.error
+    assert "cannot kekulize ring" in result.error
+
+
+@pytest.mark.asyncio
+async def test_third_rejection_preserves_diagnostic_for_reflection(
+    tmp_path: Path,
+) -> None:
+    class DiagnosticEditor(FakeEditor):
+        async def inspect(self, *args, **kwargs):
+            result = await super().inspect(*args, **kwargs)
+            result.payload["canonical_isomeric_smiles"] = "C"
+            return result
+
+        async def edit(self, *args, **kwargs):
+            return SimpleNamespace(
+                processed=True,
+                chemical_status="INVALID",
+                geometry_status="NOT_REQUESTED",
+                ready_for_evaluator=False,
+                candidate=None,
+                payload={
+                    "errors": [
+                        {
+                            "code": "CLOSED_SHELL_REQUIRED",
+                            "message": "only closed-shell singlets are supported",
+                        }
+                    ]
+                },
+                process=None,
+            )
+
+    run_inputs = inputs(tmp_path)
+    provider = FlameWorkflowToolProvider.bind(
+        run_inputs,
+        DiagnosticEditor([], parent_graph()),
+        FlameWorkflowResources.from_inputs(run_inputs, max_new_evaluations=10),
+        flame=FakeFlameCommand(),
+        artifact_store=FileArtifactStore(tmp_path / "artifacts"),
+        rollback_after_rejections=3,
+    )
+    request, context = authorized_request(tmp_path, attempt=2)
+
+    result = await provider.execute(request, context)
+
+    assert result.status is ToolStatus.SUCCESS
+    assert result.payload["rollback"]["rejection_detail"] == (
+        "MoleculeEditor rejected edit: CLOSED_SHELL_REQUIRED: "
+        "only closed-shell singlets are supported"
+    )
+    candidate = FlameRedAbsorptionTaskAdapter().candidate_from_tool_result(
+        result, context
+    )
+    assert candidate.metadata["rollback"]["rejection_detail"] == result.payload[
+        "rollback"
+    ]["rejection_detail"]
+
+
+@pytest.mark.asyncio
+async def test_molecule_editor_process_rejection_reports_status_and_exit_code(
+    tmp_path: Path,
+) -> None:
+    class ProcessErrorEditor(FakeEditor):
+        async def edit(self, *args, **kwargs):
+            return SimpleNamespace(
+                processed=False,
+                chemical_status="FAILED",
+                geometry_status="FAILED",
+                ready_for_evaluator=False,
+                candidate=None,
+                payload=None,
+                process=SimpleNamespace(
+                    status=JsonCommandStatus.PROCESS_ERROR,
+                    exit_code=2,
+                    stderr_text="x" * 700 + " editor process failed",
+                ),
+            )
+
+    run_inputs = inputs(tmp_path)
+    provider = FlameWorkflowToolProvider.bind(
+        run_inputs,
+        ProcessErrorEditor([], parent_graph()),
+        FlameWorkflowResources.from_inputs(run_inputs, max_new_evaluations=10),
+        flame=FakeFlameCommand(),
+        artifact_store=FileArtifactStore(tmp_path / "artifacts"),
+    )
+    request, context = authorized_request(tmp_path)
+
+    result = await provider.execute(request, context)
+
+    assert result.status is ToolStatus.REJECTED
+    assert len(result.error) <= 512
+    assert "PROCESS_ERROR" in result.error
+    assert "exit=2" in result.error
+    assert "editor process failed" in result.error
+
+
+@pytest.mark.asyncio
+async def test_molecule_editor_process_rejection_recovers_stdout_json_error(
+    tmp_path: Path,
+) -> None:
+    class ProcessErrorEditor(FakeEditor):
+        async def edit(self, *args, **kwargs):
+            return SimpleNamespace(
+                processed=False,
+                chemical_status="FAILED",
+                geometry_status="FAILED",
+                ready_for_evaluator=False,
+                candidate=None,
+                payload=None,
+                process=SimpleNamespace(
+                    status=JsonCommandStatus.PROCESS_ERROR,
+                    exit_code=2,
+                    stderr_text="",
+                    stdout_text=json.dumps(
+                        {
+                            "errors": [
+                                {
+                                    "code": "INPUT_SCHEMA_ERROR",
+                                    "message": (
+                                        "fragment_graph state_hash does not match "
+                                        "graph contents"
+                                    ),
+                                }
+                            ]
+                        }
+                    ),
+                ),
+            )
+
+    run_inputs = inputs(tmp_path)
+    provider = FlameWorkflowToolProvider.bind(
+        run_inputs,
+        ProcessErrorEditor([], parent_graph()),
+        FlameWorkflowResources.from_inputs(run_inputs, max_new_evaluations=10),
+        flame=FakeFlameCommand(),
+        artifact_store=FileArtifactStore(tmp_path / "artifacts"),
+    )
+    request, context = authorized_request(tmp_path)
+
+    result = await provider.execute(request, context)
+
+    assert result.status is ToolStatus.REJECTED
+    assert "INPUT_SCHEMA_ERROR" in result.error
+    assert "state_hash does not match graph contents" in result.error
 
 
 @pytest.mark.asyncio
@@ -254,7 +691,7 @@ async def test_stage_context_restores_artifact_backed_parent_without_smiles_rebu
 
     assert additions["inspected_graph"]["chemical_identity_hash"] == CANDIDATE_HASH
     assert additions["inspected_source_hash"] == HASH
-    assert additions["inspected_geometry_hash"] == GEOMETRY_HASH
+    assert additions["inspected_geometry_hash"] is None
     assert additions["inspected_artifact"] == result.artifacts[0].model_dump(
         mode="json"
     )
@@ -292,6 +729,109 @@ async def test_stage_context_restores_artifact_backed_parent_without_smiles_rebu
     assert proposal["tool_payload"]["inspected_artifact"] == additions[
         "inspected_artifact"
     ]
+
+
+@pytest.mark.asyncio
+async def test_stage_context_accepts_chemical_only_inheritance_artifact(
+    tmp_path: Path,
+) -> None:
+    run_inputs = inputs(tmp_path)
+    artifact_store = FileArtifactStore(tmp_path / "artifacts")
+    graph = copy.deepcopy(parent_graph())
+    graph["geometry_status"] = "NOT_REQUESTED"
+    record = {
+        "chemical_status": "VALID",
+        "geometry_status": "NOT_REQUESTED",
+        "ready_for_evaluator": False,
+        "graph": graph,
+        "state_hash": PARENT_HASH,
+        "chemical_identity_hash": "f" * 64,
+        "canonical_isomeric_smiles": "C",
+    }
+    artifact = artifact_store.publish_json("chemical-only.json", record)
+    continuation = {
+        "kind": "canonical_smiles",
+        "canonical_isomeric_smiles": "C",
+        "chemical_identity_hash": "f" * 64,
+        "state_hash": PARENT_HASH,
+        "molecule_artifact": artifact.model_dump(mode="json"),
+    }
+    stage_context = FlameStageContextProvider(
+        run_inputs,
+        FakeWiki([]),
+        FakeEditor([], parent_graph()),
+        inherit_previous_candidate=True,
+        artifact_store=artifact_store,
+    )
+
+    additions = await stage_context.prepare(
+        AgentStage.PROPOSING_ACTION,
+        {
+            "run_id": "run",
+            "particle_id": "p0",
+            "iteration_id": 1,
+            "protocol_snapshot_hash": "1" * 64,
+            "target_position": [0.0] * 8,
+            "parent_continuation_state": continuation,
+        },
+        ToolContext(
+            "run",
+            "p0",
+            1,
+            AgentStage.PROPOSING_ACTION,
+            0,
+            tmp_path.resolve(),
+        ),
+    )
+
+    assert additions["inspected_geometry_hash"] is None
+    adapter = FlameRedAbsorptionTaskAdapter()
+    request = adapter.build_stage_request(
+        AgentStage.PROPOSING_ACTION,
+        {
+            "run_id": "run",
+            "particle_id": "p0",
+            "iteration_id": 1,
+            "protocol_snapshot_hash": "1" * 64,
+            "target_position": [0.0] * 8,
+            **additions,
+        },
+    )
+    assert request.stage is AgentStage.PROPOSING_ACTION
+
+
+@pytest.mark.asyncio
+async def test_flame_stage_context_inspects_initial_parent_without_geometry(
+    tmp_path: Path,
+) -> None:
+    class ChemicalOnlyEditor(FakeEditor):
+        async def inspect(self, source, *, geometry=None, **kwargs):
+            assert geometry is None
+            result = await super().inspect(source, geometry=geometry, **kwargs)
+            result.payload["canonical_isomeric_smiles"] = "C"
+            return result
+
+    stage_context = FlameStageContextProvider(
+        inputs(tmp_path),
+        FakeWiki([]),
+        ChemicalOnlyEditor([], parent_graph()),
+    )
+
+    additions = await stage_context.prepare(
+        AgentStage.PROPOSING_ACTION,
+        {},
+        ToolContext(
+            "run",
+            "p0",
+            0,
+            AgentStage.PROPOSING_ACTION,
+            0,
+            tmp_path.resolve(),
+        ),
+    )
+
+    assert additions["inspected_geometry_hash"] is None
+    assert additions["inspected_graph"]["geometry_status"] == "NOT_REQUESTED"
 
 
 @pytest.mark.parametrize(
@@ -399,8 +939,16 @@ async def test_inherited_parent_skips_geometry_preparation(tmp_path: Path) -> No
             )
 
         async def edit(self, inspection, commands, **kwargs):
-            assert kwargs["geometry"] == run_inputs.geometry.model_dump(mode="json")
-            return await super().edit(inspection, commands, **kwargs)
+            assert kwargs["geometry"] is None
+            result = await super().edit(inspection, commands, **kwargs)
+            result.geometry_status = "NOT_REQUESTED"
+            result.ready_for_evaluator = False
+            result.candidate["geometry_status"] = "NOT_REQUESTED"
+            result.payload["geometry_status"] = "NOT_REQUESTED"
+            result.payload["ready_for_evaluator"] = False
+            result.payload["graph"]["geometry_status"] = "NOT_REQUESTED"
+            result.payload.pop("geometry_hash", None)
+            return result
 
     editor = NoParentGeometryEditor([], inherited_graph)
     payload = {
@@ -418,7 +966,7 @@ async def test_inherited_parent_skips_geometry_preparation(tmp_path: Path) -> No
             "substitute_fragment": 0.25,
         },
         "inspected_graph": inherited_graph,
-        "inspected_geometry_hash": GEOMETRY_HASH,
+        "inspected_geometry_hash": None,
         "inspected_artifact": artifact.model_dump(mode="json"),
     }
     proposal = {
@@ -448,7 +996,7 @@ async def test_inherited_parent_skips_geometry_preparation(tmp_path: Path) -> No
     result = await provider.execute(request, context)
 
     assert result.status is ToolStatus.SUCCESS
-    assert editor.geometry_configs == [None, run_inputs.geometry.model_dump(mode="json")]
+    assert editor.geometry_configs == [None, None]
 
 
 @pytest.mark.asyncio

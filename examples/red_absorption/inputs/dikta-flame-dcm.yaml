@@ -29,4 +29,5 @@ flame_backend:
     e: 49ac664fffd8a5da15f86bd4d737bdc2054f3e5c155e81c0480ec912ce633087
   solvent_smiles: ClCCl
   timeout_seconds: 120.0
+  max_attempts: 3
 evaluation_concurrency: 1
