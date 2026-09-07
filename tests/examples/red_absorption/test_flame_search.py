@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,6 +16,48 @@ class FakeRuntime:
 
     async def close(self) -> None:
         self.close_calls += 1
+
+
+def flame_contract(*, particles: int, iterations: int):
+    task = SimpleNamespace(
+        spec=SimpleNamespace(
+            agent=SimpleNamespace(model="gpt-5.6-luna"),
+            pso=SimpleNamespace(
+                population_size=particles,
+                iterations=iterations,
+                inherit_previous_candidate=True,
+            ),
+            concurrency=SimpleNamespace(agents=particles, evaluations=1),
+        )
+    )
+    inputs = SimpleNamespace(
+        evaluation_concurrency=1,
+        flame_backend=SimpleNamespace(solvent_smiles="ClCCl"),
+    )
+    return task, inputs
+
+
+def test_flame_contract_derives_ten_by_ten_budget() -> None:
+    task, inputs = flame_contract(particles=10, iterations=10)
+
+    shape = flame_search_module._run_shape(
+        task,
+        inputs,
+        confirmed_max_new_evaluations=100,
+    )
+
+    assert shape == (10, 10, 100)
+
+
+def test_flame_contract_rejects_wrong_explicit_evaluation_confirmation() -> None:
+    task, inputs = flame_contract(particles=10, iterations=10)
+
+    with pytest.raises(ValueError, match="exact confirmation required: 100"):
+        flame_search_module._run_shape(
+            task,
+            inputs,
+            confirmed_max_new_evaluations=1000,
+        )
 
 
 def test_matching_fixed_flame_artifact_is_reused(tmp_path) -> None:
@@ -68,6 +111,7 @@ def test_explicit_resume_reuses_committed_resource_budget() -> None:
         ResumeStore(),
         run_id="flame-aaaaaaaaaaaaaaaaaaaaaaaa",
         config_hash=config_hash,
+        max_new_evaluations=1000,
     )
 
     assert selected == committed_budget

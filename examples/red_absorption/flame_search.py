@@ -39,9 +39,6 @@ from .preflight import _default_auth_probe, _resolve_probe
 from .search import _make_private_run_root
 
 
-EXPECTED_PARTICLES = 10
-EXPECTED_ITERATIONS = 100
-EXPECTED_EVALUATIONS = 1000
 _T = TypeVar("_T")
 
 
@@ -100,6 +97,7 @@ def _resume_resource_budget(
     *,
     run_id: str,
     config_hash: str,
+    max_new_evaluations: int,
 ) -> dict[str, JsonValue]:
     if store.get_run_snapshot_hash(run_id) != config_hash:
         raise ValueError("resume config hash does not match the stored run")
@@ -112,7 +110,7 @@ def _resume_resource_budget(
     selected = dict(budget)
     preflight_identity = selected.get("preflight_identity")
     if (
-        selected.get("max_new_evaluations") != EXPECTED_EVALUATIONS
+        selected.get("max_new_evaluations") != max_new_evaluations
         or selected.get("evaluator") != "FLAME/FLSF proxy"
         or not isinstance(preflight_identity, str)
     ):
@@ -163,32 +161,45 @@ async def _run_with_runtime_recovery(
     raise AssertionError("runtime recovery loop is unreachable")
 
 
-def _identity(task, loaded) -> str:
+def _identity(task, loaded, max_new_evaluations: int) -> str:
     payload = {
         "task_snapshot_hash": task.snapshot_hash,
         "input_raw_hash": loaded.raw_sha256,
         "input_semantic_hash": loaded.semantic_sha256,
         "model_manifest_hash": loaded.value.flame_backend.manifest_hash,
-        "max_new_evaluations": EXPECTED_EVALUATIONS,
+        "max_new_evaluations": max_new_evaluations,
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
 
-def _validate_contract(task, inputs: FlameRunInputs) -> None:
+def _run_shape(
+    task,
+    inputs: FlameRunInputs,
+    *,
+    confirmed_max_new_evaluations: int,
+) -> tuple[int, int, int]:
     spec = task.spec
+    particles = spec.pso.population_size
+    iterations = spec.pso.iterations
+    max_new_evaluations = particles * iterations
+    if confirmed_max_new_evaluations != max_new_evaluations:
+        raise ValueError(
+            f"exact confirmation required: {max_new_evaluations}"
+        )
     if (
         spec.agent.model != "gpt-5.6-luna"
-        or spec.pso.population_size != EXPECTED_PARTICLES
-        or spec.pso.iterations != EXPECTED_ITERATIONS
         or spec.pso.inherit_previous_candidate is not True
-        or spec.concurrency.agents != EXPECTED_PARTICLES
+        or spec.concurrency.agents != particles
         or spec.concurrency.evaluations != 1
         or inputs.evaluation_concurrency != 1
         or inputs.flame_backend.solvent_smiles != "ClCCl"
     ):
-        raise ValueError("FLAME search contract must be Luna 10x100 with inheritance and DCM")
+        raise ValueError(
+            "FLAME search contract must use Luna, inheritance, and serial DCM evaluation"
+        )
+    return particles, iterations, max_new_evaluations
 
 
 def _parent_source(inputs: FlameRunInputs) -> dict[str, object]:
@@ -205,14 +216,19 @@ async def run_flame_search(
     inputs_path: Path,
     runs_dir: Path,
     *,
+    confirmed_max_new_evaluations: int,
     preflight_only: bool = False,
     resume_config_hash: str | None = None,
 ):
     task = load_task_package(task_path)
     loaded = load_run_inputs(inputs_path, FlameRunInputs)
     inputs = loaded.value
-    _validate_contract(task, inputs)
-    current_config_hash = _identity(task, loaded)
+    particles, iterations, max_new_evaluations = _run_shape(
+        task,
+        inputs,
+        confirmed_max_new_evaluations=confirmed_max_new_evaluations,
+    )
+    current_config_hash = _identity(task, loaded, max_new_evaluations)
     config_hash = (
         current_config_hash
         if resume_config_hash is None
@@ -277,7 +293,7 @@ async def run_flame_search(
             "parent_state_hash": inspection.candidate["state_hash"],
             "parent_chemical_hash": inspection.candidate["chemical_identity_hash"],
             "model_manifest_hash": inputs.flame_backend.manifest_hash,
-            "max_new_evaluations": EXPECTED_EVALUATIONS,
+            "max_new_evaluations": max_new_evaluations,
             "flame_attempts": preflight_attempts,
             "prediction": prediction.model_dump(mode="json"),
             "evaluation": preflight_evaluation.model_dump(mode="json"),
@@ -295,7 +311,7 @@ async def run_flame_search(
             return {
                 "run_id": run_id,
                 "passed": True,
-                "max_new_evaluations": EXPECTED_EVALUATIONS,
+                "max_new_evaluations": max_new_evaluations,
                 "prediction": prediction.model_dump(mode="json"),
                 "evaluation": preflight_evaluation.model_dump(mode="json"),
                 "preflight": preflight_ref.model_dump(mode="json"),
@@ -306,7 +322,7 @@ async def run_flame_search(
         wiki = LocalWikiRetriever(task.spec.wiki.path)
         resources = FlameWorkflowResources.from_inputs(
             inputs,
-            max_new_evaluations=EXPECTED_EVALUATIONS,
+            max_new_evaluations=max_new_evaluations,
             ledger=ledger,
             run_id=run_id,
         )
@@ -362,7 +378,7 @@ async def run_flame_search(
 
             resource_budget = (
                 {
-                    "max_new_evaluations": EXPECTED_EVALUATIONS,
+                    "max_new_evaluations": max_new_evaluations,
                     "preflight_identity": preflight_ref.sha256,
                     "evaluator": "FLAME/FLSF proxy",
                 }
@@ -371,6 +387,7 @@ async def run_flame_search(
                     store,
                     run_id=run_id,
                     config_hash=config_hash,
+                    max_new_evaluations=max_new_evaluations,
                 )
             )
             runner = SynchronousSwarmRunner(
@@ -390,12 +407,12 @@ async def run_flame_search(
                 episode_factory=lambda target: make_loop("p0", target),
                 particle_episode_factory=make_loop,
                 continuation_episode_factory=make_loop,
-                particle_ids=tuple(f"p{index}" for index in range(EXPECTED_PARTICLES)),
+                particle_ids=tuple(f"p{index}" for index in range(particles)),
                 resource_budget=resource_budget,
                 failure_threshold=task.spec.retry.consecutive_failures_before_resample,
             )
             return await runner.run(
-                iterations=EXPECTED_ITERATIONS,
+                iterations=iterations,
                 resume_paused=resume_config_hash is not None,
             )
 
@@ -410,9 +427,9 @@ async def run_flame_search(
             "run_id": run_id,
             "run_status": result.final_snapshot.run_status.value,
             "completed_iterations": result.final_snapshot.iteration_id,
-            "population_size": EXPECTED_PARTICLES,
-            "target_iterations": EXPECTED_ITERATIONS,
-            "max_new_evaluations": EXPECTED_EVALUATIONS,
+            "population_size": particles,
+            "target_iterations": iterations,
+            "max_new_evaluations": max_new_evaluations,
             "current_config_hash": current_config_hash,
             "resume_config_hash": resume_config_hash,
             "flame_execution_count": resources.execution_count,
@@ -434,7 +451,7 @@ async def run_flame_search(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run the bounded FLAME 10x100 search")
+    parser = argparse.ArgumentParser(description="Run a bounded FLAME swarm search")
     parser.add_argument("task", type=Path)
     parser.add_argument("--inputs", type=Path, required=True)
     parser.add_argument("--runs-dir", type=Path, required=True)
@@ -442,14 +459,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--resume-config-hash")
     args = parser.parse_args(argv)
-    if args.confirm_max_new_evaluations != EXPECTED_EVALUATIONS:
-        parser.error("exact confirmation required: --confirm-max-new-evaluations 1000")
     try:
         result = asyncio.run(
             run_flame_search(
                 args.task,
                 args.inputs,
                 args.runs_dir,
+                confirmed_max_new_evaluations=args.confirm_max_new_evaluations,
                 preflight_only=args.preflight_only,
                 resume_config_hash=args.resume_config_hash,
             )
