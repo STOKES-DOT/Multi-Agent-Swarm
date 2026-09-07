@@ -2,15 +2,23 @@ from __future__ import annotations
 
 from importlib import import_module
 import json
+from pathlib import Path
 
 import pytest
 
+from examples.red_absorption.flame_inputs import FlameRunInputs
+from multi_agent_pso.configuration import load_run_inputs, load_task_package
 from multi_agent_pso.core import AgentStage
 from multi_agent_pso.protocols import CandidateRef, StageResponse, TokenUsage
 
 
 HASH = "a" * 64
 CHEMICAL_HASH = "b" * 64
+ROOT = Path(__file__).resolve().parents[3]
+LARGE_EDIT_TASK = ROOT / "examples/red_absorption/task-flame-luna-large-edit-10x10.yaml"
+LARGE_EDIT_INPUTS = (
+    ROOT / "examples/red_absorption/inputs/gbest-525-flame-dcm-large-edit.yaml"
+)
 
 
 def atom(serial: int) -> dict[str, object]:
@@ -237,3 +245,63 @@ def test_large_edit_realized_position_uses_same_five_dimensions() -> None:
 
     assert realized == [0.0, 0.5, 1.0, 0.0, 0.35]
     assert len(adapter.position_adherence([1.0, 0.5, 1.0, 0.0, 0.4], realized)["absolute_error"]) == 5
+
+
+def test_large_edit_task_package_is_frozen_to_ten_by_ten() -> None:
+    task = load_task_package(LARGE_EDIT_TASK)
+    inputs = load_run_inputs(LARGE_EDIT_INPUTS, FlameRunInputs).value
+
+    assert task.spec.task.name == "red-absorption-flame-large-edit"
+    assert task.spec.pso.population_size == 10
+    assert task.spec.pso.iterations == 10
+    assert task.spec.pso.inherit_previous_candidate is True
+    assert task.spec.agent.model == "gpt-5.6-luna"
+    assert task.spec.concurrency.agents == 10
+    assert task.spec.concurrency.evaluations == 1
+    assert task.plugins.position_space.lower.tolist() == [0.5, 0.0, 0.0, 0.0, 0.1]
+    assert task.plugins.position_space.upper.tolist() == [1.0, 1.0, 1.0, 1.0, 0.7]
+    assert inputs.parent.value == (
+        "CC(=O)C=Cc1c(N(C)C)cc2c(=O)c3c(C=C(C#N)C#N)cccc3n3c4ccccc4c(=O)c1c23"
+    )
+
+
+def test_large_edit_prompts_keep_minimum_fragment_contract() -> None:
+    task = load_task_package(LARGE_EDIT_TASK)
+    adapter = task.plugins.task_adapter
+
+    hypothesis = adapter.build_stage_request(
+        AgentStage.HYPOTHESIZING,
+        {
+            "run_id": "run",
+            "particle_id": "p0",
+            "iteration_id": 0,
+            "protocol_snapshot_hash": HASH,
+            "target_position": [1.0, 1.0, 1.0, 1.0, 0.4],
+            "wiki_query": {
+                "text": "red absorption molecular design",
+                "max_results": 5,
+                "score_threshold": 0.1,
+                "snippet_max_chars": 512,
+            },
+            "wiki_hits": [],
+        },
+    )
+    proposal = adapter.build_stage_request(
+        AgentStage.PROPOSING_ACTION,
+        proposal_context(),
+    )
+    reflection = adapter.build_stage_request(
+        AgentStage.REFLECTING,
+        {
+            "run_id": "run",
+            "particle_id": "p0",
+            "iteration_id": 0,
+            "protocol_snapshot_hash": HASH,
+            "target_position": [1.0, 1.0, 1.0, 1.0, 0.4],
+        },
+    )
+
+    for request in (hypothesis, proposal, reflection):
+        assert "at least 10 heavy atoms" in request.prompt
+    assert "replace_atom" in proposal.prompt and "prohibited" in proposal.prompt
+    assert "change_bond" in proposal.prompt and "prohibited" in proposal.prompt

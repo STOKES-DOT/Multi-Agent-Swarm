@@ -1,0 +1,49 @@
+task:
+  name: red-absorption-flame-large-edit
+  version: v1
+  prompt: prompts/flame_large_edit_hypothesize.md
+  schemas: [schemas/hypothesis.schema.json, schemas/tool-request.schema.json, schemas/reflection.schema.json]
+agent:
+  model: gpt-5.6-luna
+  skills: [/Users/jiaoyuan/Documents/ChatGPT/MolToGraph/.agents/skills/molecule-editor]
+  stage_timeout_seconds: 600.0
+wiki:
+  path: /Users/jiaoyuan/Library/Mobile Documents/com~apple~CloudDocs/Documents/GitHub/ChemAgent/.worktrees/codex-opencode-runtime-base/.openchem/wiki
+  read_only: true
+  max_results: 10
+  snapshot_mode: maintained_markdown
+pso:
+  population_size: 10
+  iterations: 10
+  inherit_previous_candidate: true
+  run_seed: 20260907
+  topology: {type: ring, neighborhood_radius: 1}
+concurrency: {agents: 10, evaluations: 1}
+retry: {agent_schema_corrections: 2, transient_resource_retries: 3, proposal_attempts: 3, consecutive_failures_before_resample: 2}
+thread: {max_turns: 4, max_context_tokens: 16384}
+snapshot: {max_files: 10000, max_file_bytes: 67108864, max_total_bytes: 536870912}
+storage: {runs_directory: runs}
+plugins:
+  position_space: examples.red_absorption.flame_large_edit:create_large_edit_position_space
+  task_adapter: examples.red_absorption.flame_large_edit:create_large_edit_task_adapter
+  evaluator: examples.red_absorption.flame_adapter:create_flame_evaluator
+  tool_provider: examples.red_absorption.flame_adapter:create_flame_tool_provider
+  source_files:
+    - adapter.py
+    - similarity.py
+    - flame_adapter.py
+    - flame_inputs.py
+    - flame_proxy.py
+    - flame_search.py
+    - flame_stage_context.py
+    - flame_workflow.py
+    - flame_large_edit.py
+    - stage_context.py
+    - workflow.py
+    - backends/flame_flsf.py
+    - prompts/flame_large_edit_hypothesize.md
+    - prompts/flame_large_edit_propose.md
+    - prompts/flame_large_edit_reflect.md
+    - schemas/hypothesis.schema.json
+    - schemas/tool-request.schema.json
+    - schemas/reflection.schema.json

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
+from types import MappingProxyType
 
 import numpy as np
 
-from multi_agent_pso.core import ContinuousBoxPositionSpace
+from multi_agent_pso.core import AgentStage, ContinuousBoxPositionSpace
 from multi_agent_pso.protocols import CandidateRef
 
 from .flame_adapter import FlameRedAbsorptionTaskAdapter
@@ -49,6 +51,30 @@ class LargeEditFlameTaskAdapter(FlameRedAbsorptionTaskAdapter):
     """Require every non-rollback proposal to carry a large fragment edit."""
 
     dimension_names = LARGE_EDIT_DIMENSIONS
+
+    def __init__(self) -> None:
+        super().__init__()
+        root = Path(__file__).resolve().parent
+        assets = dict(self._assets)
+        assets[AgentStage.HYPOTHESIZING] = (
+            (root / "prompts" / "flame_large_edit_hypothesize.md").read_text(
+                encoding="utf-8"
+            ),
+            assets[AgentStage.HYPOTHESIZING][1],
+        )
+        assets[AgentStage.PROPOSING_ACTION] = (
+            (root / "prompts" / "flame_large_edit_propose.md").read_text(
+                encoding="utf-8"
+            ),
+            assets[AgentStage.PROPOSING_ACTION][1],
+        )
+        assets[AgentStage.REFLECTING] = (
+            (root / "prompts" / "flame_large_edit_reflect.md").read_text(
+                encoding="utf-8"
+            ),
+            assets[AgentStage.REFLECTING][1],
+        )
+        self._assets = MappingProxyType(assets)
 
     def decode_position(self, position: object) -> dict[str, object]:
         raw = np.asarray(position)
