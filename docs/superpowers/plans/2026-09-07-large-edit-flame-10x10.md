@@ -268,4 +268,3 @@ Report the branch commits, merge state, task/input hashes, run ID, PID, run dire
 - Spec coverage: 10 particles, 10 epochs, Luna, inherited candidates, frozen current gbest parent, ≥10-heavy-atom edit enforcement, exact 100-evaluation ceiling, retry/rollback policy, and live launch are all assigned to concrete tasks.
 - Placeholder scan: no TBD/TODO or unspecified implementation steps remain.
 - Type consistency: the five-dimensional position space, decoder, realized position, prompt contract, proposal validation, and task plugin factories use the same names and bounds.
-

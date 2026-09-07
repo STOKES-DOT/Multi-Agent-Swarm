@@ -143,7 +143,7 @@ class LargeEditFlameTaskAdapter(FlameRedAbsorptionTaskAdapter):
         ]
         fragment_total = _fragment_heavy_atoms(commands)
         return [
-            min(1.0, max(0.0, (total_commands - 1) / 2)),
+            min(1.0, 0.5 + max(0, total_commands - 1) / 4),
             min(
                 1.0,
                 max(
@@ -153,7 +153,7 @@ class LargeEditFlameTaskAdapter(FlameRedAbsorptionTaskAdapter):
                 ),
             ),
             *weights,
-            parent_similarity,
+            min(0.70, max(0.10, parent_similarity)),
         ]
 
 def create_large_edit_position_space() -> ContinuousBoxPositionSpace:

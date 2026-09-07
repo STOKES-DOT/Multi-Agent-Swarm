@@ -18,6 +18,16 @@ class FakeRuntime:
         self.close_calls += 1
 
 
+def test_existing_ten_by_one_hundred_contract_remains_compatible() -> None:
+    task, inputs = flame_contract(particles=10, iterations=100)
+
+    assert flame_search_module._run_shape(
+        task,
+        inputs,
+        confirmed_max_new_evaluations=1000,
+    ) == (10, 100, 1000)
+
+
 def flame_contract(*, particles: int, iterations: int):
     task = SimpleNamespace(
         spec=SimpleNamespace(

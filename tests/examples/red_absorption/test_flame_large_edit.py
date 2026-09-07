@@ -19,6 +19,10 @@ LARGE_EDIT_TASK = ROOT / "examples/red_absorption/task-flame-luna-large-edit-10x
 LARGE_EDIT_INPUTS = (
     ROOT / "examples/red_absorption/inputs/gbest-525-flame-dcm-large-edit.yaml"
 )
+LARGE_EDIT_PARENT_PROVENANCE = (
+    ROOT
+    / "examples/red_absorption/inputs/gbest-525-flame-dcm-large-edit.provenance.json"
+)
 
 
 def atom(serial: int) -> dict[str, object]:
@@ -243,8 +247,34 @@ def test_large_edit_realized_position_uses_same_five_dimensions() -> None:
 
     realized = adapter.realized_position(candidate)
 
-    assert realized == [0.0, 0.5, 1.0, 0.0, 0.35]
+    assert realized == [0.5, 0.5, 1.0, 0.0, 0.35]
     assert len(adapter.position_adherence([1.0, 0.5, 1.0, 0.0, 0.4], realized)["absolute_error"]) == 5
+
+
+def test_large_edit_rollback_realized_position_stays_inside_search_space() -> None:
+    module = import_module("examples.red_absorption.flame_large_edit")
+    adapter = module.LargeEditFlameTaskAdapter()
+    candidate = CandidateRef(
+        "rollback",
+        CHEMICAL_HASH,
+        metadata={
+            "committed_commands": [],
+            "target_position": [0.75, 0.5, 0.5, 0.5, 0.4],
+            "parent_similarity": 1.0,
+            "rollback": {"performed": True},
+        },
+    )
+
+    realized = adapter.realized_position(candidate)
+
+    assert realized == [0.5, 0.0, 0.5, 0.5, 0.7]
+    space = module.create_large_edit_position_space()
+    assert all(
+        lower <= value <= upper
+        for value, lower, upper in zip(
+            realized, space.lower.tolist(), space.upper.tolist(), strict=True
+        )
+    )
 
 
 def test_large_edit_task_package_is_frozen_to_ten_by_ten() -> None:
@@ -305,3 +335,34 @@ def test_large_edit_prompts_keep_minimum_fragment_contract() -> None:
         assert "at least 10 heavy atoms" in request.prompt
     assert "replace_atom" in proposal.prompt and "prohibited" in proposal.prompt
     assert "change_bond" in proposal.prompt and "prohibited" in proposal.prompt
+    assert "three distinct proposals" in proposal.prompt
+    assert "fallback only" in proposal.prompt
+
+
+def test_large_edit_parent_has_source_run_lineage() -> None:
+    inputs = load_run_inputs(LARGE_EDIT_INPUTS, FlameRunInputs).value
+    provenance = json.loads(LARGE_EDIT_PARENT_PROVENANCE.read_text(encoding="utf-8"))
+
+    assert provenance["schema_version"] == "flame-parent-lineage:v1"
+    assert provenance["source_run_id"] == "flame-8a1d132e36df44f92d5e84e5"
+    assert provenance["source_config_hash"] == (
+        "8a1d132e36df44f92d5e84e53f0e0a48ca2520d25f3c3aaa41ae276448f3fe09"
+    )
+    assert provenance["source_iteration"] == 6
+    assert provenance["gbest_history_iteration"] == 7
+    assert provenance["candidate_hash"] == (
+        "3421d6996c52988fd7ef82e0f03ef05981e05491610366fc3156de4749a014c0"
+    )
+    assert provenance["state_hash"] == (
+        "6caeb8a07995ac4bd5ad9b11f813698df64e9019f9b34153dc4c193fd9763572"
+    )
+    assert provenance["evaluation_reference"] == (
+        "e50b9213fdefe03c319dfc7583297e187e14229bb94005827f4d691fa04cb855"
+    )
+    assert provenance["parent_smiles"] == inputs.parent.value
+    assert provenance["prediction"]["absorption_nm"] == pytest.approx(
+        525.2611165571681
+    )
+    assert provenance["model_manifest_hash"] == (
+        "832f2d5c73d06699e74175ca7c91ea9acf042261384e32b69876a6ea29ba68e6"
+    )

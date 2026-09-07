@@ -132,6 +132,54 @@ def test_snapshot_adopts_only_latest_successful_candidate_continuation() -> None
     assert second.particles[0].continuation_state == {"molecule": "candidate-0"}
 
 
+def test_optimization_ineligible_success_advances_without_updating_best() -> None:
+    space = ContinuousBoxPositionSpace([-1.0], [1.0])
+    snapshot = initial_snapshot(
+        run_id="run-1",
+        run_seed=5,
+        config_snapshot_hash="a" * 64,
+        particle_ids=("p0",),
+        space=space,
+    )
+    rollback = _episode(
+        "p0",
+        0,
+        quality=10,
+        continuation_state={"molecule": "unchanged-parent"},
+    )
+    rollback = rollback.model_copy(
+        update={
+            "evaluation": rollback.evaluation.model_copy(
+                update={
+                    "provenance": {
+                        "optimization_eligible": False,
+                        "optimization_exclusion_reason": "rollback_parent",
+                    }
+                }
+            )
+        }
+    )
+
+    result = advance_snapshot(
+        snapshot,
+        (rollback,),
+        run_seed=5,
+        space=space,
+        adapter=QualityAdapter(),
+        topology=RingTopology(),
+        update_rule=ConstrictedUpdateRule(),
+        failure_threshold=2,
+    )
+
+    assert result.run_status is RunStatus.RUNNING
+    assert result.gbest is None
+    assert result.particles[0].pbest is None
+    assert result.particles[0].continuation_state == {
+        "molecule": "unchanged-parent"
+    }
+    assert result.particles[0].consecutive_failures == 1
+
+
 @pytest.mark.asyncio
 async def test_runner_passes_particle_continuation_to_next_generation(tmp_path) -> None:
     runner = make_fake_runner(tmp_path, delays={}, seed=6)

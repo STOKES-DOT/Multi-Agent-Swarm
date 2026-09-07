@@ -38,6 +38,7 @@ plugins:
     - flame_stage_context.py
     - flame_workflow.py
     - flame_large_edit.py
+    - inputs/gbest-525-flame-dcm-large-edit.provenance.json
     - stage_context.py
     - workflow.py
     - backends/flame_flsf.py

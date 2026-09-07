@@ -1,0 +1,39 @@
+{
+  "schema_version": "flame-parent-lineage:v1",
+  "extracted_at": "2026-09-07T20:29:43+08:00",
+  "source_database": "runs/dikta-flame-dcm-luna-10x100-parent-similarity-8a69581/runs.sqlite",
+  "source_run_id": "flame-8a1d132e36df44f92d5e84e5",
+  "source_config_hash": "8a1d132e36df44f92d5e84e53f0e0a48ca2520d25f3c3aaa41ae276448f3fe09",
+  "source_task_snapshot_hash": "bb6fdd748176ab8a09145832721c67af3e9cbeb40ddd87855ddc916f5bcd9426",
+  "source_iteration": 6,
+  "gbest_history_iteration": 7,
+  "candidate_hash": "3421d6996c52988fd7ef82e0f03ef05981e05491610366fc3156de4749a014c0",
+  "state_hash": "6caeb8a07995ac4bd5ad9b11f813698df64e9019f9b34153dc4c193fd9763572",
+  "hypothesis_reference": "4a94bb067d32f887ff4d8393e52f5fce1446549e7d915276f9738155a581eae3",
+  "evaluation_reference": "e50b9213fdefe03c319dfc7583297e187e14229bb94005827f4d691fa04cb855",
+  "molecule_artifact": {
+    "relative_path": "molecules/flame-8a1d132e36df44f92d5e84e5/p8/6-1-2636118b9bbd47f8bf733f43c52dc525.json",
+    "sha256": "df5315c4dfbfeaf38af06c9d16db8eaaad8e11ad18b224e10c3572642064fa67",
+    "size_bytes": 58518,
+    "media_type": "application/json",
+    "committed": true
+  },
+  "parent_smiles": "CC(=O)C=Cc1c(N(C)C)cc2c(=O)c3c(C=C(C#N)C#N)cccc3n3c4ccccc4c(=O)c1c23",
+  "prediction": {
+    "backend": "FLAME/FLSF",
+    "backend_version": "2024.10.a1",
+    "solvent_smiles": "ClCCl",
+    "absorption_nm": 525.2611165571681,
+    "emission_nm": 478.0090640067965,
+    "plqy": 0.09758957939046631,
+    "epsilon_m1_cm1": 29303.62783935274,
+    "fitness": -0.7258278249875126,
+    "model_hashes": {
+      "abs": "046547fc2984dee36fac9f10e194dc0a9f42a71e5c2aa60b377144f17e709169",
+      "emi": "1bfbd8ec5a6ba6f773cde7055a552bac2b970ab98cbc191f3ba71e8e05576332",
+      "plqy": "fe420b98586cf1075f9c76d7daa34e3bc390e498287f272935421452e0bbbc06",
+      "e": "49ac664fffd8a5da15f86bd4d737bdc2054f3e5c155e81c0480ec912ce633087"
+    }
+  },
+  "model_manifest_hash": "832f2d5c73d06699e74175ca7c91ea9acf042261384e32b69876a6ea29ba68e6"
+}

@@ -119,7 +119,20 @@ class FlameProxyEvaluator:
                     "error": f"invalid FLAME prediction: {type(error).__name__}"
                 },
             )
-        return self.evaluate_prediction(prediction)
+        evaluation = self.evaluate_prediction(prediction)
+        rollback = candidate.metadata.get("rollback")
+        if isinstance(rollback, Mapping) and rollback.get("performed") is True:
+            provenance = dict(evaluation.provenance)
+            provenance.update(
+                {
+                    "optimization_eligible": False,
+                    "optimization_exclusion_reason": "rollback_parent",
+                }
+            )
+            payload = evaluation.model_dump(mode="json")
+            payload["provenance"] = provenance
+            return Evaluation.model_validate(payload)
+        return evaluation
 
     def evaluate_prediction(self, prediction: FlamePrediction) -> Evaluation:
         if not isinstance(prediction, FlamePrediction):

@@ -91,6 +91,7 @@ def _episode_best(episode: AgentEpisode) -> PersonalBest | None:
         episode.status is not EpisodeStatus.COMPLETED
         or evaluation is None
         or evaluation.status is not EvaluationStatus.SUCCESS
+        or evaluation.provenance.get("optimization_eligible") is False
         or not all(references)
     ):
         return None
@@ -194,8 +195,14 @@ def advance_snapshot(
 
     updated_bests: dict[str, PersonalBest | None] = {}
     generation_success = False
+    generation_progress = False
     for particle in snapshot.particles:
         episode = episode_by_id[particle.particle_id]
+        generation_progress = generation_progress or bool(
+            episode.status is EpisodeStatus.COMPLETED
+            and episode.evaluation is not None
+            and episode.evaluation.status is EvaluationStatus.SUCCESS
+        )
         candidate = _episode_best(episode)
         generation_success = generation_success or candidate is not None
         updated_bests[particle.particle_id] = _preferred_best(
@@ -223,8 +230,13 @@ def advance_snapshot(
         particle_id = particle.particle_id
         episode = episode_by_id[particle_id]
         success = _episode_best(episode) is not None
+        evaluated_success = bool(
+            episode.status is EpisodeStatus.COMPLETED
+            and episode.evaluation is not None
+            and episode.evaluation.status is EvaluationStatus.SUCCESS
+        )
         continuation_state = particle.continuation_state
-        if success and episode.continuation_state is not None:
+        if evaluated_success and episode.continuation_state is not None:
             continuation_state = episode.continuation_state
         failures = 0 if success else particle.consecutive_failures + 1
         cognitive_seed = derive_seed(run_seed, particle_id, next_iteration, "cognitive")
@@ -318,7 +330,7 @@ def advance_snapshot(
 
     effective_status = (
         RunStatus.PAUSED_NO_SUCCESS
-        if not generation_success
+        if not generation_progress
         else (RunStatus.RUNNING if run_status is None else run_status)
     )
     return IterationSnapshot(

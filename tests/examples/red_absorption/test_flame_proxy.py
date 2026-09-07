@@ -11,6 +11,7 @@ from examples.red_absorption.flame_proxy import (
     epsilon_order_score,
 )
 from multi_agent_pso.core import EvaluationStatus
+from multi_agent_pso.protocols import CandidateRef, EvaluationContext
 
 
 HASHES = {
@@ -110,6 +111,34 @@ def test_emission_and_stokes_shift_are_diagnostics_only() -> None:
     assert positive.metrics["stokes_shift_nm"] == pytest.approx(50.0)
     assert negative.metrics["stokes_shift_nm"] == pytest.approx(-50.0)
     assert negative.metrics["stokes_shift_nonnegative"] is False
+
+
+@pytest.mark.asyncio
+async def test_rollback_parent_is_evaluated_but_ineligible_for_optimization(
+    tmp_path,
+) -> None:
+    candidate = CandidateRef(
+        "rollback-parent",
+        "e" * 64,
+        metadata={
+            "flame_prediction": prediction().model_dump(mode="json"),
+            "rollback": {"performed": True},
+        },
+    )
+    context = EvaluationContext(
+        "run",
+        "p0",
+        0,
+        tmp_path.resolve(),
+        "f" * 64,
+    )
+
+    result = await FlameProxyEvaluator().evaluate(candidate, context)
+
+    assert result.status is EvaluationStatus.SUCCESS
+    assert result.fitness is not None
+    assert result.provenance["optimization_eligible"] is False
+    assert result.provenance["optimization_exclusion_reason"] == "rollback_parent"
 
 
 @pytest.mark.parametrize(
