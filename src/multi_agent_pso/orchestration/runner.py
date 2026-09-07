@@ -117,12 +117,17 @@ class SynchronousSwarmRunner(Generic[P, V]):
             raise RuntimeError("initial snapshot commit was not visible")
         return self._validated_snapshot(stored)
 
-    async def run(self, *, iterations: int) -> SwarmRunResult:
+    async def run(
+        self, *, iterations: int, resume_paused: bool = False
+    ) -> SwarmRunResult:
         if type(iterations) is not int or iterations <= 0:
             raise ValueError("iterations must be a positive integer absolute target")
+        if type(resume_paused) is not bool:
+            raise TypeError("resume_paused must be a bool")
         current = self.ensure_initial_snapshot()
         snapshots = [current]
         generations: list[GenerationResult] = []
+        paused_retry_available = resume_paused
         if current.iteration_id > iterations:
             raise ValueError("iteration target is behind the latest snapshot")
         if current.run_status is RunStatus.COMPLETED:
@@ -131,7 +136,9 @@ class SynchronousSwarmRunner(Generic[P, V]):
             return SwarmRunResult(current, tuple(snapshots), ())
         while current.iteration_id < iterations:
             if current.run_status is RunStatus.PAUSED_NO_SUCCESS:
-                break
+                if not paused_retry_available:
+                    break
+                paused_retry_available = False
             episodes = await self._run_generation(current)
             target_status = (
                 RunStatus.COMPLETED

@@ -11,7 +11,10 @@ from pathlib import Path
 import sys
 from typing import TypeVar
 
+from pydantic import JsonValue
+
 from multi_agent_pso.configuration import load_run_inputs, load_task_package
+from multi_agent_pso.core import ArtifactRef
 from multi_agent_pso.core.topology import RingTopology
 from multi_agent_pso.core.update_rule import ConstrictedUpdateRule
 from multi_agent_pso.orchestration import AgentLoop, SynchronousSwarmRunner
@@ -40,6 +43,48 @@ EXPECTED_PARTICLES = 10
 EXPECTED_ITERATIONS = 100
 EXPECTED_EVALUATIONS = 1000
 _T = TypeVar("_T")
+
+
+def _canonical_json_bytes(payload: Mapping[str, JsonValue]) -> bytes:
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8") + b"\n"
+
+
+def _publish_idempotent_json(
+    artifacts: FileArtifactStore,
+    relative_path: str,
+    payload: Mapping[str, JsonValue],
+) -> ArtifactRef:
+    data = _canonical_json_bytes(payload)
+    reference = ArtifactRef(
+        relative_path=relative_path,
+        sha256=hashlib.sha256(data).hexdigest(),
+        size_bytes=len(data),
+        media_type="application/json",
+        committed=True,
+    )
+    try:
+        return artifacts.publish_bytes(relative_path, data, "application/json")
+    except FileExistsError:
+        artifacts.verify(reference)
+        return reference
+
+
+def _publish_content_addressed_json(
+    artifacts: FileArtifactStore,
+    path_prefix: str,
+    payload: Mapping[str, JsonValue],
+) -> ArtifactRef:
+    data = _canonical_json_bytes(payload)
+    digest = hashlib.sha256(data).hexdigest()
+    return _publish_idempotent_json(
+        artifacts, f"{path_prefix}/{digest}.json", payload
+    )
 
 
 async def _run_with_runtime_recovery(
@@ -195,7 +240,9 @@ async def run_flame_search(
             "prediction": prediction.model_dump(mode="json"),
             "evaluation": preflight_evaluation.model_dump(mode="json"),
         }
-        preflight_ref = artifacts.publish_json("preflight/flame.json", preflight_payload)
+        preflight_ref = _publish_idempotent_json(
+            artifacts, "preflight/flame.json", preflight_payload
+        )
         if preflight_only:
             return {
                 "run_id": run_id,
@@ -290,7 +337,10 @@ async def run_flame_search(
                 },
                 failure_threshold=task.spec.retry.consecutive_failures_before_resample,
             )
-            return await runner.run(iterations=EXPECTED_ITERATIONS)
+            return await runner.run(
+                iterations=EXPECTED_ITERATIONS,
+                resume_paused=True,
+            )
 
         result = await _run_with_runtime_recovery(
             lambda: LocalCodexRuntime(model=task.spec.agent.model),
@@ -311,7 +361,9 @@ async def run_flame_search(
             "best": task.plugins.task_adapter.summarize_best(result.final_snapshot.gbest),
             "preflight": preflight_ref.model_dump(mode="json"),
         }
-        summary_ref = artifacts.publish_json("reports/flame-summary.json", summary)
+        summary_ref = _publish_content_addressed_json(
+            artifacts, "reports/flame-summary", summary
+        )
         return {**summary, "summary_artifact": summary_ref.model_dump(mode="json")}
     finally:
         for tool in tools:

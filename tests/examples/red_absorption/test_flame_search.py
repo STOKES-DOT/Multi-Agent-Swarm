@@ -6,6 +6,7 @@ import pytest
 
 import examples.red_absorption.flame_search as flame_search_module
 from multi_agent_pso.runtimes import CodexTransportInterruptedError
+from multi_agent_pso.storage import FileArtifactStore
 
 
 class FakeRuntime:
@@ -14,6 +15,36 @@ class FakeRuntime:
 
     async def close(self) -> None:
         self.close_calls += 1
+
+
+def test_matching_fixed_flame_artifact_is_reused(tmp_path) -> None:
+    artifacts = FileArtifactStore(tmp_path)
+    payload = {"schema_version": "test:v1", "passed": True}
+
+    first = flame_search_module._publish_idempotent_json(
+        artifacts, "preflight/flame.json", payload
+    )
+    second = flame_search_module._publish_idempotent_json(
+        artifacts, "preflight/flame.json", payload
+    )
+
+    assert second == first
+    assert artifacts.read_json(second) == payload
+
+
+def test_changed_flame_summaries_use_distinct_content_paths(tmp_path) -> None:
+    artifacts = FileArtifactStore(tmp_path)
+
+    paused = flame_search_module._publish_content_addressed_json(
+        artifacts, "reports/flame-summary", {"completed_iterations": 6}
+    )
+    resumed = flame_search_module._publish_content_addressed_json(
+        artifacts, "reports/flame-summary", {"completed_iterations": 7}
+    )
+
+    assert paused.relative_path != resumed.relative_path
+    assert paused.relative_path.startswith("reports/flame-summary/")
+    assert resumed.relative_path.startswith("reports/flame-summary/")
 
 
 @pytest.mark.asyncio

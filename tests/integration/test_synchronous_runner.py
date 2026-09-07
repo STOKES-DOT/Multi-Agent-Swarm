@@ -439,6 +439,36 @@ async def test_no_success_generation_commits_pause_and_stops(tmp_path) -> None:
     assert latest["run_status"] == RunStatus.PAUSED_NO_SUCCESS.value
 
 
+@pytest.mark.asyncio
+async def test_explicit_paused_resume_attempts_exactly_one_new_generation(tmp_path) -> None:
+    runner = make_fake_runner(tmp_path, delays={}, seed=12, succeed=False)
+    first = await runner.run(iterations=3)
+    assert first.final_snapshot.run_status is RunStatus.PAUSED_NO_SUCCESS
+    assert first.final_snapshot.iteration_id == 1
+
+    resumed_calls = []
+
+    class SuccessfulLoop:
+        async def run_particle(
+            self, run_id, particle_id, iteration_id, *, resume=None
+        ):
+            resumed_calls.append((particle_id, iteration_id))
+            return _episode(
+                particle_id,
+                iteration_id,
+                quality=1,
+                continuation_state={"retried": True},
+            )
+
+    runner.episode_factory = lambda target: SuccessfulLoop()
+
+    result = await runner.run(iterations=2, resume_paused=True)
+
+    assert result.final_snapshot.iteration_id == 2
+    assert result.final_snapshot.run_status is RunStatus.COMPLETED
+    assert resumed_calls == [("p0", 1), ("p1", 1)]
+
+
 @pytest.mark.parametrize("iterations", [0, -1, True, 1.0])
 async def test_runner_requires_positive_exact_integer_target(tmp_path, iterations) -> None:
     runner = make_fake_runner(tmp_path, delays={}, seed=47)
