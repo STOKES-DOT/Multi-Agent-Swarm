@@ -30,6 +30,7 @@ plugins:
   tool_provider: examples.red_absorption.flame_adapter:create_flame_tool_provider
   source_files:
     - adapter.py
+    - similarity.py
     - flame_adapter.py
     - flame_inputs.py
     - flame_proxy.py

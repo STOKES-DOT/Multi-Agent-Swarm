@@ -11,9 +11,16 @@ from pathlib import Path
 from multi_agent_pso.core import AgentStage, ArtifactRef
 from multi_agent_pso.protocols import CandidateRef, ToolContext, ToolResult, ToolStatus
 
-from .adapter import RedAbsorptionTaskAdapter, _HASH, _plain, create_position_space
+from .adapter import (
+    RedAbsorptionTaskAdapter,
+    _HASH,
+    _plain,
+    _validated_parent_similarity,
+    create_position_space,
+)
 from .flame_proxy import FLAME_PROXY_EVALUATOR_VERSION, FlamePrediction, FlameProxyEvaluator
 from .flame_workflow import flame_input_hash
+from .similarity import PARENT_SIMILARITY_METHOD
 
 
 class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
@@ -48,6 +55,7 @@ class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
         candidate_hash = payload.get("chemical_identity_hash")
         canonical_smiles = payload.get("canonical_isomeric_smiles")
         commands = payload.get("committed_commands")
+        parent_similarity = _validated_parent_similarity(payload)
         rollback = payload.get("rollback")
         rolled_back = isinstance(rollback, dict) and rollback.get("performed") is True
         try:
@@ -145,6 +153,8 @@ class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
             "cache_key": cache_key,
             "cache_hit": payload["cache_hit"],
             "flame_attempts": flame_attempts,
+            "parent_similarity": parent_similarity,
+            "parent_similarity_method": PARENT_SIMILARITY_METHOD,
             "molecule_artifact": molecule_artifact.model_dump(mode="json"),
             "continuation_state": {
                 "kind": "canonical_smiles",

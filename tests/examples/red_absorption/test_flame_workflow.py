@@ -20,6 +20,10 @@ from examples.red_absorption.flame_workflow import (
     FlameWorkflowToolProvider,
     flame_cache_key,
 )
+from examples.red_absorption.similarity import (
+    PARENT_SIMILARITY_METHOD,
+    parent_morgan_similarity,
+)
 from multi_agent_pso.core import AgentStage, ArtifactRef, EvaluationStatus
 from multi_agent_pso.core.topology import RingTopology
 from multi_agent_pso.core.update_rule import ConstrictedUpdateRule
@@ -139,6 +143,8 @@ def chemical_only_payload(
         "parent_state_hash": PARENT_HASH,
         "committed_commands": [],
         "canonical_isomeric_smiles": smiles,
+        "parent_similarity": 0.5,
+        "parent_similarity_method": PARENT_SIMILARITY_METHOD,
     }
 
 
@@ -177,7 +183,7 @@ def authorized_request(tmp_path: Path, *, attempt: int = 0):
     payload = {
         "inspected_source_hash": PARENT_HASH,
         "commands": commands,
-        "target_position": [0.0] * 8,
+        "target_position": [0.0] * 7,
         "edit_budget": 1,
         "fragment_heavy_atom_cap": 1,
         "operation_policy": {
@@ -236,6 +242,14 @@ async def test_workflow_builds_flame_candidate_and_proxy_reward(tmp_path: Path):
 
     assert result.status is ToolStatus.SUCCESS
     assert candidate.candidate_hash == CANDIDATE_HASH
+    assert result.payload["parent_similarity"] == parent_morgan_similarity("C", "N")
+    assert result.payload["parent_similarity_method"] == PARENT_SIMILARITY_METHOD
+    assert candidate.metadata["parent_similarity"] == result.payload[
+        "parent_similarity"
+    ]
+    assert candidate.metadata["parent_similarity_method"] == (
+        PARENT_SIMILARITY_METHOD
+    )
     assert candidate.metadata["flame_attempts"] == 1
     assert candidate.metadata["continuation_state"]["canonical_isomeric_smiles"] == "N"
     assert candidate.metadata["continuation_state"]["molecule_artifact"] == (
@@ -672,7 +686,7 @@ async def test_stage_context_restores_artifact_backed_parent_without_smiles_rebu
         "particle_id": "p0",
         "iteration_id": 1,
         "protocol_snapshot_hash": "1" * 64,
-        "target_position": [0.0] * 8,
+        "target_position": [0.0] * 7,
         "parent_continuation_state": candidate.metadata["continuation_state"],
     }
 
@@ -771,7 +785,7 @@ async def test_stage_context_accepts_chemical_only_inheritance_artifact(
             "particle_id": "p0",
             "iteration_id": 1,
             "protocol_snapshot_hash": "1" * 64,
-            "target_position": [0.0] * 8,
+            "target_position": [0.0] * 7,
             "parent_continuation_state": continuation,
         },
         ToolContext(
@@ -793,7 +807,7 @@ async def test_stage_context_accepts_chemical_only_inheritance_artifact(
             "particle_id": "p0",
             "iteration_id": 1,
             "protocol_snapshot_hash": "1" * 64,
-            "target_position": [0.0] * 8,
+            "target_position": [0.0] * 7,
             **additions,
         },
     )
@@ -956,7 +970,7 @@ async def test_inherited_parent_skips_geometry_preparation(tmp_path: Path) -> No
         "commands": [
             {"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 8}
         ],
-        "target_position": [0.0] * 8,
+        "target_position": [0.0] * 7,
         "edit_budget": 1,
         "fragment_heavy_atom_cap": 1,
         "operation_policy": {
@@ -1100,6 +1114,8 @@ async def test_third_rejection_rolls_back_and_evaluates_parent(tmp_path: Path):
     assert third.payload["chemical_identity_hash"] == "f" * 64
     assert third.payload["canonical_isomeric_smiles"] == "C"
     assert third.payload["committed_commands"] == ()
+    assert third.payload["parent_similarity"] == 1.0
+    assert third.payload["parent_similarity_method"] == PARENT_SIMILARITY_METHOD
     assert command.calls[0][0]["dye_smiles"] == "C"
     assert len(command.calls) == 1
     assert len(third.artifacts) == 1

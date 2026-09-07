@@ -14,6 +14,7 @@ from examples.red_absorption.adapter import (
 from examples.red_absorption.evaluator import RedAbsorptionEvaluator
 from examples.red_absorption.models import SpectrumResult
 from examples.red_absorption.stage_context import RedAbsorptionStageContextProvider
+from examples.red_absorption.similarity import PARENT_SIMILARITY_METHOD
 from examples.red_absorption.workflow import (
     RedAbsorptionWorkflowResources,
     RedAbsorptionWorkflowToolProvider,
@@ -108,17 +109,21 @@ class FakeEditor:
         )
         geometry_status = "READY" if geometry is not None else "NOT_REQUESTED"
         inspected_graph["geometry_status"] = geometry_status
+        canonical_smiles = (
+            source.get("value")
+            if source.get("kind") == "smiles"
+            else ("N" if inspected_graph.get("state_hash") == HASH else "C")
+        )
+        payload = {"canonical_isomeric_smiles": canonical_smiles}
+        if geometry is not None:
+            payload["geometry_hash"] = geometry_hash
         return SimpleNamespace(
             processed=True,
             chemical_status="VALID",
             geometry_status=geometry_status,
             ready_for_evaluator=geometry is not None,
             candidate=inspected_graph,
-            payload=(
-                {"geometry_hash": geometry_hash}
-                if geometry is not None
-                else {}
-            ),
+            payload=payload,
         )
 
     async def edit(
@@ -306,7 +311,7 @@ def authorized_request_context(commands, workspace: Path):
     payload = {
         "inspected_source_hash": PARENT_HASH,
         "commands": commands,
-        "target_position": [0.0] * 8,
+        "target_position": [0.0] * 7,
         "edit_budget": 1,
         "fragment_heavy_atom_cap": 1,
         "operation_policy": {
@@ -588,6 +593,12 @@ async def test_three_by_two_red_absorption_flow_is_audited_and_cached(tmp_path: 
             if event.stage is AgentStage.EXECUTING and event.event_type == "completed"
         )
         cache_hits.append(executing.payload["tool_result"]["payload"]["cache_hit"])
+        similarity_payload = executing.payload["tool_result"]["payload"]
+        assert 0.0 <= similarity_payload["parent_similarity"] <= 1.0
+        assert (
+            similarity_payload["parent_similarity_method"]
+            == PARENT_SIMILARITY_METHOD
+        )
         hypothesis_event = next(
             event
             for event in episode.events

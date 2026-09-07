@@ -20,7 +20,7 @@ dev = [
   "packaging>=24",
 ]
 codex = ["openai-codex>=0.147"]
-molecule = ["networkx>=3.0"]
+molecule = ["networkx>=3.0", "rdkit>=2024.3"]
 quantum = ["pyscf==2.9.0", "geometric==1.1.1"]
 
 [project.scripts]

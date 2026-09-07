@@ -536,6 +536,8 @@ Expected: collection fails because adapter and task package are missing.
 
 - [ ] **Step 3: Implement the task-owned search position**
 
+> Superseded on 2026-09-07 by `2026-09-07-parent-similarity-position.md`: the two unmeasured evidence/novelty coordinates are replaced by one externally measured RDKit parent-similarity coordinate, reducing this task position from eight to seven dimensions.
+
 Use an eight-dimensional `ContinuousBoxPositionSpace` with normalized `[0, 1]` bounds and stable dimension names:
 
 ```text

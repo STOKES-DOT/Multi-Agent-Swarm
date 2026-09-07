@@ -19,6 +19,7 @@ from examples.red_absorption.models import (
     SpectrumProvenance,
     SpectrumResult,
 )
+from examples.red_absorption.similarity import PARENT_SIMILARITY_METHOD
 from multi_agent_pso.core import AgentStage, Evaluation, EvaluationStatus
 from multi_agent_pso.protocols import (
     StageResponse,
@@ -61,6 +62,8 @@ def spectrum_fields() -> dict[str, object]:
         "spectrum_result": spectrum.model_dump(mode="json"),
         "cache_key": key,
         "cache_hit": False,
+        "parent_similarity": 0.5,
+        "parent_similarity_method": PARENT_SIMILARITY_METHOD,
     }
 
 
@@ -126,7 +129,7 @@ def context(**updates: object) -> dict[str, object]:
         "particle_id": "p0",
         "iteration_id": 0,
         "protocol_snapshot_hash": HASH,
-        "target_position": [0.0] * 8,
+        "target_position": [0.0] * 7,
         "wiki_query": {
             "text": "conjugation red shift",
             "max_results": 5,
@@ -186,7 +189,7 @@ def hypothesis() -> dict[str, object]:
     }
 
 
-def test_position_space_and_decode_have_exact_eight_dimensions() -> None:
+def test_position_space_and_decode_have_exact_seven_dimensions() -> None:
     space = create_position_space()
     assert DIMENSION_NAMES == (
         "edit_scale",
@@ -195,14 +198,13 @@ def test_position_space_and_decode_have_exact_eight_dimensions() -> None:
         "change_bond_weight",
         "attach_fragment_weight",
         "substitute_fragment_weight",
-        "evidence_exploitation",
-        "novelty",
+        "parent_similarity_target",
     )
-    assert space.lower.tolist() == [0.0] * 8
-    assert space.upper.tolist() == [1.0] * 8
+    assert space.lower.tolist() == [0.0] * 7
+    assert space.upper.tolist() == [1.0] * 7
     adapter = RedAbsorptionTaskAdapter()
-    low = adapter.decode_position([0.0] * 8)
-    high = adapter.decode_position([1.0] * 8)
+    low = adapter.decode_position([0.0] * 7)
+    high = adapter.decode_position([1.0] * 7)
     assert (low["edit_budget"], low["fragment_heavy_atoms"]) == (1, 1)
     assert (high["edit_budget"], high["fragment_heavy_atoms"]) == (3, 8)
     assert low["operation_weights"] == {
@@ -211,6 +213,10 @@ def test_position_space_and_decode_have_exact_eight_dimensions() -> None:
         "attach_fragment": 0.25,
         "substitute_fragment": 0.25,
     }
+    assert low["parent_similarity_target"] == 0.0
+    assert high["parent_similarity_target"] == 1.0
+    with pytest.raises(ValueError, match="seven numeric dimensions"):
+        adapter.decode_position([0.0] * 8)
 
 
 def test_strict_response_strips_only_reward_authority() -> None:
@@ -344,6 +350,18 @@ def test_proposal_prompt_requires_error_specific_reproposal() -> None:
     assert "different site or operation" in request.prompt
 
 
+def test_proposal_prompt_defines_parent_similarity_target() -> None:
+    request = RedAbsorptionTaskAdapter().build_stage_request(
+        AgentStage.PROPOSING_ACTION,
+        context(target_position=[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.9]),
+    )
+
+    assert "parent_similarity_target" in request.prompt
+    assert "near 1" in request.prompt
+    assert "near 0" in request.prompt
+    assert "RDKit" in request.prompt
+
+
 def test_proposal_response_drops_nullable_optional_command_fields() -> None:
     adapter = RedAbsorptionTaskAdapter()
     proposal = {
@@ -419,11 +437,12 @@ def test_candidate_realized_adherence_and_compare() -> None:
         "chemical_identity_hash": HASH2,
         "state_hash": HASH,
     }
-    assert realized is not None and len(realized) == 8
+    assert realized is not None and len(realized) == 7
+    assert realized[6] == 0.5
     adherence = adapter.position_adherence(
-        [1, 0.5, 0.4, 0.1, 0.4, 0.1, 0.8, 0.2], realized
+        [1, 0.5, 0.4, 0.1, 0.4, 0.1, 0.8], realized
     )
-    assert adherence["approximate_dimensions"] == ["evidence_exploitation", "novelty"]
+    assert adherence["approximate_dimensions"] == []
     feasible = Evaluation(status=EvaluationStatus.SUCCESS, feasible=True, fitness=1)
     infeasible = Evaluation(
         status=EvaluationStatus.SUCCESS, feasible=False, fitness=100
@@ -495,14 +514,14 @@ def test_agent_cannot_supply_target_budget_or_unsupported_operations() -> None:
     for mutation in ("target", "add_atom", "oversized_fragment", "zero_weight"):
         values = context(
             target_position=(
-                [0, 0, 0, 1, 0, 0, 0, 0] if mutation == "zero_weight" else [0] * 8
+                [0, 0, 0, 1, 0, 0, 0] if mutation == "zero_weight" else [0] * 7
             )
         )
         token = authorize(adapter, AgentStage.PROPOSING_ACTION, values)
         command = {"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}
         payload = {"inspected_source_hash": HASH, "commands": [command]}
         if mutation == "target":
-            payload["target_position"] = [1] * 8
+            payload["target_position"] = [1] * 7
         elif mutation == "add_atom":
             payload["commands"] = [
                 {"operation": "add_atom", "client_ref": "@x", "atomic_number": 6}
@@ -533,7 +552,7 @@ def test_agent_cannot_supply_target_budget_or_unsupported_operations() -> None:
 
 def test_candidate_uses_authorized_target_and_rejects_self_report() -> None:
     adapter = RedAbsorptionTaskAdapter()
-    target = [0, 0, 1, 0, 0, 0, 0.2, 0.8]
+    target = [0, 0, 1, 0, 0, 0, 0.8]
     commands = [{"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}]
     token = authorize(
         adapter, AgentStage.PROPOSING_ACTION, context(target_position=target)
@@ -564,7 +583,7 @@ def test_candidate_uses_authorized_target_and_rejects_self_report() -> None:
         "committed_commands": commands,
     }
     base.update(spectrum_fields())
-    forged = {**base, "target_position": [1] * 8}
+    forged = {**base, "target_position": [1] * 7}
     with pytest.raises(ValueError):
         adapter.candidate_from_tool_result(
             ToolResult(ToolStatus.SUCCESS, forged), tool_context
@@ -573,8 +592,92 @@ def test_candidate_uses_authorized_target_and_rejects_self_report() -> None:
         ToolResult(ToolStatus.SUCCESS, base), tool_context
     )
     realized = adapter.realized_position(candidate)
-    assert realized[6:] == [0.2, 0.8]
-    assert adapter.evaluated_position(target, [1] * 8)[6:] == [0.2, 0.8]
+    assert candidate.metadata["target_position"] == tuple(target)
+    assert realized[6] == 0.5
+    assert adapter.evaluated_position(target, [1] * 7)[6] == 1.0
+
+
+@pytest.mark.parametrize("similarity", [-0.1, 1.1, float("nan"), 1, True])
+def test_candidate_rejects_invalid_parent_similarity(similarity: object) -> None:
+    adapter = RedAbsorptionTaskAdapter()
+    commands = [
+        {"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}
+    ]
+    proposal = {
+        "authorization_id": authorize(
+            adapter, AgentStage.PROPOSING_ACTION, context()
+        ),
+        "provider": "molecule_editor",
+        "operation": "edit",
+        "tool_payload": {"inspected_source_hash": HASH, "commands": commands},
+    }
+    parsed = adapter.parse_stage_response(
+        AgentStage.PROPOSING_ACTION, response(proposal)
+    )
+    payload = {
+        "chemical_status": "VALID",
+        "state_hash": HASH,
+        "chemical_identity_hash": HASH2,
+        "parent_state_hash": HASH,
+        "committed_commands": commands,
+        **spectrum_fields(),
+        "parent_similarity": similarity,
+    }
+    tool_context = ToolContext(
+        "r",
+        "p0",
+        0,
+        AgentStage.EXECUTING,
+        0,
+        Path.cwd().resolve(),
+        metadata={"proposal": parsed},
+    )
+
+    with pytest.raises(ValueError):
+        adapter.candidate_from_tool_result(
+            ToolResult(ToolStatus.SUCCESS, payload), tool_context
+        )
+
+
+def test_candidate_rejects_parent_similarity_method_mismatch() -> None:
+    adapter = RedAbsorptionTaskAdapter()
+    commands = [
+        {"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}
+    ]
+    proposal = {
+        "authorization_id": authorize(
+            adapter, AgentStage.PROPOSING_ACTION, context()
+        ),
+        "provider": "molecule_editor",
+        "operation": "edit",
+        "tool_payload": {"inspected_source_hash": HASH, "commands": commands},
+    }
+    parsed = adapter.parse_stage_response(
+        AgentStage.PROPOSING_ACTION, response(proposal)
+    )
+    payload = {
+        "chemical_status": "VALID",
+        "state_hash": HASH,
+        "chemical_identity_hash": HASH2,
+        "parent_state_hash": HASH,
+        "committed_commands": commands,
+        **spectrum_fields(),
+        "parent_similarity_method": "unversioned",
+    }
+    tool_context = ToolContext(
+        "r",
+        "p0",
+        0,
+        AgentStage.EXECUTING,
+        0,
+        Path.cwd().resolve(),
+        metadata={"proposal": parsed},
+    )
+
+    with pytest.raises(ValueError, match="parent similarity"):
+        adapter.candidate_from_tool_result(
+            ToolResult(ToolStatus.SUCCESS, payload), tool_context
+        )
 
 
 @pytest.mark.asyncio
@@ -675,7 +778,7 @@ def test_adapter_preloads_assets_and_fresh_adapter_resumes_from_proposal(
 
 def test_realized_fragment_dimension_uses_transaction_total_heavy_atoms() -> None:
     adapter = RedAbsorptionTaskAdapter()
-    target = [0.34, 0.375, 0, 0, 1, 0, 0.2, 0.8]
+    target = [0.34, 0.375, 0, 0, 1, 0, 0.8]
     fragment = graph()
     commands = [
         {

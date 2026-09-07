@@ -35,6 +35,7 @@ plugins:
     - preflight.py
     - search.py
     - models.py
+    - similarity.py
     - geometry.py
     - evaluator.py
     - backends/__init__.py

@@ -37,6 +37,7 @@ from multi_agent_pso.tools import validate_commands, validate_source
 
 from .evaluator import EVALUATOR_VERSION, RedAbsorptionEvaluator
 from .models import SpectrumResult
+from .similarity import PARENT_SIMILARITY_METHOD
 from .workflow import RedAbsorptionWorkflowToolProvider
 
 
@@ -47,8 +48,7 @@ DIMENSION_NAMES = (
     "change_bond_weight",
     "attach_fragment_weight",
     "substitute_fragment_weight",
-    "evidence_exploitation",
-    "novelty",
+    "parent_similarity_target",
 )
 _OPERATIONS = ("replace_atom", "change_bond", "attach_fragment", "substitute_fragment")
 _HASH = re.compile(r"^[0-9a-f]{64}$")
@@ -124,6 +124,18 @@ def _pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def _validated_parent_similarity(payload: Mapping[str, object]) -> float:
+    similarity = payload.get("parent_similarity")
+    if (
+        type(similarity) is not float
+        or not math.isfinite(similarity)
+        or not 0.0 <= similarity <= 1.0
+        or payload.get("parent_similarity_method") != PARENT_SIMILARITY_METHOD
+    ):
+        raise ValueError("candidate parent similarity is invalid")
+    return similarity
+
+
 class RedAbsorptionTaskAdapter:
     dimension_names = DIMENSION_NAMES
 
@@ -166,8 +178,8 @@ class RedAbsorptionTaskAdapter:
 
     def decode_position(self, position: object) -> dict[str, JsonValue]:
         raw = np.asarray(position)
-        if raw.shape != (8,) or raw.dtype.kind not in "iuf":
-            raise ValueError("position must have eight numeric dimensions")
+        if raw.shape != (7,) or raw.dtype.kind not in "iuf":
+            raise ValueError("position must have seven numeric dimensions")
         values = np.array(raw, dtype=np.float64)
         if not np.all(np.isfinite(values)) or np.any(values < 0) or np.any(values > 1):
             raise ValueError("position must be normalized")
@@ -182,8 +194,7 @@ class RedAbsorptionTaskAdapter:
                 for name, weight in zip(_OPERATIONS, normalized, strict=True)
             },
             "operation_weights_were_zero": total == 0,
-            "evidence_exploitation": float(values[6]),
-            "novelty": float(values[7]),
+            "parent_similarity_target": float(values[6]),
         }
 
     def build_stage_request(
@@ -580,6 +591,7 @@ class RedAbsorptionTaskAdapter:
         candidate_hash = payload.get("chemical_identity_hash")
         canonical_smiles = payload.get("canonical_isomeric_smiles")
         commands = payload.get("committed_commands")
+        parent_similarity = _validated_parent_similarity(payload)
         try:
             spectrum = SpectrumResult.model_validate(payload.get("spectrum_result"))
         except (TypeError, ValueError) as error:
@@ -655,6 +667,8 @@ class RedAbsorptionTaskAdapter:
             "spectrum_result": spectrum.model_dump(mode="json"),
             "cache_key": list(expected_cache_key),
             "cache_hit": payload["cache_hit"],
+            "parent_similarity": parent_similarity,
+            "parent_similarity_method": PARENT_SIMILARITY_METHOD,
             "continuation_state": {
                 "kind": "canonical_smiles",
                 "canonical_isomeric_smiles": canonical_smiles,
@@ -667,7 +681,10 @@ class RedAbsorptionTaskAdapter:
     def realized_position(self, candidate: CandidateRef) -> list[float] | None:
         commands = candidate.metadata.get("committed_commands")
         target = candidate.metadata.get("target_position")
+        parent_similarity = candidate.metadata.get("parent_similarity")
         if not isinstance(commands, tuple) or not isinstance(target, tuple):
+            return None
+        if type(parent_similarity) is not float:
             return None
         counts = {name: 0 for name in _OPERATIONS}
         fragments = []
@@ -699,8 +716,7 @@ class RedAbsorptionTaskAdapter:
             min(1, max(0, (total - 1) / 2)),
             min(1, max(0, (fragment - 1) / 7)),
             *weights,
-            float(decoded["evidence_exploitation"]),
-            float(decoded["novelty"]),
+            parent_similarity,
         ]
 
     def evaluated_position(
@@ -709,10 +725,7 @@ class RedAbsorptionTaskAdapter:
         self.decode_position(target)
         if realized is not None:
             self.decode_position(realized)
-        result = list(target if realized is None else realized)
-        result[6] = target[6]
-        result[7] = target[7]
-        return result
+        return list(target if realized is None else realized)
 
     def position_adherence(
         self, target: list[float], realized: list[float] | None
@@ -725,7 +738,7 @@ class RedAbsorptionTaskAdapter:
             "absolute_error": [
                 abs(float(a) - float(b)) for a, b in zip(target, actual, strict=True)
             ],
-            "approximate_dimensions": ["evidence_exploitation", "novelty"],
+            "approximate_dimensions": [],
         }
 
     def compare(self, left: Evaluation, right: Evaluation) -> int:
@@ -759,7 +772,7 @@ class RedAbsorptionTaskAdapter:
 
 
 def create_position_space() -> ContinuousBoxPositionSpace:
-    return ContinuousBoxPositionSpace(np.zeros(8), np.ones(8))
+    return ContinuousBoxPositionSpace(np.zeros(7), np.ones(7))
 
 
 def create_task_adapter() -> RedAbsorptionTaskAdapter:

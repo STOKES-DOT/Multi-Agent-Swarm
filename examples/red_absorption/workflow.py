@@ -17,6 +17,7 @@ from .evaluator import EVALUATOR_VERSION
 from .geometry import EvaluatedGeometry, GeometryAtom
 from .inputs import RedAbsorptionRunInputs
 from .models import SpectrumResult
+from .similarity import PARENT_SIMILARITY_METHOD, parent_morgan_similarity
 
 
 CacheKey = tuple[str, str, str, str]
@@ -630,6 +631,17 @@ class RedAbsorptionWorkflowToolProvider:
             return ToolResult(
                 ToolStatus.FAILED, error="edited candidate identity is invalid"
             )
+        parent_smiles = inspection.payload.get("canonical_isomeric_smiles")
+        child_smiles = payload.get("canonical_isomeric_smiles")
+        try:
+            parent_similarity = parent_morgan_similarity(
+                parent_smiles, child_smiles
+            )
+        except (TypeError, ValueError) as error:
+            return ToolResult(
+                ToolStatus.FAILED,
+                error=f"parent similarity failed: {type(error).__name__}",
+            )
         key: CacheKey = (
             chemical_hash,
             geometry_hash,
@@ -853,6 +865,8 @@ class RedAbsorptionWorkflowToolProvider:
                 "cache_key": list(key),
                 "cache_hit": cache_hit,
                 "spectrum_process": spectrum_process,
+                "parent_similarity": parent_similarity,
+                "parent_similarity_method": PARENT_SIMILARITY_METHOD,
             }
         )
         return ToolResult(ToolStatus.SUCCESS, result_payload)

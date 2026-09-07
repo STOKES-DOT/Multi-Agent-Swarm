@@ -23,6 +23,7 @@ from multi_agent_pso.tools import JsonCommandStatus
 
 from .flame_inputs import FlameRunInputs
 from .flame_proxy import FLAME_PROXY_EVALUATOR_VERSION, FlamePrediction
+from .similarity import PARENT_SIMILARITY_METHOD, parent_morgan_similarity
 from .workflow import _plain_json
 
 
@@ -409,7 +410,34 @@ class FlameWorkflowToolProvider:
                     rejection_detail=rejection_detail,
                 )
             return ToolResult(ToolStatus.REJECTED, error=rejection_detail)
-        return await self._evaluate_payload(_plain_json(edit.payload), context)
+        edited_payload = _plain_json(edit.payload)
+        parent_payload = parent_record if parent_record is not None else inspection.payload
+        parent_smiles = (
+            parent_payload.get("canonical_isomeric_smiles")
+            if isinstance(parent_payload, Mapping)
+            else None
+        )
+        child_smiles = (
+            edited_payload.get("canonical_isomeric_smiles")
+            if isinstance(edited_payload, dict)
+            else None
+        )
+        try:
+            parent_similarity = parent_morgan_similarity(
+                parent_smiles, child_smiles
+            )
+        except (TypeError, ValueError) as error:
+            return ToolResult(
+                ToolStatus.FAILED,
+                error=f"parent similarity failed: {type(error).__name__}",
+            )
+        edited_payload.update(
+            {
+                "parent_similarity": parent_similarity,
+                "parent_similarity_method": PARENT_SIMILARITY_METHOD,
+            }
+        )
+        return await self._evaluate_payload(edited_payload, context)
 
     async def _evaluate_rollback_parent(
         self,
@@ -479,6 +507,8 @@ class FlameWorkflowToolProvider:
                 "committed_commands": [],
                 "canonical_isomeric_smiles": smiles,
                 "rollback": {**rollback, "rejected_commands": commands},
+                "parent_similarity": 1.0,
+                "parent_similarity_method": PARENT_SIMILARITY_METHOD,
             }
         )
         return await self._evaluate_payload(
@@ -572,6 +602,8 @@ class FlameWorkflowToolProvider:
             "cache_key": list(key),
             "cache_hit": cache_hit,
             "flame_attempts": flame_attempts,
+            "parent_similarity": payload["parent_similarity"],
+            "parent_similarity_method": payload["parent_similarity_method"],
             "molecule_artifact": artifact.model_dump(mode="json"),
         }
         if rollback is not None:
