@@ -1021,7 +1021,7 @@ async def test_workflow_externalizes_full_molecule_result_as_artifact(tmp_path: 
         async def edit(self, *args, **kwargs):
             result = await super().edit(*args, **kwargs)
             result.payload["large_diagnostics"] = [
-                {"atom": index, "score": float(index)} for index in range(3_500)
+                {"atom": index, "score": float(index)} for index in range(35_000)
             ]
             return result
 
@@ -1058,7 +1058,7 @@ async def test_workflow_externalizes_full_molecule_result_as_artifact(tmp_path: 
     stored = json.loads(
         (artifact_root / molecule_artifact.relative_path).read_text(encoding="utf-8")
     )
-    with pytest.raises(ValueError, match="node limit exceeded"):
+    with pytest.raises(ValueError, match="JSON boundary rejected"):
         _bounded_json_copy(stored, boundary="large molecule artifact")
     _bounded_json_copy(result.to_json(), boundary="compact FLAME tool result")
     assert stored["graph"]["chemical_identity_hash"] == CANDIDATE_HASH

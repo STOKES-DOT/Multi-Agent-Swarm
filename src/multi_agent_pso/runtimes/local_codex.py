@@ -19,7 +19,8 @@ from multi_agent_pso.protocols import StageRequest, StageResponse, ThreadRef, To
 
 _JSON_LIMIT = 256 * 1024
 _JSON_MAX_DEPTH = 32
-_JSON_MAX_NODES = 10_000
+# Match AgentLoop's dense-checkpoint budget so persisted state can be restored.
+_JSON_MAX_NODES = 100_000
 _JSON_MAX_COLLECTION_ITEMS = 4_096
 _SANDBOXES = {"workspace-write", "read-only"}
 LOCAL_CODEX_RUNTIME_VERSION = 1

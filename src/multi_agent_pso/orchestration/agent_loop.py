@@ -59,7 +59,9 @@ _AGENT_SCHEMA_ATTEMPTS = 3
 _MAX_PROPOSAL_ATTEMPTS = 3
 V1_JSON_MAX_UTF8_BYTES = 256 * 1024
 V1_JSON_MAX_DEPTH = 32
-V1_JSON_MAX_NODES = 10_000
+# Molecular graphs repeat in proposals, candidates, and recovery context.
+# Keep the 256 KiB byte bound; allow dense JSON within that bound.
+V1_JSON_MAX_NODES = 100_000
 V1_JSON_MAX_COLLECTION_ITEMS = 4_096
 V1_IDENTIFIER_MAX_UTF8_BYTES = 512
 _TEXT_CHUNK_CHARACTERS = 16_384

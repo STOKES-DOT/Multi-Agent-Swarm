@@ -1809,7 +1809,7 @@ async def test_audit_base_exception_without_primary_propagates_original(
 def test_v1_json_boundary_constants_are_explicit() -> None:
     assert agent_loop_module.V1_JSON_MAX_UTF8_BYTES == 256 * 1024
     assert agent_loop_module.V1_JSON_MAX_DEPTH == 32
-    assert agent_loop_module.V1_JSON_MAX_NODES == 10_000
+    assert agent_loop_module.V1_JSON_MAX_NODES == 100_000
     assert agent_loop_module.V1_JSON_MAX_COLLECTION_ITEMS == 4_096
     assert agent_loop_module.V1_IDENTIFIER_MAX_UTF8_BYTES == 512
 
