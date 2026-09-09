@@ -1,0 +1,33 @@
+parent:
+  kind: smiles
+  value: CC(=O)C=Cc1c(N(C)C)cc2c(=O)c3c(C=C(C#N)C#N)cccc3n3c4ccccc4c(=O)c1c23
+  charge: 0
+  multiplicity: 1
+  protected_atom_ids: []
+  protected_smarts: []
+geometry:
+  num_conformers: 1
+  random_seed: 42
+  max_iterations: 200
+  rmsd_threshold_angstrom: 0.2
+flame_argv:
+  - /opt/anaconda3/envs/multi-agent-pso/bin/python
+  - /Users/jiaoyuan/Documents/GitHub/Multi-Agent-PSO/.worktrees/fix-editor-canonical-commands/examples/red_absorption/backends/flame_flsf.py
+flame_backend:
+  repository_path: /Users/jiaoyuan/Documents/GitHub/olde_ml/FLAME-main
+  runner_path: /Users/jiaoyuan/Documents/GitHub/olde_ml/test/flame/scripts/run_flsf.py
+  python_path: /Users/jiaoyuan/Documents/GitHub/olde_ml/test/flame/.venv/bin/python
+  model_directories:
+    abs: /Users/jiaoyuan/Documents/GitHub/olde_ml/test/flame/model/flsf/FluoDB_abs
+    emi: /Users/jiaoyuan/Documents/GitHub/olde_ml/test/flame/model/flsf/FluoDB_emi
+    plqy: /Users/jiaoyuan/Documents/GitHub/olde_ml/test/flame/model/flsf/FluoDB_plqy
+    e: /Users/jiaoyuan/Documents/GitHub/olde_ml/test/flame/model/flsf/FluoDB_e
+  model_hashes:
+    abs: 046547fc2984dee36fac9f10e194dc0a9f42a71e5c2aa60b377144f17e709169
+    emi: 1bfbd8ec5a6ba6f773cde7055a552bac2b970ab98cbc191f3ba71e8e05576332
+    plqy: fe420b98586cf1075f9c76d7daa34e3bc390e498287f272935421452e0bbbc06
+    e: 49ac664fffd8a5da15f86bd4d737bdc2054f3e5c155e81c0480ec912ce633087
+  solvent_smiles: ClCCl
+  timeout_seconds: 120.0
+  max_attempts: 3
+evaluation_concurrency: 1
