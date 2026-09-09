@@ -20,7 +20,7 @@ from multi_agent_pso.protocols import (
     ToolStatus,
 )
 from multi_agent_pso.resources import BudgetClaimStatus, DurableBudgetLedger
-from multi_agent_pso.tools import JsonCommandStatus
+from multi_agent_pso.tools import JsonCommandStatus, canonicalize_commands
 
 from .flame_inputs import FlameRunInputs
 from .flame_proxy import FLAME_PROXY_EVALUATOR_VERSION, FlamePrediction
@@ -547,6 +547,13 @@ class FlameWorkflowToolProvider:
                 )
             return ToolResult(ToolStatus.REJECTED, error=rejection_detail)
         edited_payload = _plain_json(edit.payload)
+        try:
+            returned = canonicalize_commands(edited_payload['committed_commands'], graph)
+            expected = canonicalize_commands(authoritative['commands'], graph)
+            if returned != expected or edited_payload.get('parent_state_hash') != authoritative.get('inspected_source_hash'):
+                return ToolResult(ToolStatus.FAILED, error='MoleculeEditor authorization mismatch before FLAME')
+        except (KeyError, TypeError, ValueError):
+            return ToolResult(ToolStatus.FAILED, error='MoleculeEditor authorization mismatch before FLAME')
         parent_payload = parent_record if parent_record is not None else inspection.payload
         parent_smiles = (
             parent_payload.get("canonical_isomeric_smiles")

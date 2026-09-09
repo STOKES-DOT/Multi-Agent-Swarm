@@ -494,7 +494,7 @@ class MoleculeEditorProvider:
         registered = self._inspections.get(id(inspection))
         if registered is None or registered() is not inspection:
             raise ValueError("edit requires this provider's live inspection result; restart requires re-inspect")
-        checked = self._commands(commands, inspection.candidate)
+        checked = canonicalize_commands(commands, inspection.candidate)
         envelope = {"source": {"kind": "chemical_graph", "value": _plain(inspection.candidate)}, "commands": checked}
         if geometry is not None: envelope["geometry"] = self._geometry(geometry)
         if artifacts is not None: envelope["artifacts"] = self._artifacts(artifacts)
@@ -635,11 +635,47 @@ def validate_commands(
     return MoleculeEditorProvider._commands(commands, graph)
 
 
+def canonicalize_commands(
+    commands: Sequence[Mapping[str, object]], graph: Mapping[str, object]
+) -> list[dict[str, object]]:
+    """Validate and serialize with MoleculeEditor v1 command defaults.
+
+    This mirrors command serialization, not chemical sanitization. In particular,
+    replacement/change commands preserve omission semantics. An omitted atom_map
+    on replace_atom preserves the map, while explicit null clears it.
+    """
+    checked = validate_commands(_plain(commands), graph)
+    result = []
+    for command in checked:
+        if "client_ref" in command and command["client_ref"] is None:
+            raise ValueError("explicit null client_ref is not a CLI command")
+        operation = command["operation"]
+        if operation == "add_atom":
+            command = {
+                "isotope": 0, "formal_charge": 0, "radical_electrons": 0,
+                "chiral_tag": "CHI_UNSPECIFIED", "explicit_h_count": 0,
+                "no_implicit": False, "aromatic": False, "atom_map": None,
+                **command,
+            }
+        elif operation == "add_bond":
+            command = {
+                "aromatic": command["bond_type"] == "AROMATIC",
+                "conjugated": False, "stereo": "STEREONONE",
+                "stereo_atom_ids": [], "bond_direction": "NONE",
+                **command,
+            }
+        elif operation == "change_bond" and command["bond_type"] == "AROMATIC":
+            command = {"aromatic": True, **command}
+        result.append(command)
+    return result
+
+
 __all__ = [
     "MAX_EDIT_ATTEMPTS",
     "MOLECULE_EDITOR_SCRIPT",
     "MoleculeEditorProvider",
     "MoleculeEditorResult",
     "validate_commands",
+    "canonicalize_commands",
     "validate_source",
 ]

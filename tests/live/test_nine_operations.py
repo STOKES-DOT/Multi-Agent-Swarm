@@ -1,7 +1,7 @@
 """Small real-CLI transactions covering all nine editor operations, no geometry."""
 
 import pytest
-from multi_agent_pso.tools import MoleculeEditorProvider
+from multi_agent_pso.tools import MoleculeEditorProvider, canonicalize_commands
 
 
 @pytest.mark.live
@@ -126,6 +126,11 @@ async def test_nine_operations(kind, tmp_path):
             commands = [command]
         result = await editor.edit(parent, commands, cwd=tmp_path, geometry=None)
         assert result.chemical_status == "VALID", result.payload
+        # The original bug passed real chemistry tests but failed this comparison
+        # because AddAtom/AddBond serialization inserts defaults.
+        expected = canonicalize_commands(commands, parent.candidate)
+        actual = canonicalize_commands(result.payload['committed_commands'], parent.candidate)
+        assert actual == expected
         assert result.payload["parent_state_hash"] == parent.candidate["state_hash"]
         assert (
             result.payload["chemical_identity_hash"]

@@ -387,7 +387,7 @@ def test_proposal_prompt_defines_parent_similarity_target() -> None:
     assert "RDKit" in request.prompt
 
 
-def test_proposal_response_drops_nullable_optional_command_fields() -> None:
+def test_proposal_response_drops_placeholder_nulls_but_preserves_explicit_atom_map_clear() -> None:
     adapter = RedAbsorptionTaskAdapter()
     proposal = {
         "authorization_id": authorize(
@@ -419,7 +419,7 @@ def test_proposal_response_drops_nullable_optional_command_fields() -> None:
     )
 
     assert parsed["tool_payload"]["commands"] == [
-        {"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7}
+        {"operation": "replace_atom", "atom_id": "a0001", "atomic_number": 7, "atom_map": None}
     ]
 
 

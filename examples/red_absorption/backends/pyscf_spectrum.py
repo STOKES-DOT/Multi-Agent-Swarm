@@ -16,6 +16,10 @@ from pydantic import BaseModel, ConfigDict, Field
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+# Use the same checkout for examples and src, even when an editable installation
+# points at another worktree and the process starts in a particle workspace.
+if str(_PROJECT_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
 from examples.red_absorption.geometry import (
     EvaluatedGeometry,

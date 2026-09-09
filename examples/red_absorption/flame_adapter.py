@@ -10,6 +10,7 @@ from pathlib import Path
 
 from multi_agent_pso.core import AgentStage, ArtifactRef
 from multi_agent_pso.protocols import CandidateRef, ToolContext, ToolResult, ToolStatus
+from multi_agent_pso.tools import canonicalize_commands
 
 from .adapter import (
     RedAbsorptionTaskAdapter,
@@ -136,7 +137,8 @@ class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
         elif (
             payload.get("parent_state_hash")
             != authorized.get("inspected_source_hash")
-            or _plain(commands) != _plain(authorized.get("commands"))
+            or canonicalize_commands(commands, authorized["inspected_graph"])
+            != canonicalize_commands(authorized.get("commands"), authorized["inspected_graph"])
         ):
             raise ValueError("edited candidate authority is invalid")
         if (

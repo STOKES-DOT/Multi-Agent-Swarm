@@ -33,7 +33,7 @@ from multi_agent_pso.protocols import (
     ToolResult,
     ToolStatus,
 )
-from multi_agent_pso.tools import validate_commands, validate_source
+from multi_agent_pso.tools import canonicalize_commands, validate_source
 
 from .evaluator import EVALUATOR_VERSION, RedAbsorptionEvaluator
 from .models import SpectrumResult
@@ -545,7 +545,7 @@ class RedAbsorptionTaskAdapter:
                 raise ValueError("edit command schema rejected")
             required, optional = _COMMAND_FIELDS[command["operation"]]
             for key in optional:
-                if command.get(key) is None:
+                if command.get(key) is None and key != "atom_map":
                     command.pop(key, None)
             if not required <= set(command) or not set(command) <= required | optional:
                 raise ValueError("edit command schema rejected")
@@ -626,7 +626,7 @@ class RedAbsorptionTaskAdapter:
                 fragment_total += heavy
         if fragment_total > decoded["fragment_heavy_atoms"]:
             raise ValueError("transaction fragments exceed decoded cap")
-        commands[:] = validate_commands(commands, entry["graph"])
+        commands[:] = canonicalize_commands(commands, entry["graph"])
         payload.update(
             {
                 "target_position": entry["target"],
@@ -737,7 +737,8 @@ class RedAbsorptionTaskAdapter:
             or _plain(authorized.get("operation_policy"))
             != _plain(decoded["operation_weights"])
             or payload.get("parent_state_hash") != inspection
-            or _plain(commands) != _plain(authorized_commands)
+            or canonicalize_commands(commands, authorized["inspected_graph"])
+            != canonicalize_commands(authorized_commands, authorized["inspected_graph"])
         ):
             raise ValueError("tool result does not match authoritative proposal")
         metadata = {

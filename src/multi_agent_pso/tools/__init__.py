@@ -12,6 +12,7 @@ from .molecule_editor import (
     MoleculeEditorProvider,
     MoleculeEditorResult,
     validate_commands,
+    canonicalize_commands,
     validate_source,
 )
 
@@ -25,5 +26,6 @@ __all__ = [
     "MoleculeEditorProvider",
     "MoleculeEditorResult",
     "validate_commands",
+    "canonicalize_commands",
     "validate_source",
 ]

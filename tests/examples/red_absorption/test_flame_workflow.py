@@ -460,6 +460,26 @@ async def test_workflow_builds_flame_candidate_and_proxy_reward(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_workflow_rejects_genuinely_changed_commands_before_flame(tmp_path):
+    class ChangedCommandEditor(FakeEditor):
+        async def edit(self, *args, **kwargs):
+            result = await super().edit(*args, **kwargs)
+            result.payload['committed_commands'][0]['atomic_number'] = 8
+            return result
+
+    run_inputs = inputs(tmp_path)
+    flame = FakeFlameCommand()
+    provider = FlameWorkflowToolProvider.bind(run_inputs, ChangedCommandEditor([], parent_graph()),
+        FlameWorkflowResources.from_inputs(run_inputs, max_new_evaluations=10),
+        flame=flame, artifact_store=FileArtifactStore(tmp_path / 'artifacts'))
+    request, context = authorized_request(tmp_path)
+    result = await provider.execute(request, context)
+    assert result.status is ToolStatus.FAILED
+    assert 'authorization mismatch' in result.error
+    assert flame.calls == []
+
+
+@pytest.mark.asyncio
 async def test_flame_execution_obeys_configured_concurrency(tmp_path: Path) -> None:
     class ConcurrentFlame:
         def __init__(self) -> None:
