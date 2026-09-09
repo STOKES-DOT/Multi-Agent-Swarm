@@ -121,6 +121,22 @@ class FlameProxyEvaluator:
             )
         evaluation = self.evaluate_prediction(prediction)
         rollback = candidate.metadata.get("rollback")
+        if 'hypothesis_prediction' in candidate.metadata:
+            from .research_control import assess_prediction
+            parent_raw = candidate.to_json()['metadata'].get('parent_prediction')
+            parent = FlamePrediction.model_validate(parent_raw) if parent_raw is not None else None
+            if isinstance(rollback, Mapping) and rollback.get('performed') is True:
+                parent = prediction
+            if parent is not None and (parent.model_hashes != prediction.model_hashes or parent.solvent_smiles != prediction.solvent_smiles):
+                raise ValueError('parent/child prediction protocols differ')
+            outcome = assess_prediction(candidate.metadata['hypothesis_prediction'],
+                parent.absorption_nm if parent else None, prediction.absorption_nm,
+                rollback=isinstance(rollback, Mapping) and rollback.get('performed') is True)
+            data = evaluation.model_dump(mode='json')
+            data['provenance']['hypothesis_outcome'] = outcome
+            data['provenance']['parent_reward'] = self.evaluate_prediction(parent).fitness if parent else None
+            data['provenance']['reward_delta'] = evaluation.fitness - data['provenance']['parent_reward'] if parent else None
+            evaluation = Evaluation.model_validate(data)
         if isinstance(rollback, Mapping) and rollback.get("performed") is True:
             provenance = dict(evaluation.provenance)
             provenance.update(

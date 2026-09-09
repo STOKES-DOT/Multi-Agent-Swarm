@@ -331,6 +331,31 @@ def test_proposal_response_schema_uses_codex_supported_primitives() -> None:
     assert_const_types(request.response_schema)
 
 
+def test_default_adapter_schema_exposes_only_its_four_supported_operations() -> None:
+    adapter = RedAbsorptionTaskAdapter()
+    hypothesis = adapter.build_stage_request(AgentStage.HYPOTHESIZING, context())
+    proposal = adapter.build_stage_request(AgentStage.PROPOSING_ACTION, context())
+
+    hypothesis_operations = set(
+        hypothesis.response_schema["properties"]["edit_class"]["enum"]
+    )
+    variants = proposal.response_schema["properties"]["tool_payload"]["properties"][
+        "commands"
+    ]["items"]["anyOf"]
+    proposal_operations = {
+        variant["properties"]["operation"]["const"] for variant in variants
+    }
+
+    expected = {
+        "replace_atom",
+        "change_bond",
+        "attach_fragment",
+        "substitute_fragment",
+    }
+    assert hypothesis_operations == expected
+    assert proposal_operations == expected
+
+
 def test_proposal_prompt_requires_error_specific_reproposal() -> None:
     request = RedAbsorptionTaskAdapter().build_stage_request(
         AgentStage.PROPOSING_ACTION,

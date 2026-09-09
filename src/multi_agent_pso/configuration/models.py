@@ -50,7 +50,8 @@ class WikiConfig(StrictFrozenModel):
 
 
 class TopologyConfig(StrictFrozenModel):
-    type: Literal["ring", "global"] = "ring"
+    type: Literal["ring", "global", "similarity"] = "ring"
+    neighbor_count: PositiveInt = 3
     neighborhood_radius: NonNegativeInt = 1
 
 
@@ -64,6 +65,8 @@ class PsoConfig(StrictFrozenModel):
     constriction_factor: PositiveFloat = 0.72984
     velocity_clamp: UnitIntervalFraction = 0.20
     topology: TopologyConfig = TopologyConfig()
+    global_social_mix: Annotated[float, Field(ge=0, le=1)] = 0.0
+    use_realized_position: Annotated[bool, Field(strict=True)] = False
 
 
 class ConcurrencyConfig(StrictFrozenModel):

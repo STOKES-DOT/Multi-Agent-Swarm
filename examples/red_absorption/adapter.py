@@ -61,6 +61,20 @@ _STAGE_FILES = {
 }
 _AUTHORITY = {"reward", "fitness", "claimed_reward", "evaluation"}
 _COMMAND_FIELDS = {
+    "add_atom": (
+        {"operation", "client_ref", "atomic_number"},
+        {
+            "isotope",
+            "formal_charge",
+            "radical_electrons",
+            "chiral_tag",
+            "explicit_h_count",
+            "no_implicit",
+            "aromatic",
+            "atom_map",
+        },
+    ),
+    "remove_atom": ({"operation", "atom_id"}, set()),
     "replace_atom": (
         {"operation", "atom_id", "atomic_number"},
         {
@@ -73,6 +87,18 @@ _COMMAND_FIELDS = {
             "atom_map",
         },
     ),
+    "add_bond": (
+        {"operation", "begin", "end", "bond_type"},
+        {
+            "client_ref",
+            "aromatic",
+            "conjugated",
+            "stereo",
+            "stereo_atom_ids",
+            "bond_direction",
+        },
+    ),
+    "remove_bond": ({"operation", "bond_id"}, set()),
     "change_bond": (
         {"operation", "bond_id", "bond_type"},
         {"aromatic", "conjugated", "stereo", "stereo_atom_ids", "bond_direction"},
@@ -86,6 +112,10 @@ _COMMAND_FIELDS = {
             "bond_type",
         },
         {"client_ref"},
+    ),
+    "detach_fragment": (
+        {"operation", "bond_id", "retained_atom_id"},
+        set(),
     ),
     "substitute_fragment": (
         {
@@ -138,6 +168,8 @@ def _validated_parent_similarity(payload: Mapping[str, object]) -> float:
 
 class RedAbsorptionTaskAdapter:
     dimension_names = DIMENSION_NAMES
+    operation_names = _OPERATIONS
+    hypothesis_extra_fields = frozenset()
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -220,9 +252,26 @@ class RedAbsorptionTaskAdapter:
             or not _HASH.fullmatch(copied["protocol_snapshot_hash"])
         ):
             raise ValueError("stage context identity is invalid")
-        decoded = self.decode_position(copied["target_position"])
+        decoded = self.decode_context(copied)
         template, schema_text = self._assets[stage]
         schema = json.loads(schema_text)
+        if stage is AgentStage.HYPOTHESIZING:
+            schema["properties"]["edit_class"]["enum"] = list(
+                self.operation_names
+            )
+        elif stage is AgentStage.PROPOSING_ACTION:
+            variants = schema["properties"]["tool_payload"]["properties"][
+                "commands"
+            ]["items"]["anyOf"]
+            allowed_operations = set(self.operation_names)
+            variants[:] = [
+                variant
+                for variant in variants
+                if variant["properties"]["operation"]["const"]
+                in allowed_operations
+            ]
+            if "edit_command_target" in decoded:
+                schema["properties"]["tool_payload"]["properties"]["commands"]["maxItems"] = decoded["edit_command_target"]
         authorization = hashlib.sha256(
             json.dumps(
                 [
@@ -297,6 +346,7 @@ class RedAbsorptionTaskAdapter:
             "inspection_artifact": inspection_artifact,
             "graph": inspected_graph,
             "wiki_query": copied.get("wiki_query"),
+            "hypothesis": copied.get("hypothesis"),
         }
         schema["properties"]["authorization_id"] = {
             "type": "string",
@@ -400,13 +450,13 @@ class RedAbsorptionTaskAdapter:
             "uncertainty",
             "edit_class",
         }
-        if set(value) != expected or not all(
+        if set(value) != expected | self.hypothesis_extra_fields or not all(
             self._text(value[k]) for k in ("question", "hypothesis", "uncertainty")
         ):
             raise ValueError("hypothesis schema rejected")
         if (
             value["predicted_direction"] not in {"red_shift", "blue_shift", "no_change"}
-            or value["edit_class"] not in _OPERATIONS
+            or value["edit_class"] not in self.operation_names
         ):
             raise ValueError("hypothesis enum rejected")
         query = value["wiki_query"]
@@ -490,6 +540,7 @@ class RedAbsorptionTaskAdapter:
             if (
                 not isinstance(command, dict)
                 or command.get("operation") not in _COMMAND_FIELDS
+                or command.get("operation") not in self.operation_names
             ):
                 raise ValueError("edit command schema rejected")
             required, optional = _COMMAND_FIELDS[command["operation"]]
@@ -504,6 +555,27 @@ class RedAbsorptionTaskAdapter:
                 or command["atomic_number"] < 1
             ):
                 raise ValueError("replace_atom fields rejected")
+            if command["operation"] == "add_atom" and (
+                not self._text(command["client_ref"])
+                or type(command["atomic_number"]) is not int
+                or command["atomic_number"] < 1
+            ):
+                raise ValueError("add_atom fields rejected")
+            if command["operation"] == "remove_atom" and not self._text(
+                command["atom_id"]
+            ):
+                raise ValueError("remove_atom fields rejected")
+            if command["operation"] == "add_bond" and (
+                not self._text(command["begin"])
+                or not self._text(command["end"])
+                or command["bond_type"]
+                not in {"SINGLE", "DOUBLE", "TRIPLE", "AROMATIC"}
+            ):
+                raise ValueError("add_bond fields rejected")
+            if command["operation"] == "remove_bond" and not self._text(
+                command["bond_id"]
+            ):
+                raise ValueError("remove_bond fields rejected")
             if command["operation"] == "change_bond" and (
                 not self._text(command["bond_id"])
                 or command["bond_type"]
@@ -525,11 +597,16 @@ class RedAbsorptionTaskAdapter:
                 not in {"SINGLE", "DOUBLE", "TRIPLE", "AROMATIC"}
             ):
                 raise ValueError("substitute_fragment fields rejected")
+            if command["operation"] == "detach_fragment" and (
+                not self._text(command["bond_id"])
+                or not self._text(command["retained_atom_id"])
+            ):
+                raise ValueError("detach_fragment fields rejected")
             if "client_ref" in command and not self._text(command["client_ref"]):
                 raise ValueError("client_ref rejected")
             if (
                 not decoded["operation_weights_were_zero"]
-                and decoded["operation_weights"][command["operation"]] == 0
+                and decoded["operation_weights"].get(command["operation"], 0) == 0
             ):
                 raise ValueError("operation has zero target weight")
             if command["operation"] in {"attach_fragment", "substitute_fragment"}:
@@ -562,6 +639,9 @@ class RedAbsorptionTaskAdapter:
         )
         if entry["inspection_artifact"] is not None:
             payload["inspected_artifact"] = entry["inspection_artifact"]
+
+    def decode_context(self, context: Mapping[str, JsonValue]) -> dict:
+        return self.decode_position(context["target_position"])
 
     def _reflection(self, value: dict[str, object]) -> None:
         expected = {

@@ -23,6 +23,30 @@ LARGE_EDIT_PARENT_PROVENANCE = (
     ROOT
     / "examples/red_absorption/inputs/gbest-525-flame-dcm-large-edit.provenance.json"
 )
+OPERATIONS = (
+    "add_atom",
+    "remove_atom",
+    "replace_atom",
+    "add_bond",
+    "remove_bond",
+    "change_bond",
+    "attach_fragment",
+    "detach_fragment",
+    "substitute_fragment",
+)
+
+
+def position(
+    primary_operation: str | None = None,
+    *,
+    edit_scale: float = 0.0,
+    fragment_scale: float = 0.0,
+    similarity: float = 0.7,
+) -> list[float]:
+    result = [edit_scale, fragment_scale] + [0.0] * len(OPERATIONS) + [similarity]
+    if primary_operation is not None:
+        result[2 + OPERATIONS.index(primary_operation)] = 1.0
+    return result
 
 
 def atom(serial: int) -> dict[str, object]:
@@ -78,16 +102,21 @@ def proposal_context() -> dict[str, object]:
         "particle_id": "p0",
         "iteration_id": 0,
         "protocol_snapshot_hash": HASH,
-        "target_position": [1.0, 1.0, 1.0, 1.0, 0.4],
+        "target_position": position("attach_fragment"),
         "inspected_source_hash": HASH,
         "inspected_geometry_hash": None,
         "inspected_graph": chemical_graph(2),
     }
 
 
-def fragment_response(adapter, heavy_atoms: int) -> StageResponse:
+def proposal_response(
+    adapter, target_position: list[float], commands: list[dict[str, object]]
+) -> StageResponse:
+    adapter.decode_context = lambda ctx: adapter.decode_position(ctx["target_position"])
+    context = proposal_context()
+    context["target_position"] = target_position
     request = adapter.build_stage_request(
-        AgentStage.PROPOSING_ACTION, proposal_context()
+        AgentStage.PROPOSING_ACTION, context
     )
     token = request.response_schema["properties"]["authorization_id"]["const"]
     payload = {
@@ -96,19 +125,27 @@ def fragment_response(adapter, heavy_atoms: int) -> StageResponse:
         "operation": "edit",
         "tool_payload": {
             "inspected_source_hash": HASH,
-            "commands": [
-                {
-                    "operation": "attach_fragment",
-                    "anchor_atom_id": "a0001",
-                    "fragment_graph": chemical_graph(heavy_atoms),
-                    "fragment_anchor_atom_id": "a0001",
-                    "bond_type": "SINGLE",
-                    "client_ref": "@large_fragment",
-                }
-            ],
+            "commands": commands,
         },
     }
     return StageResponse(json.dumps(payload), TokenUsage(0, 0))
+
+
+def fragment_response(adapter, heavy_atoms: int) -> StageResponse:
+    return proposal_response(
+        adapter,
+        position("attach_fragment"),
+        [
+            {
+                "operation": "attach_fragment",
+                "anchor_atom_id": "a0001",
+                "fragment_graph": chemical_graph(heavy_atoms),
+                "fragment_anchor_atom_id": "a0001",
+                "bond_type": "SINGLE",
+                "client_ref": "@large_fragment",
+            }
+        ],
+    )
 
 
 def hypothesis_response(adapter, edit_class: str) -> StageResponse:
@@ -117,7 +154,7 @@ def hypothesis_response(adapter, edit_class: str) -> StageResponse:
         "particle_id": "p0",
         "iteration_id": 0,
         "protocol_snapshot_hash": HASH,
-        "target_position": [1.0, 1.0, 1.0, 1.0, 0.4],
+        "target_position": [1.0] * 11 + [0.4],
         "wiki_query": {
             "text": "red absorption molecular design",
             "max_results": 5,
@@ -141,6 +178,8 @@ def hypothesis_response(adapter, edit_class: str) -> StageResponse:
         "authorization_id": token,
         "question": "Will a large fragment shift the absorption?",
         "hypothesis": "A large conjugated fragment may cause a red shift.",
+        "mechanism": "conjugation extension",
+        "minimum_change_nm": 10.0,
         "predicted_direction": "red_shift",
         "wiki_query": context["wiki_query"],
         "evidence_references": [
@@ -157,36 +196,129 @@ def hypothesis_response(adapter, edit_class: str) -> StageResponse:
     return StageResponse(json.dumps(payload), TokenUsage(0, 0))
 
 
-def test_large_edit_position_decodes_five_dimensions() -> None:
+def test_large_edit_position_decodes_twelve_controllable_dimensions() -> None:
     module = import_module("examples.red_absorption.flame_large_edit")
     adapter = module.LargeEditFlameTaskAdapter()
 
-    low = adapter.decode_position([0.5, 0.0, 0.0, 0.0, 0.1])
-    high = adapter.decode_position([1.0, 1.0, 1.0, 1.0, 0.7])
+    low = adapter.decode_position([0.0] * 11 + [0.1])
+    high = adapter.decode_position([1.0] * 12)
 
     assert module.create_large_edit_position_space().lower.tolist() == [
-        0.5,
         0.0,
         0.0,
         0.0,
-        0.1,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
     ]
     assert module.create_large_edit_position_space().upper.tolist() == [
         1.0,
         1.0,
         1.0,
         1.0,
-        0.7,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
     ]
-    assert (low["edit_budget"], high["edit_budget"]) == (2, 3)
+    assert (low["edit_budget"], high["edit_budget"]) == (1, 3)
+    assert (low["edit_command_target"], high["edit_command_target"]) == (1, 3)
     assert low["fragment_heavy_atom_min"] == 10
     assert (low["fragment_heavy_atoms"], high["fragment_heavy_atoms"]) == (10, 20)
+    assert (low["fragment_heavy_atom_target"], high["fragment_heavy_atom_target"]) == (
+        10,
+        20,
+    )
     assert low["operation_weights"] == {
-        "replace_atom": 0.0,
-        "change_bond": 0.0,
-        "attach_fragment": 0.5,
-        "substitute_fragment": 0.5,
+        operation: pytest.approx(1 / 9) for operation in OPERATIONS
     }
+    assert low["required_primary_operation"] is None
+    assert low["minimum_parent_heavy_atoms_changed"] == 10
+    assert low["max_net_heavy_atom_growth"] == 2
+    assert high["minimum_parent_heavy_atoms_changed"] == 1
+    assert high["max_net_heavy_atom_growth"] == 20
+
+
+def test_large_edit_keeps_every_operation_reachable_and_selects_a_primary() -> None:
+    module = import_module("examples.red_absorption.flame_large_edit")
+    adapter = module.LargeEditFlameTaskAdapter()
+
+    decoded = adapter.decode_position(position("replace_atom", similarity=0.3))
+
+    assert all(weight > 0.0 for weight in decoded["operation_weights"].values())
+    assert decoded["required_primary_operation"] == "replace_atom"
+    assert decoded["operation_weights"]["replace_atom"] > max(
+        weight
+        for operation, weight in decoded["operation_weights"].items()
+        if operation != "replace_atom"
+    )
+
+
+def test_large_edit_add_atom_primary_requires_a_connecting_command() -> None:
+    module = import_module("examples.red_absorption.flame_large_edit")
+    adapter = module.LargeEditFlameTaskAdapter()
+
+    decoded = adapter.decode_position(position("add_atom", edit_scale=0.0))
+
+    assert decoded["required_primary_operation"] == "add_atom"
+    assert decoded["edit_command_target"] == 2
+    assert decoded["edit_budget"] == 2
+
+
+def test_low_similarity_mode_projects_growth_to_scaffold_capable_operation() -> None:
+    module = import_module("examples.red_absorption.flame_large_edit")
+    adapter = module.LargeEditFlameTaskAdapter()
+
+    decoded = adapter.decode_context({**proposal_context(),
+        "target_position": position("attach_fragment", similarity=0.3)})
+
+    assert "substitute_fragment" in decoded["required_operations"] or "detach_fragment" in decoded["required_operations"]
+    assert decoded["minimum_parent_heavy_atoms_changed"] == 10
+    assert decoded["max_net_heavy_atom_growth"] == 2
+
+
+def test_large_edit_proposal_schema_exposes_all_nine_editor_operations() -> None:
+    module = import_module("examples.red_absorption.flame_large_edit")
+    adapter = module.LargeEditFlameTaskAdapter()
+
+    schema = adapter.build_stage_request(
+        AgentStage.PROPOSING_ACTION, proposal_context()
+    ).response_schema
+    variants = schema["properties"]["tool_payload"]["properties"]["commands"][
+        "items"
+    ]["anyOf"]
+    operations = {
+        variant["properties"]["operation"]["const"] for variant in variants
+    }
+
+    assert operations == set(OPERATIONS)
+
+
+def test_operation_sampling_is_replayable_and_covers_all_nine_operations():
+    from collections import Counter
+    from examples.red_absorption.flame_large_edit import LargeEditFlameTaskAdapter
+    adapter = LargeEditFlameTaskAdapter()
+    counts = Counter()
+    for iteration in range(900):
+        ctx = {**proposal_context(), "iteration_id": iteration,
+               "target_position": position(similarity=.85)}
+        decoded = adapter.decode_context(ctx)
+        assert decoded == adapter.decode_context(ctx)
+        counts[decoded['required_primary_operation']] += 1
+        if decoded['required_primary_operation'] == 'add_atom':
+            assert decoded['required_operations'] == ['add_atom', 'add_bond']
+    assert set(counts) == set(OPERATIONS)
+    assert all(60 < n < 140 for n in counts.values())
 
 
 def test_large_edit_rejects_fragment_total_below_ten() -> None:
@@ -210,21 +342,99 @@ def test_large_edit_accepts_fragment_total_of_ten() -> None:
     )
 
     assert parsed["tool_payload"]["fragment_heavy_atom_min"] == 10
-    assert parsed["tool_payload"]["fragment_heavy_atom_cap"] == 20
+    assert parsed["tool_payload"]["fragment_heavy_atom_cap"] == 10
+    assert parsed["tool_payload"]["fragment_heavy_atom_target"] == 10
 
 
-def test_large_edit_hypothesis_rejects_single_atom_operation() -> None:
+def test_large_edit_requires_the_sampled_operation() -> None:
     module = import_module("examples.red_absorption.flame_large_edit")
     adapter = module.LargeEditFlameTaskAdapter()
 
-    with pytest.raises(ValueError, match="fragment operation"):
+    # Isolate the proposal validator from stochastic selection: the production
+    # decoder is tested separately for reproducibility and empirical coverage.
+    adapter.decode_context = lambda ctx: adapter.decode_position(ctx["target_position"])
+    with pytest.raises(ValueError, match="required primary operation replace_atom"):
         adapter.parse_stage_response(
-            AgentStage.HYPOTHESIZING,
-            hypothesis_response(adapter, "replace_atom"),
+            AgentStage.PROPOSING_ACTION,
+            proposal_response(
+                adapter,
+                position("replace_atom"),
+                [
+                    {
+                        "operation": "attach_fragment",
+                        "anchor_atom_id": "a0001",
+                        "fragment_graph": chemical_graph(10),
+                        "fragment_anchor_atom_id": "a0001",
+                        "bond_type": "SINGLE",
+                        "client_ref": "@wrong_primary",
+                    }
+                ],
+            ),
         )
 
 
-def test_large_edit_realized_position_uses_same_five_dimensions() -> None:
+def test_large_edit_requires_the_decoded_command_count() -> None:
+    module = import_module("examples.red_absorption.flame_large_edit")
+    adapter = module.LargeEditFlameTaskAdapter()
+
+    with pytest.raises(ValueError, match="exactly 2 edit commands"):
+        adapter.parse_stage_response(
+            AgentStage.PROPOSING_ACTION,
+            proposal_response(
+                adapter,
+                position("attach_fragment", edit_scale=0.5),
+                [
+                    {
+                        "operation": "attach_fragment",
+                        "anchor_atom_id": "a0001",
+                        "fragment_graph": chemical_graph(10),
+                        "fragment_anchor_atom_id": "a0001",
+                        "bond_type": "SINGLE",
+                        "client_ref": "@one_of_two",
+                    }
+                ],
+            ),
+        )
+
+
+def test_large_edit_requires_the_decoded_fragment_size() -> None:
+    module = import_module("examples.red_absorption.flame_large_edit")
+    adapter = module.LargeEditFlameTaskAdapter()
+
+    with pytest.raises(ValueError, match="exactly 15 fragment heavy atoms"):
+        adapter.parse_stage_response(
+            AgentStage.PROPOSING_ACTION,
+            proposal_response(
+                adapter,
+                position("attach_fragment", fragment_scale=0.5),
+                [
+                    {
+                        "operation": "attach_fragment",
+                        "anchor_atom_id": "a0001",
+                        "fragment_graph": chemical_graph(10),
+                        "fragment_anchor_atom_id": "a0001",
+                        "bond_type": "SINGLE",
+                        "client_ref": "@wrong_size",
+                    }
+                ],
+            ),
+        )
+
+
+@pytest.mark.parametrize("edit_class", OPERATIONS)
+def test_large_edit_hypothesis_accepts_all_editor_operations(edit_class: str) -> None:
+    module = import_module("examples.red_absorption.flame_large_edit")
+    adapter = module.LargeEditFlameTaskAdapter()
+
+    parsed = adapter.parse_stage_response(
+        AgentStage.HYPOTHESIZING,
+        hypothesis_response(adapter, edit_class),
+    )
+
+    assert parsed["edit_class"] == edit_class
+
+
+def test_large_edit_realized_position_uses_same_twelve_dimensions() -> None:
     module = import_module("examples.red_absorption.flame_large_edit")
     adapter = module.LargeEditFlameTaskAdapter()
     command = {
@@ -240,15 +450,24 @@ def test_large_edit_realized_position_uses_same_five_dimensions() -> None:
         CHEMICAL_HASH,
         metadata={
             "committed_commands": [command],
-            "target_position": [1.0, 0.5, 1.0, 0.0, 0.4],
+            "target_position": position(
+                "attach_fragment", fragment_scale=0.5, similarity=0.4
+            ),
             "parent_similarity": 0.35,
         },
     )
 
     realized = adapter.realized_position(candidate)
 
-    assert realized == [0.5, 0.5, 1.0, 0.0, 0.35]
-    assert len(adapter.position_adherence([1.0, 0.5, 1.0, 0.0, 0.4], realized)["absolute_error"]) == 5
+    expected = [0.0, 0.5] + [0.0] * 9 + [0.35]
+    expected[2 + OPERATIONS.index("attach_fragment")] = 1.0
+    assert realized == expected
+    assert len(
+        adapter.position_adherence(
+            position("attach_fragment", fragment_scale=0.5, similarity=0.4),
+            realized,
+        )["absolute_error"]
+    ) == 12
 
 
 def test_large_edit_rollback_realized_position_stays_inside_search_space() -> None:
@@ -259,7 +478,7 @@ def test_large_edit_rollback_realized_position_stays_inside_search_space() -> No
         CHEMICAL_HASH,
         metadata={
             "committed_commands": [],
-            "target_position": [0.75, 0.5, 0.5, 0.5, 0.4],
+            "target_position": [0.5] * 11 + [0.4],
             "parent_similarity": 1.0,
             "rollback": {"performed": True},
         },
@@ -267,7 +486,7 @@ def test_large_edit_rollback_realized_position_stays_inside_search_space() -> No
 
     realized = adapter.realized_position(candidate)
 
-    assert realized == [0.5, 0.0, 0.5, 0.5, 0.7]
+    assert realized == [0.0, 0.5] + [pytest.approx(1 / 9)] * 9 + [1.0]
     space = module.create_large_edit_position_space()
     assert all(
         lower <= value <= upper
@@ -288,14 +507,40 @@ def test_large_edit_task_package_is_frozen_to_ten_by_ten() -> None:
     assert task.spec.agent.model == "gpt-5.6-luna"
     assert task.spec.concurrency.agents == 10
     assert task.spec.concurrency.evaluations == 1
-    assert task.plugins.position_space.lower.tolist() == [0.5, 0.0, 0.0, 0.0, 0.1]
-    assert task.plugins.position_space.upper.tolist() == [1.0, 1.0, 1.0, 1.0, 0.7]
+    assert task.plugins.position_space.lower.tolist() == [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ]
+    assert task.plugins.position_space.upper.tolist() == [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+    ]
     assert inputs.parent.value == (
         "CC(=O)C=Cc1c(N(C)C)cc2c(=O)c3c(C=C(C#N)C#N)cccc3n3c4ccccc4c(=O)c1c23"
     )
 
 
-def test_large_edit_prompts_keep_minimum_fragment_contract() -> None:
+def test_large_edit_prompts_describe_enforced_structural_policy() -> None:
     task = load_task_package(LARGE_EDIT_TASK)
     adapter = task.plugins.task_adapter
 
@@ -306,7 +551,7 @@ def test_large_edit_prompts_keep_minimum_fragment_contract() -> None:
             "particle_id": "p0",
             "iteration_id": 0,
             "protocol_snapshot_hash": HASH,
-            "target_position": [1.0, 1.0, 1.0, 1.0, 0.4],
+            "target_position": [1.0] * 11 + [0.4],
             "wiki_query": {
                 "text": "red absorption molecular design",
                 "max_results": 5,
@@ -327,14 +572,18 @@ def test_large_edit_prompts_keep_minimum_fragment_contract() -> None:
             "particle_id": "p0",
             "iteration_id": 0,
             "protocol_snapshot_hash": HASH,
-            "target_position": [1.0, 1.0, 1.0, 1.0, 0.4],
+            "target_position": [1.0] * 11 + [0.4],
         },
     )
 
     for request in (hypothesis, proposal, reflection):
-        assert "at least 10 heavy atoms" in request.prompt
-    assert "replace_atom" in proposal.prompt and "prohibited" in proposal.prompt
-    assert "change_bond" in proposal.prompt and "prohibited" in proposal.prompt
+        assert "parent_similarity_target" in request.prompt
+        assert "minimum_parent_heavy_atoms_changed" in request.prompt
+    for operation in OPERATIONS:
+        assert operation in proposal.prompt
+    assert "all permitted" in proposal.prompt
+    assert "required_primary_operation" in proposal.prompt
+    assert "edit_command_target" in proposal.prompt
     assert "three distinct proposals" in proposal.prompt
     assert "fallback only" in proposal.prompt
 

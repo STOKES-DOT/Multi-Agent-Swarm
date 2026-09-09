@@ -18,6 +18,8 @@ from examples.red_absorption.flame_stage_context import FlameStageContextProvide
 from examples.red_absorption.flame_workflow import (
     FlameWorkflowResources,
     FlameWorkflowToolProvider,
+    _structural_change_metrics,
+    _structural_policy_rejection,
     flame_cache_key,
 )
 from examples.red_absorption.similarity import (
@@ -212,6 +214,198 @@ def authorized_request(tmp_path: Path, *, attempt: int = 0):
         metadata={"proposal": proposal},
     )
     return request, context
+
+
+def authorized_structural_request(tmp_path: Path, *, attempt: int = 0):
+    request, _ = authorized_request(tmp_path, attempt=attempt)
+    payload = copy.deepcopy(request.to_json()["payload"])
+    payload.update(
+        {
+            "parent_similarity_target": parent_morgan_similarity("C", "N"),
+            "parent_similarity_tolerance": 0.01,
+            "minimum_parent_heavy_atoms_changed": 10,
+            "max_net_heavy_atom_growth": 2,
+        }
+    )
+    proposal = {
+        "authorization_id": "9" * 64,
+        "provider": "molecule_editor",
+        "operation": "edit",
+        "tool_payload": payload,
+    }
+    return (
+        ToolRequest("id", "molecule_editor", "edit", payload, "key"),
+        ToolContext(
+            "run",
+            "p0",
+            0,
+            AgentStage.EXECUTING,
+            attempt,
+            tmp_path.resolve(),
+            metadata={"proposal": proposal},
+        ),
+    )
+
+
+def chain_graph(size: int) -> dict[str, object]:
+    value = copy.deepcopy(parent_graph())
+    value["atoms"] = [
+        {
+            **copy.deepcopy(parent_graph()["atoms"][0]),
+            "atom_id": f"a{index:04d}",
+        }
+        for index in range(1, size + 1)
+    ]
+    value["bonds"] = [
+        {
+            **copy.deepcopy(parent_graph()["bonds"][0]),
+            "bond_id": f"b{index:04d}",
+            "begin_atom_id": f"a{index:04d}",
+            "end_atom_id": f"a{index + 1:04d}",
+        }
+        for index in range(1, size)
+    ]
+    value["next_atom_serial"] = size + 1
+    value["next_bond_serial"] = size
+    return value
+
+
+def low_similarity_policy() -> dict[str, object]:
+    return {
+        "parent_similarity_target": 0.3,
+        "parent_similarity_tolerance": 0.15,
+        "minimum_parent_heavy_atoms_changed": 10,
+        "max_net_heavy_atom_growth": 2,
+    }
+
+
+def test_structural_metrics_detect_peripheral_growth() -> None:
+    parent = chain_graph(12)
+    child = copy.deepcopy(parent)
+    child["atoms"].extend(
+        {
+            **copy.deepcopy(parent["atoms"][0]),
+            "atom_id": f"a{index:04d}",
+        }
+        for index in range(13, 23)
+    )
+    child["bonds"].append(
+        {
+            **copy.deepcopy(parent["bonds"][0]),
+            "bond_id": "b0012",
+            "begin_atom_id": "a0001",
+            "end_atom_id": "a0013",
+        }
+    )
+
+    metrics = _structural_change_metrics(parent, child)
+
+    assert metrics == {
+        "parent_heavy_atoms": 12,
+        "child_heavy_atoms": 22,
+        "parent_heavy_atoms_changed": 1,
+        "net_heavy_atom_growth": 10,
+    }
+    assert "parent heavy atoms changed 1 < 10" in _structural_policy_rejection(
+        low_similarity_policy(), metrics, parent_similarity=0.3
+    )
+
+
+def test_structural_policy_accepts_genuine_low_similarity_scaffold_change() -> None:
+    parent = chain_graph(12)
+    child = chain_graph(2)
+    metrics = _structural_change_metrics(parent, child)
+
+    assert metrics["parent_heavy_atoms_changed"] >= 10
+    assert metrics["net_heavy_atom_growth"] == -10
+    assert (
+        _structural_policy_rejection(
+            low_similarity_policy(), metrics, parent_similarity=0.3
+        )
+        is None
+    )
+
+
+def test_structural_policy_rejects_parent_similarity_miss() -> None:
+    policy = low_similarity_policy()
+    metrics = {
+        "parent_heavy_atoms": 12,
+        "child_heavy_atoms": 2,
+        "parent_heavy_atoms_changed": 10,
+        "net_heavy_atom_growth": -10,
+    }
+
+    rejection = _structural_policy_rejection(
+        policy, metrics, parent_similarity=0.8
+    )
+
+    assert "parent similarity 0.800000 outside" in rejection
+
+
+def test_structural_policy_accepts_local_high_similarity_edit() -> None:
+    parent = chain_graph(12)
+    child = copy.deepcopy(parent)
+    child["atoms"][0]["atomic_number"] = 7
+    metrics = _structural_change_metrics(parent, child)
+    policy = {
+        "parent_similarity_target": 0.85,
+        "parent_similarity_tolerance": 0.15,
+        "minimum_parent_heavy_atoms_changed": 1,
+        "max_net_heavy_atom_growth": 20,
+    }
+
+    assert metrics["parent_heavy_atoms_changed"] == 1
+    assert (
+        _structural_policy_rejection(policy, metrics, parent_similarity=0.85)
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_workflow_rejects_structural_policy_miss_before_flame(
+    tmp_path: Path,
+) -> None:
+    run_inputs = inputs(tmp_path)
+    command = FakeFlameCommand()
+    provider = FlameWorkflowToolProvider.bind(
+        run_inputs,
+        FakeEditor([], parent_graph()),
+        FlameWorkflowResources.from_inputs(run_inputs, max_new_evaluations=10),
+        flame=command,
+        artifact_store=FileArtifactStore(tmp_path / "artifacts"),
+        rollback_after_rejections=3,
+    )
+    request, context = authorized_structural_request(tmp_path)
+
+    result = await provider.execute(request, context)
+
+    assert result.status is ToolStatus.REJECTED
+    assert "parent heavy atoms changed 0 < 10" in result.error
+    assert command.calls == []
+
+
+@pytest.mark.asyncio
+async def test_third_structural_policy_miss_rolls_back_to_parent(
+    tmp_path: Path,
+) -> None:
+    run_inputs = inputs(tmp_path)
+    command = FakeFlameCommand()
+    provider = FlameWorkflowToolProvider.bind(
+        run_inputs,
+        FakeEditor([], parent_graph()),
+        FlameWorkflowResources.from_inputs(run_inputs, max_new_evaluations=10),
+        flame=command,
+        artifact_store=FileArtifactStore(tmp_path / "artifacts"),
+        rollback_after_rejections=3,
+    )
+    request, context = authorized_structural_request(tmp_path, attempt=2)
+
+    result = await provider.execute(request, context)
+
+    assert result.status is ToolStatus.SUCCESS
+    assert result.payload["rollback"]["reason"] == "Structural policy rejected edit"
+    assert result.payload["committed_commands"] == ()
+    assert command.calls[0][0]["dye_smiles"] == "C"
 
 
 @pytest.mark.asyncio

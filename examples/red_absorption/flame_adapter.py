@@ -78,7 +78,9 @@ class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
         if not isinstance(authorized, Mapping):
             raise ValueError("tool context lacks authoritative proposal")
         target = authorized.get("target_position")
-        decoded = self.decode_position(target)
+        decoded = self.decode_context({"target_position": target,
+            "run_id": context.run_id, "particle_id": context.particle_id,
+            "iteration_id": context.iteration_id})
         expected_key = (
             flame_input_hash(canonical_smiles, prediction.solvent_smiles),
             prediction.solvent_smiles,
@@ -114,7 +116,11 @@ class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
                     "rejected_commands_sha256",
                     "rejection_detail",
                 }
-                or rollback.get("reason") != "MoleculeEditor rejected edit"
+                or rollback.get("reason")
+                not in {
+                    "MoleculeEditor rejected edit",
+                    "Structural policy rejected edit",
+                }
                 or rollback.get("failed_proposal_attempt") != context.attempt
                 or rollback.get("rejection_count") != context.attempt + 1
                 or rollback.get("rejected_commands_sha256")
@@ -164,8 +170,25 @@ class FlameRedAbsorptionTaskAdapter(RedAbsorptionTaskAdapter):
                 "molecule_artifact": molecule_artifact.model_dump(mode="json"),
             },
         }
+        for name in (
+            "parent_heavy_atoms",
+            "child_heavy_atoms",
+            "parent_heavy_atoms_changed",
+            "net_heavy_atom_growth",
+        ):
+            if name in payload:
+                value = payload[name]
+                if type(value) is not int:
+                    raise ValueError("candidate structural metrics are invalid")
+                metadata[name] = value
         if rolled_back:
             metadata["rollback"] = rollback
+        if 'hypothesis_prediction' in authorized:
+            metadata['hypothesis_prediction'] = _plain(authorized['hypothesis_prediction'])
+            metadata['parent_prediction'] = payload.get('parent_prediction')
+        for name in ('required_operations', 'operation_selection_seed', 'dependency_operations'):
+            if name in authorized:
+                metadata[name] = _plain(authorized[name])
         return CandidateRef(state_hash, candidate_hash, result.artifacts, metadata)
 
 

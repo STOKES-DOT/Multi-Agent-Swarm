@@ -184,6 +184,7 @@ class PersonalBest(_FrozenModel):
     evaluated_position: JsonValue
     candidate_reference: str = Field(min_length=1)
     hypothesis_reference: str = Field(min_length=1)
+    reflection_reference: str | None = Field(default=None, min_length=1)
     evaluation_reference: str = Field(min_length=1)
     candidate_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     evaluation: Evaluation
@@ -360,6 +361,21 @@ class UpdateTrace(_FrozenModel):
     resample_rng_state_before: JsonValue | None = None
     resample_rng_state_after: JsonValue | None = None
     projected_dimensions: tuple[int, ...] = ()
+    behavior_update: JsonValue | None = None
+
+    @field_validator("behavior_update", mode="before")
+    @classmethod
+    def normalize_behavior_update(cls, value: object) -> object:
+        return _normalize_json_input(value)
+
+    @field_validator("behavior_update")
+    @classmethod
+    def validate_behavior_update(cls, value: JsonValue) -> JsonValue:
+        return _freeze_finite_json(value)
+
+    @field_serializer("behavior_update")
+    def serialize_behavior_update(self, value: JsonValue) -> JsonValue:
+        return _thaw_json(value)
 
     @field_validator(
         "cognitive_rng_state_before",

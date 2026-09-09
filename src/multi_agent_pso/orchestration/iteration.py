@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from collections.abc import Mapping, Sequence
 from functools import cmp_to_key
 from typing import Any, TypeVar
@@ -100,6 +101,12 @@ def _episode_best(episode: AgentEpisode) -> PersonalBest | None:
         candidate_reference=episode.candidate_reference,
         candidate_hash=episode.candidate_hash,
         hypothesis_reference=episode.hypothesis_reference,
+        reflection_reference=(hashlib.sha256(json.dumps(
+            ["reflection", episode.run_id, episode.particle_id, episode.iteration_id],
+            ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+        ).encode()).hexdigest() if any(
+            e.stage.value == "REFLECTING" and e.event_type == "completed"
+            for e in episode.events) else None),
         evaluation_reference=episode.evaluation_reference,
         evaluation=evaluation,
         fitness=evaluation.fitness,
@@ -153,8 +160,11 @@ def advance_snapshot(
     failure_threshold: int,
     resource_budget: Mapping[str, JsonValue] | None = None,
     run_status: RunStatus | None = None,
+    use_realized_position: bool = False,
 ) -> IterationSnapshot:
     """Build the next generation from a frozen snapshot and terminal episodes."""
+    if type(use_realized_position) is not bool:
+        raise TypeError("use_realized_position must be boolean")
     if type(failure_threshold) is not int or failure_threshold <= 0:
         raise ValueError("failure_threshold must be a positive integer")
     order = tuple(particle.particle_id for particle in snapshot.particles)
@@ -247,12 +257,17 @@ def advance_snapshot(
         social_before = _rng_state(social_rng)
         particle_json = particle.model_dump(mode="json")
         position = space.deserialize_position(particle_json["position"])
+        if use_realized_position and success and episode.realized_position is not None:
+            position = space.deserialize_position(
+                episode.model_dump(mode="json")["evaluated_position"])
         velocity = space.deserialize_velocity(particle_json["velocity"])
+        source_position = space.serialize_position(position)
         projected_dimensions: tuple[int, ...] = ()
         resample_seed: int | None = None
         resample_before: JsonValue | None = None
         resample_after: JsonValue | None = None
         resampled = not success and failures >= failure_threshold
+        behavior_update = None
         if resampled:
             resample_seed = derive_seed(run_seed, particle_id, next_iteration, "resample")
             resample_rng = np.random.default_rng(resample_seed)
@@ -260,6 +275,10 @@ def advance_snapshot(
             position = space.sample_position(resample_rng)
             velocity = space.zero_velocity()
             resample_after = _rng_state(resample_rng)
+            if use_realized_position:
+                behavior_update = {"resampled": True, "planned_position": particle_json["position"],
+                                   "next_position": space.serialize_position(position),
+                                   "clamped_velocity": space.serialize_velocity(velocity)}
         elif generation_success:
             pbest = updated_bests[particle_id]
             sbest_id = sbest_ids[particle_id]
@@ -283,11 +302,29 @@ def advance_snapshot(
                             sbest.model_dump(mode="json")["evaluated_position"]
                         )
                     ),
+                    gbest=(space.deserialize_position(gbest.model_dump(mode="json")["evaluated_position"])
+                           if gbest is not None else None),
                 ),
                 cognitive_rng,
                 social_rng,
             )
             position = update.position
+            if use_realized_position:
+                behavior_update = {
+                    name: space.serialize_velocity(getattr(update, name))
+                    for name in ("inertia_component", "personal_component", "local_component", "global_component")
+                }
+                behavior_update.update({
+                    "source_position": source_position,
+                    "planned_position": particle_json["position"],
+                    "pbest_position": pbest.model_dump(mode="json")["evaluated_position"] if pbest else None,
+                    "lbest_position": sbest.model_dump(mode="json")["evaluated_position"] if sbest else None,
+                    "gbest_position": gbest.model_dump(mode="json")["evaluated_position"] if gbest else None,
+                    "unclamped_velocity": space.serialize_velocity(update.unclamped_velocity),
+                    "clamped_velocity": space.serialize_velocity(update.velocity),
+                    "next_position": space.serialize_position(update.position),
+                    "global_mix": update_rule.global_mix,
+                })
             velocity = update.velocity
             projected_dimensions = update.projection.changed_dimensions
 
@@ -307,6 +344,7 @@ def advance_snapshot(
             resample_rng_state_before=resample_before,
             resample_rng_state_after=resample_after,
             projected_dimensions=projected_dimensions,
+            behavior_update=behavior_update,
         )
         particles.append(
             ParticleState(

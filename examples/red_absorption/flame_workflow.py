@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 from collections.abc import Mapping, MutableMapping
 import threading
 import uuid
@@ -28,10 +29,145 @@ from .workflow import _plain_json
 
 
 FlameCacheKey = tuple[str, str, str, str]
+_STRUCTURAL_POLICY_KEYS = frozenset(
+    {
+        "parent_similarity_target",
+        "parent_similarity_tolerance",
+        "minimum_parent_heavy_atoms_changed",
+        "max_net_heavy_atom_growth",
+    }
+)
+_STRUCTURAL_METRIC_KEYS = (
+    "parent_heavy_atoms",
+    "child_heavy_atoms",
+    "parent_heavy_atoms_changed",
+    "net_heavy_atom_growth",
+)
 _TRANSIENT_FLAME_STATUSES = {
     JsonCommandStatus.PROCESS_ERROR,
     JsonCommandStatus.SPAWN_ERROR,
 }
+
+
+def _structural_change_metrics(
+    parent_graph: Mapping[str, object], child_graph: Mapping[str, object]
+) -> dict[str, int]:
+    """Count changed parent heavy atoms from stable atom and bond identities."""
+
+    def atoms(graph: Mapping[str, object]) -> dict[str, Mapping[str, object]]:
+        raw = graph.get("atoms")
+        if not isinstance(raw, (list, tuple)):
+            raise ValueError("structural graph atoms are missing")
+        result = {}
+        for atom in raw:
+            if not isinstance(atom, Mapping):
+                raise ValueError("structural graph atom is invalid")
+            atom_id = atom.get("atom_id")
+            atomic_number = atom.get("atomic_number")
+            if not isinstance(atom_id, str) or type(atomic_number) is not int:
+                raise ValueError("structural graph atom identity is invalid")
+            if atomic_number <= 1:
+                continue
+            if atom_id in result:
+                raise ValueError("structural graph atom IDs are duplicated")
+            result[atom_id] = atom
+        return result
+
+    def incident_bonds(
+        graph: Mapping[str, object], heavy_atom_ids: set[str]
+    ) -> dict[str, set[tuple[object, ...]]]:
+        raw = graph.get("bonds")
+        if not isinstance(raw, (list, tuple)):
+            raise ValueError("structural graph bonds are missing")
+        result = {atom_id: set() for atom_id in heavy_atom_ids}
+        for bond in raw:
+            if not isinstance(bond, Mapping):
+                raise ValueError("structural graph bond is invalid")
+            begin = bond.get("begin_atom_id")
+            end = bond.get("end_atom_id")
+            if not isinstance(begin, str) or not isinstance(end, str):
+                raise ValueError("structural graph bond identity is invalid")
+            signature = (
+                min(begin, end),
+                max(begin, end),
+                bond.get("bond_type"),
+                bond.get("aromatic"),
+                bond.get("conjugated"),
+                bond.get("stereo"),
+                tuple(bond.get("stereo_atom_ids", ())),
+                bond.get("bond_direction"),
+            )
+            if begin in result:
+                result[begin].add(signature)
+            if end in result:
+                result[end].add(signature)
+        return result
+
+    parent_atoms = atoms(parent_graph)
+    child_atoms = atoms(child_graph)
+    parent_ids = set(parent_atoms)
+    child_ids = set(child_atoms)
+    parent_incident = incident_bonds(parent_graph, parent_ids)
+    child_incident = incident_bonds(child_graph, parent_ids & child_ids)
+    changed = set(parent_ids - child_ids)
+    for atom_id in parent_ids & child_ids:
+        parent_atom = dict(parent_atoms[atom_id])
+        child_atom = dict(child_atoms[atom_id])
+        parent_atom.pop('atom_map', None)
+        child_atom.pop('atom_map', None)
+        if parent_atom != child_atom or parent_incident[atom_id] != child_incident[atom_id]:
+            changed.add(atom_id)
+    return {
+        "parent_heavy_atoms": len(parent_atoms),
+        "child_heavy_atoms": len(child_atoms),
+        "parent_heavy_atoms_changed": len(changed),
+        "net_heavy_atom_growth": len(child_atoms) - len(parent_atoms),
+    }
+
+
+def _structural_policy_rejection(
+    policy: Mapping[str, object],
+    metrics: Mapping[str, int],
+    *,
+    parent_similarity: float,
+) -> str | None:
+    present = _STRUCTURAL_POLICY_KEYS & policy.keys()
+    if not present:
+        return None
+    if present != _STRUCTURAL_POLICY_KEYS:
+        return "structural policy is incomplete"
+    target = policy.get("parent_similarity_target")
+    tolerance = policy.get("parent_similarity_tolerance")
+    minimum_changed = policy.get("minimum_parent_heavy_atoms_changed")
+    maximum_growth = policy.get("max_net_heavy_atom_growth")
+    if (
+        type(target) not in {int, float}
+        or type(tolerance) not in {int, float}
+        or not math.isfinite(float(target))
+        or not math.isfinite(float(tolerance))
+        or not 0.0 <= float(target) <= 1.0
+        or not 0.0 <= float(tolerance) <= 1.0
+        or type(minimum_changed) is not int
+        or minimum_changed < 0
+        or type(maximum_growth) is not int
+    ):
+        return "structural policy is invalid"
+    lower = max(0.0, float(target) - float(tolerance))
+    upper = min(1.0, float(target) + float(tolerance))
+    if not lower <= parent_similarity <= upper:
+        return (
+            f"parent similarity {parent_similarity:.6f} outside "
+            f"[{lower:.6f}, {upper:.6f}]"
+        )
+    changed = metrics.get("parent_heavy_atoms_changed")
+    growth = metrics.get("net_heavy_atom_growth")
+    if type(changed) is not int or type(growth) is not int:
+        return "structural change metrics are invalid"
+    if changed < minimum_changed:
+        return f"parent heavy atoms changed {changed} < {minimum_changed}"
+    if growth > maximum_growth:
+        return f"net heavy atom growth {growth} > {maximum_growth}"
+    return None
 
 
 def _flame_failure_message(result, attempt: int, max_attempts: int) -> str:
@@ -431,6 +567,52 @@ class FlameWorkflowToolProvider:
                 ToolStatus.FAILED,
                 error=f"parent similarity failed: {type(error).__name__}",
             )
+        if _STRUCTURAL_POLICY_KEYS & authoritative.keys():
+            child_graph = (
+                edited_payload.get("graph")
+                if isinstance(edited_payload, Mapping)
+                else None
+            )
+            if not isinstance(child_graph, Mapping):
+                return ToolResult(
+                    ToolStatus.FAILED,
+                    error="structural policy requires an edited child graph",
+                )
+            try:
+                structural_metrics = _structural_change_metrics(graph, child_graph)
+            except (TypeError, ValueError) as error:
+                return ToolResult(
+                    ToolStatus.FAILED,
+                    error=f"structural change analysis failed: {type(error).__name__}",
+                )
+            rejection = _structural_policy_rejection(
+                authoritative,
+                structural_metrics,
+                parent_similarity=parent_similarity,
+            )
+            if edited_payload.get('chemical_identity_hash') == graph.get('chemical_identity_hash'):
+                rejection = 'chemical identity is unchanged (no-op transaction)'
+            if rejection is not None:
+                rejection_detail = f"Structural policy rejected edit: {rejection}"[:512]
+                if (
+                    self.rollback_after_rejections is not None
+                    and context.attempt + 1 >= self.rollback_after_rejections
+                ):
+                    return await self._evaluate_rollback_parent(
+                        inspection,
+                        authoritative,
+                        context,
+                        parent_record=parent_record,
+                        rejection_detail=rejection_detail,
+                        reason="Structural policy rejected edit",
+                    )
+                return ToolResult(ToolStatus.REJECTED, error=rejection_detail)
+            edited_payload.update(structural_metrics)
+        if 'hypothesis_prediction' in authoritative:
+            parent_key = flame_cache_key(self.inputs, parent_smiles)
+            parent_prediction = self.resources.cache.get(parent_key) or await self.resources.recover(parent_key)
+            edited_payload['hypothesis_prediction'] = _plain_json(authoritative['hypothesis_prediction'])
+            edited_payload['parent_prediction'] = parent_prediction.model_dump(mode='json') if parent_prediction else None
         edited_payload.update(
             {
                 "parent_similarity": parent_similarity,
@@ -447,6 +629,7 @@ class FlameWorkflowToolProvider:
         *,
         parent_record: Mapping[str, object] | None = None,
         rejection_detail: str,
+        reason: str = "MoleculeEditor rejected edit",
     ) -> ToolResult:
         graph = _plain_json(
             inspection.candidate
@@ -487,7 +670,7 @@ class FlameWorkflowToolProvider:
         ).hexdigest()
         rollback = {
             "performed": True,
-            "reason": "MoleculeEditor rejected edit",
+            "reason": reason,
             "failed_proposal_attempt": context.attempt,
             "rejection_count": self.rollback_after_rejections,
             "rejected_commands_sha256": commands_sha256,
@@ -511,6 +694,8 @@ class FlameWorkflowToolProvider:
                 "parent_similarity_method": PARENT_SIMILARITY_METHOD,
             }
         )
+        if _STRUCTURAL_POLICY_KEYS & authoritative.keys():
+            parent_payload.update(_structural_change_metrics(graph, graph))
         return await self._evaluate_payload(
             parent_payload, context, rollback=rollback
         )
@@ -606,6 +791,12 @@ class FlameWorkflowToolProvider:
             "parent_similarity_method": payload["parent_similarity_method"],
             "molecule_artifact": artifact.model_dump(mode="json"),
         }
+        for name in _STRUCTURAL_METRIC_KEYS:
+            if name in payload:
+                compact_payload[name] = payload[name]
+        for name in ('hypothesis_prediction', 'parent_prediction'):
+            if name in payload:
+                compact_payload[name] = payload[name]
         if rollback is not None:
             compact_payload["rollback"] = _plain_json(rollback)
         return ToolResult(ToolStatus.SUCCESS, compact_payload, (artifact,))

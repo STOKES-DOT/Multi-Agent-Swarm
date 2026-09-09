@@ -66,6 +66,8 @@ class SynchronousSwarmRunner(Generic[P, V]):
         initial_snapshot: IterationSnapshot | None = None,
         resource_budget: Mapping[str, JsonValue] | None = None,
         failure_threshold: int = 2,
+        use_realized_position: bool = False,
+        topology_factory: Callable[[IterationSnapshot], SocialTopology] | None = None,
     ) -> None:
         if not run_id:
             raise ValueError("run_id must not be empty")
@@ -77,6 +79,8 @@ class SynchronousSwarmRunner(Generic[P, V]):
             raise ValueError("config_snapshot_hash must be a lowercase SHA-256 digest")
         if type(failure_threshold) is not int or failure_threshold <= 0:
             raise ValueError("failure_threshold must be positive")
+        if type(use_realized_position) is not bool:
+            raise TypeError("use_realized_position must be boolean")
         self.run_id = run_id
         self.run_seed = run_seed
         self.config_snapshot_hash = config_snapshot_hash
@@ -92,6 +96,8 @@ class SynchronousSwarmRunner(Generic[P, V]):
         self._initial_snapshot = initial_snapshot
         self.resource_budget = dict(resource_budget or {})
         self.failure_threshold = failure_threshold
+        self.use_realized_position = use_realized_position
+        self.topology_factory = topology_factory
 
     def ensure_initial_snapshot(self) -> IterationSnapshot:
         latest = self.store.get_latest_committed_snapshot_json(self.run_id)
@@ -151,11 +157,12 @@ class SynchronousSwarmRunner(Generic[P, V]):
                 run_seed=self.run_seed,
                 space=self.space,
                 adapter=self.adapter,
-                topology=self.topology,
+                topology=self.topology_factory(current) if self.topology_factory else self.topology,
                 update_rule=self.update_rule,
                 failure_threshold=self.failure_threshold,
                 resource_budget=self.resource_budget,
                 run_status=target_status,
+                use_realized_position=self.use_realized_position,
             )
             self._commit_snapshot(next_snapshot)
             generations.append(
@@ -274,6 +281,15 @@ class SynchronousSwarmRunner(Generic[P, V]):
         except (TypeError, ValueError) as error:
             raise IncompatibleCheckpointError("committed iteration snapshot is invalid") from error
         self._validate_snapshot_identity(snapshot)
+        try:
+            for particle in snapshot.particles:
+                value = particle.model_dump(mode="json")
+                self.space.deserialize_position(value["position"])
+                self.space.deserialize_velocity(value["velocity"])
+                if value["pbest"] is not None:
+                    self.space.deserialize_position(value["pbest"]["evaluated_position"])
+        except (TypeError, ValueError) as error:
+            raise IncompatibleCheckpointError("checkpoint position space is incompatible") from error
         if self.store.get_run_snapshot_hash(self.run_id) != self.config_snapshot_hash:
             raise IncompatibleCheckpointError("run config snapshot hash is incompatible")
         return snapshot
@@ -302,6 +318,8 @@ class SynchronousSwarmRunner(Generic[P, V]):
             initial_snapshot=recovered,
             resource_budget=self.resource_budget,
             failure_threshold=self.failure_threshold,
+            use_realized_position=self.use_realized_position,
+            topology_factory=self.topology_factory,
         )
 
     def with_config_hash(
@@ -323,6 +341,8 @@ class SynchronousSwarmRunner(Generic[P, V]):
             initial_snapshot=self._initial_snapshot,
             resource_budget=self.resource_budget,
             failure_threshold=self.failure_threshold,
+            use_realized_position=self.use_realized_position,
+            topology_factory=self.topology_factory,
         )
 
 

@@ -6,7 +6,7 @@ from collections.abc import Mapping
 
 from pydantic import JsonValue
 
-from multi_agent_pso.core import AgentStage, ArtifactRef
+from multi_agent_pso.core import AgentStage, ArtifactRef, IterationSnapshot
 from multi_agent_pso.protocols import (
     ArtifactIntegrityError,
     ArtifactStore,
@@ -30,6 +30,9 @@ class FlameStageContextProvider(RedAbsorptionStageContextProvider):
         inherit_previous_candidate: bool = False,
         artifact_store: ArtifactStore | None = None,
         run_store: RunStore | None = None,
+        social_knowledge: bool = False,
+        neighbor_count: int = 3,
+        initial_smiles: str | None = None,
     ) -> None:
         if not isinstance(inputs, FlameRunInputs):
             raise TypeError("inputs must be FlameRunInputs")
@@ -39,6 +42,9 @@ class FlameStageContextProvider(RedAbsorptionStageContextProvider):
         self._inherit_previous_candidate = inherit_previous_candidate
         self._artifact_store = artifact_store
         self._run_store = run_store
+        self._social_knowledge = social_knowledge
+        self._neighbor_count = neighbor_count
+        self._initial_smiles = initial_smiles
 
     def _inspection_geometry(self) -> None:
         return None
@@ -86,6 +92,18 @@ class FlameStageContextProvider(RedAbsorptionStageContextProvider):
                 previous_reflection = self._previous_reflection(context)
             if previous_reflection is not None:
                 additions["previous_reflection"] = previous_reflection
+            if self._social_knowledge:
+                from .research_control import molecular_topology, social_packet
+                if self._run_store is None:
+                    raise ValueError("social knowledge requires a run store")
+                raw = self._run_store.get_iteration_snapshot_json(tool_context.run_id, tool_context.iteration_id)
+                if raw is None:
+                    raise ValueError("social knowledge requires the exact committed generation")
+                snapshot = IterationSnapshot.model_validate(raw)
+                topology = molecular_topology(snapshot, self._initial_smiles, self._neighbor_count)
+                additions["social_knowledge"] = social_packet(self._run_store, snapshot, tool_context.particle_id, topology)
+                parent = context.get("parent_continuation_state")
+                additions["current_parent_smiles"] = parent.get("canonical_isomeric_smiles") if isinstance(parent, Mapping) else self._initial_smiles
             return additions
         if stage is AgentStage.PROPOSING_ACTION:
             if all(

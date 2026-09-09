@@ -30,6 +30,63 @@ class QualityAdapter:
         )
 
 
+def test_behavior_update_uses_observed_position_and_records_components():
+    space = ContinuousBoxPositionSpace([-1.0], [1.0])
+    snapshot = initial_snapshot(run_id="run-1", run_seed=5,
+        config_snapshot_hash="a"*64, particle_ids=("p0",), space=space)
+    episode = _episode("p0", 0, quality=1)
+    updated = advance_snapshot(snapshot, (episode,), run_seed=5, space=space,
+        adapter=QualityAdapter(), topology=RingTopology(),
+        update_rule=ConstrictedUpdateRule(), failure_threshold=2,
+        use_realized_position=True)
+    assert updated.particles[0].position == (0.0,)
+    trace = updated.update_traces['p0'].behavior_update
+    assert trace['source_position'] == (0.0,)
+    assert trace['personal_component'] == (0.0,)
+    assert trace['local_component'] == (0.0,)
+
+
+@pytest.mark.asyncio
+async def test_three_particles_two_generations_use_frozen_topology_and_recover():
+    from multi_agent_pso.orchestration import SynchronousSwarmRunner
+    from multi_agent_pso.core.topology import DistanceMatrixTopology
+    from tests.orchestration.fakes import FakeRunStore
+    store = FakeRunStore()
+    topology_inputs = []
+    def topology_for(snapshot):
+        topology_inputs.append(snapshot.iteration_id)
+        ids = [p.particle_id for p in snapshot.particles]
+        return DistanceMatrixTopology({a:{b:float(a != b) for b in ids} for a in ids}, k=1)
+    class Loop:
+        async def run_particle(self, run_id, particle_id, iteration_id, resume=None):
+            result = _episode(particle_id, iteration_id,
+                quality=1+int(particle_id[1:])+iteration_id,
+                candidate_hash=str(int(particle_id[1:])+1)*64)
+            data = result.model_dump(mode='json')
+            data['realized_position'] = data['evaluated_position'] = [0.1*(int(particle_id[1:])+iteration_id)]
+            return AgentEpisode.model_validate(data)
+    runner = SynchronousSwarmRunner(run_id='run-1',run_seed=5,config_snapshot_hash='a'*64,
+        space=ContinuousBoxPositionSpace([-1.],[1.]),adapter=QualityAdapter(),
+        topology=RingTopology(),topology_factory=topology_for,use_realized_position=True,
+        update_rule=ConstrictedUpdateRule(global_mix=.15),store=store,
+        episode_factory=lambda _:Loop(),particle_ids=('p0','p1','p2'))
+    first = await runner.run(iterations=1)
+    # Resume helper must retain both newly introduced settings.
+    resumed = runner.resume()
+    assert resumed.use_realized_position and resumed.topology_factory is topology_for
+    assert first.final_snapshot.gbest.fitness == 3.
+    assert topology_inputs == [0]
+    assert first.final_snapshot.update_traces['p0'].behavior_update['global_component'][0] > 0
+    # Fresh run for two generations; a completed one-generation budget cannot expand.
+    store2 = FakeRunStore()
+    runner.store = store2
+    result = await runner.run(iterations=2)
+    assert result.final_snapshot.iteration_id == 2
+    assert result.final_snapshot.gbest.fitness == 4.
+    assert topology_inputs == [0,0,1]
+    assert all(t.behavior_update is not None for t in result.final_snapshot.update_traces.values())
+
+
 class SelectiveTopology:
     def select_social_best(self, particle_id, particle_order, bests):
         return None if particle_id == "p0" else "p1"

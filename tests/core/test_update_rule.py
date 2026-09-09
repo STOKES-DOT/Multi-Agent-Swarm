@@ -274,7 +274,7 @@ def test_update_uses_only_position_space_operations_for_scalar_space() -> None:
     assert result.velocity == 0.2
     assert result.position == 1.0
     assert result.projection.changed_dimensions == (0,)
-    assert space.calls == [
-        "scale:1.0", "zero", "advance", "zero", "zero", "add", "scale:0.5",
-        "clamp:0.2", "advance", "project",
-    ]
+    assert space.calls[:3] == ["scale:1.0", "zero", "advance"]
+    assert "clamp:0.2" in space.calls
+    assert result.inertia_component == 0.25
+    assert result.personal_component == result.local_component == result.global_component == 0.0

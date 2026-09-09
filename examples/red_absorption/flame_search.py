@@ -15,7 +15,8 @@ from pydantic import JsonValue
 
 from multi_agent_pso.configuration import load_run_inputs, load_task_package
 from multi_agent_pso.core import ArtifactRef
-from multi_agent_pso.core.topology import RingTopology
+from multi_agent_pso.core.topology import RingTopology, GlobalBestTopology
+from .research_control import molecular_topology
 from multi_agent_pso.core.update_rule import ConstrictedUpdateRule
 from multi_agent_pso.orchestration import AgentLoop, SynchronousSwarmRunner
 from multi_agent_pso.resources import AsyncSemaphoreResourceManager, DurableBudgetLedger
@@ -34,6 +35,7 @@ from .flame_workflow import (
     FlameWorkflowResources,
     FlameWorkflowToolProvider,
     execute_flame_command,
+    flame_cache_key,
 )
 from .preflight import _default_auth_probe, _resolve_probe
 from .search import _make_private_run_root
@@ -326,6 +328,7 @@ async def run_flame_search(
             ledger=ledger,
             run_id=run_id,
         )
+        resources.cache[flame_cache_key(inputs, parent_smiles)] = prediction
         slots = AsyncSemaphoreResourceManager(
             agent_concurrency=task.spec.concurrency.agents,
             evaluation_concurrency=task.spec.concurrency.evaluations,
@@ -337,6 +340,9 @@ async def run_flame_search(
             inherit_previous_candidate=True,
             artifact_store=artifacts,
             run_store=store,
+            social_knowledge=task.spec.pso.topology.type == "similarity",
+            neighbor_count=task.spec.pso.topology.neighbor_count,
+            initial_smiles=parent_smiles,
         )
         async def run_attempt(runtime):
             def make_loop(particle_id, target, continuation_state=None):
@@ -396,12 +402,17 @@ async def run_flame_search(
                 config_snapshot_hash=config_hash,
                 space=task.plugins.position_space,
                 adapter=task.plugins.task_adapter,
-                topology=RingTopology(task.spec.pso.topology.neighborhood_radius),
+                topology=(GlobalBestTopology() if task.spec.pso.topology.type == "global"
+                          else RingTopology(task.spec.pso.topology.neighborhood_radius)),
+                topology_factory=(lambda snapshot: molecular_topology(snapshot, parent_smiles, task.spec.pso.topology.neighbor_count))
+                    if task.spec.pso.topology.type == "similarity" else None,
+                use_realized_position=task.spec.pso.use_realized_position,
                 update_rule=ConstrictedUpdateRule(
                     task.spec.pso.cognitive_coefficient,
                     task.spec.pso.social_coefficient,
                     task.spec.pso.constriction_factor,
                     task.spec.pso.velocity_clamp,
+                    global_mix=task.spec.pso.global_social_mix,
                 ),
                 store=store,
                 episode_factory=lambda target: make_loop("p0", target),

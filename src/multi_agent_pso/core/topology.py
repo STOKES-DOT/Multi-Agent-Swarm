@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import math
 from numbers import Real
 from typing import Mapping, Protocol, runtime_checkable
+from types import MappingProxyType
 
 
 @runtime_checkable
@@ -124,3 +125,41 @@ class GlobalBestTopology:
     ) -> str | None:
         normalized_bests = _validate_selection_inputs(particle_id, particle_order, bests)
         return _select_best(particle_order, normalized_bests)
+
+
+class DistanceMatrixTopology:
+    """Immutable nearest-neighbor topology; distances are supplied by an adapter."""
+
+    def __init__(self, distances: Mapping[str, Mapping[str, float]], k: int = 3):
+        if type(k) is not int or k < 1 or not distances:
+            raise ValueError("k must be positive and distances nonempty")
+        keys = set(distances)
+        if any(not isinstance(key, str) or not key for key in keys):
+            raise ValueError("particle identifiers must be nonempty strings")
+        if any(not isinstance(row, Mapping) or set(row) != keys for row in distances.values()):
+            raise ValueError("distance matrix must be square and complete")
+        matrix = {}
+        for key, row in distances.items():
+            if set(row) != keys:
+                raise ValueError("distance matrix must be square and complete")
+            for other, value in row.items():
+                if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or value < 0:
+                    raise ValueError("distance must be finite and nonnegative")
+                if key == other and value != 0:
+                    raise ValueError("distance diagonal must be zero")
+                if value != distances[other][key]:
+                    raise ValueError("distance matrix must be symmetric")
+            matrix[key] = MappingProxyType(dict(row))
+        self.distances = MappingProxyType(matrix)
+        self.k = k
+
+    def neighbors(self, particle_id: str) -> tuple[str, ...]:
+        row = self.distances[particle_id]
+        return tuple(sorted((key for key in row if key != particle_id),
+                            key=lambda key: (row[key], key))[:self.k])
+
+    def select_social_best(self, particle_id, particle_order, bests):
+        normalized = _validate_selection_inputs(particle_id, particle_order, bests)
+        if set(particle_order) != set(self.distances):
+            raise ValueError("distance matrix particle identities mismatch")
+        return _select_best((particle_id, *self.neighbors(particle_id)), normalized)
