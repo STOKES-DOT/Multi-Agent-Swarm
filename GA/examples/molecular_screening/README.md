@@ -1,77 +1,110 @@
-# GA 分子吸收筛选示例
+# GA Molecular Absorption Screening Example
 
-流程：选择编辑基因父代 → 块交叉 → Wiki/Codex 变异及假说 → 固定母体上
-MoleculeEditor 表达 → FLAME 四性质预测 → reward 与假说判定 → 反思 →
-三代死亡/补位和种群更新。
+Workflow: select parent edit genomes → block crossover → Wiki/Codex-guided
+mutation and hypothesis generation → MoleculeEditor expression on a fixed seed
+→ FLAME predictions for four properties → reward and hypothesis assessment
+→ reflection → three-generation mortality, replacement, and population update.
 
-本示例有可运行的 mock 与 live 入口。工具/runtime 复用仓库 PSO 子项目的
-检查过的组件；独立 GA 核心不依赖这些组件。环境需有已有 PSO 依赖和本地
-Codex 登录；当前配置 model 为 gpt-5.6-luna。
+This example provides runnable mock and live entry points. Its tools and runtime
+reuse validated components from the PSO subproject; the generic GA core does not
+depend on those components. The environment requires the existing PSO dependencies
+and an authenticated local Codex installation. The configured model is
+`gpt-5.6-luna`.
 
-目标区间由 config.json 的 target_lower_nm/target_upper_nm 指定。目前沿用
-620–750 nm 红光设置；如果目标是近红外，应先显式修改区间，并使用新运行目录。
-FLAME 为 DCM 溶液相模型代理；它提供单个吸收标量，不证明首个明显吸收峰，
-也不替代 TDDFT。PLQY 和 log10 epsilon 合计辅助权重最多 0.01。
+The target interval is set by `target_lower_nm` and `target_upper_nm` in
+`config.json`. The current default is the 620–750 nm red-light band. To target
+near-infrared absorption, explicitly change the interval and use a new run
+directory. FLAME is a solution-phase proxy model configured for DCM. It provides
+a scalar absorption prediction, does not establish the first prominent absorption
+peak, and does not replace TDDFT. The combined auxiliary weight of PLQY and
+log10 epsilon is at most 0.01.
 
-从仓库根目录执行：
+Run the following commands from the repository root:
 
 ```sh
-# 完整生命周期模拟，不使用真实 Codex 或 FLAME
+# Simulate the complete lifecycle without real Codex or FLAME calls
 python GA/examples/molecular_screening/run.py --runs-dir GA/runs/mock-check
 
-# 真实母体和 FLAME 预检；不生成设计种群
+# Validate the real seed and FLAME baseline without creating a design population
 python GA/examples/molecular_screening/run.py --live --preflight-only \
   --runs-dir GA/runs/live-check --confirm-max-new-evaluations 100
 
-# 明确启动 20 个体 × 5 代
+# Explicitly start 20 individuals for 5 generations
 python GA/examples/molecular_screening/run.py --live \
   --runs-dir GA/runs/live-check --confirm-max-new-evaluations 100
 
-# 进度读取不启动计算
+# Read progress without starting calculations
 python GA/examples/molecular_screening/status.py GA/runs/live-check
 ```
 
-100 是最多新子代预测预算；初始母体预检另加 1，持久化 ledger 总上限为101。
-相同化学结构/模型/溶剂命中缓存不新增预测。后端瞬态重试沿用其单次预算项；
-这是新结构评价预算，不是底层模型子进程启动次数预算。
+The budget of 100 covers new offspring predictions. The initial seed preflight
+adds one evaluation, giving a persistent ledger limit of 101. Cache hits for the
+same chemical structure, model, and solvent do not consume another prediction.
+Transient backend retries use the same evaluation budget item. This is a budget
+for new structure evaluations, not a count of underlying model subprocess launches.
 
-每个工作谱系有独立 Codex thread。存活谱系从已保存 thread 引用恢复；死亡
-谱系不再恢复，新成员第一次请求创建新 thread 和独立目录。agent 在只读
-sandbox 规划基因，所有分子修改和评价由控制器执行。
+Each worker lineage has an independent Codex thread. Surviving lineages restore
+their saved thread references. Dead lineages are never restored: a replacement
+creates a new thread and a separate directory on its first request. Agents plan
+genes in a read-only sandbox; the controller performs all molecular editing and
+evaluation.
 
-每次检索片段由控制器赋予 W0、W1 等显式 evidence_id；输出 schema 的 enum
-限定为本次片段编号。同一论文的不同片段使用不同编号，不能填论文号或行号。
-代码仍独立验证返回编号；编号错误会提示合法值并要求只修正引用格式。
+The controller assigns explicit `evidence_id` values such as `W0` and `W1` to
+retrieved passages. The output schema restricts its enum to the IDs supplied in
+that request. Different passages from the same paper have different IDs; paper
+numbers and line numbers are not valid substitutes. Returned IDs are also checked
+in code. Citation-format errors report the valid IDs and ask for citation-only
+corrections.
 
-错误经验单独存放在 experience/，不进入基因或 reward。每个新请求会显式读取
-error_memory：同一谱系的最近失败/失败反思、编译器认可的公共编码规则，以及
-同一参考母体且匹配所选父代/供体基因型的结构失败案例和模型判定。死亡后新
-lineage_id 不加载旧私有失败或反思，仍可读取公共编码规则及适用的案例。
-自然语言反思不会自动变成全局化学禁令；REFUTED 只保留模型判定及条件。
+Edit experience is stored separately in `experience/`; it is not part of the
+genome or reward. Each new request explicitly receives `error_memory`: recent
+failures and failure reflections from the same lineage, shared coding rules
+grounded in compiler contracts, and structural failure cases or model outcomes
+matching the fixed seed and the selected parent/donor genotypes. After death, a
+new `lineage_id` does not load the previous lineage's private failures or
+reflections. It can still read shared coding rules and applicable cases.
+Natural-language reflections never automatically become global chemical
+prohibitions. `REFUTED` retains the model verdict and its conditions.
 
-共享记忆只读取前代记录，每次请求的完整记忆包冻结在 agent-events 下的
-experience.json，避免完成顺序影响并发个体或破坏重放。已提交的失败提案
-恢复时复用原错误，不重跑同一次失败检查。记忆条目数和提示摘要有独立预算。
+Shared memory reads only previous-generation records. The complete memory packet
+for each request is frozen in `agent-events/<request_id>/experience.json` so that
+completion order cannot affect concurrent individuals or invalidate replay.
+Recovery reuses committed proposal failures verbatim rather than executing the
+same failed check again. Memory retrieval and prompt summaries have separate
+size limits.
 
-最多三次提案（含格式/编辑修正），失败后保留该工作谱系原个体及已知评价，
-记录 fallback/NOT_TESTED 并进行失败反思。失败分子不计作三代性质恶化。
-反思调用失败会记录 reflection_error，不丢弃已经成功的外部评价。
+Each request allows at most three proposals, including format and edit
+corrections. If all fail, the worker lineage retains its original individual and
+known evaluation, records `fallback`/`NOT_TESTED`, and reflects on the failure.
+Invalid edits do not count as three generations of worsening molecular properties.
+A failed reflection call records `reflection_error` without discarding a
+successful external evaluation.
 
-运行产物：
+Run artifacts:
 
-- manifest.json：配置、源码、Wiki、技能和输入身份。
-- preflight.json：检查后的参考母体和模型基线。
-- population/population-*.json：代快照、谱系轨迹、死亡事件及最好结果。
-- population/trials/：请求、遗传父代、供体和每个子代结果。
-- contexts/：各谱系的独立线程引用；死亡补位使用新目录。
-- agent-events/：提示、原始回答、token 用量、假说、反思和失败信息。
-- expressions/：基因、编译后的命令、实际分子与状态哈希链。
-- compiler/cli-records/：检查、片段和编辑调用的原始输入/输出及退出状态。
-- scientific-artifacts/、evaluation_budget.jsonl：科学工件、缓存与预算。
+- `manifest.json`: configuration, source code, Wiki, skill, and input identities.
+- `preflight.json`: inspected reference seed and model baseline.
+- `population/population-*.json`: generation snapshots, lineage trajectories,
+  death events, and best results.
+- `population/trials/`: requests, genetic parents, donors, and offspring outcomes.
+- `contexts/`: independent thread references for each lineage; replacements use
+  new directories.
+- `agent-events/`: prompts, raw responses, token usage, hypotheses, reflections,
+  failure details, and frozen experience packets.
+- `experience/`: structured failure cases, model outcomes, and lineage reflections.
+- `expressions/`: genes, compiled commands, actual molecules, and state-hash chains.
+- `compiler/cli-records/`: raw inputs, outputs, and exit states for inspection,
+  fragment, and edit calls.
+- `scientific-artifacts/` and `evaluation_budget.jsonl`: scientific artifacts,
+  cache records, and evaluation budget accounting.
 
-后台运行须使用 `PSO/src/multi_agent_pso/launchd.py` 生成的单次 plist，
-KeepAlive=false，禁止用 launchctl submit 保活有限任务。构建验证期间未启动
-真实 GA 种群；mock 验证结果不能作为分子优化效果。
+For background execution, use the one-shot plist generator at
+`PSO/src/multi_agent_pso/launchd.py` with `KeepAlive=false`. Do not use
+`launchctl submit` to keep a finite search alive. No real GA population was
+started during the build-validation phase; mock validation results do not
+establish molecular optimization performance.
 
-Codex 传输断开最多进行四次 runtime 尝试（初始加三次恢复），复用已提交
-trial/agent-event/模型缓存；不设置外层运行时限。重试耗尽后退出并保留 checkpoint。
+Codex transport interruptions allow at most four runtime attempts: the initial
+attempt plus three recovery attempts. Recovery reuses committed trials, agent
+events, and model caches. There is no outer run timeout. After the retry limit is
+reached, the process exits and preserves its checkpoints.
