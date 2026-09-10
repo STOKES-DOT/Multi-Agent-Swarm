@@ -9,6 +9,15 @@ from multi_agent_pso.storage import FileArtifactStore
 from multi_agent_pso.tools import JsonCommandProvider
 from examples.red_absorption.flame_workflow import FlameWorkflowResources, FlameWorkflowToolProvider
 from examples.red_absorption.similarity import parent_morgan_similarity, PARENT_SIMILARITY_METHOD
+from multi_agent_ga.persistence import digest, publish
+
+
+def evaluation_reference(directory, prediction):
+    record = {'schema':'ga-flame-evaluation:v1', 'prediction':prediction}
+    identity = digest(record)
+    relative = f'evaluations/{identity}.json'
+    publish(directory/relative,record)
+    return {'kind':'ga-record','relative_path':relative,'sha256':identity}
 
 
 class FlameService:
@@ -31,7 +40,8 @@ class FlameService:
         if result.status is not ToolStatus.SUCCESS:
             raise RuntimeError(result.error)
         record = result.to_json()['payload']
-        return record['flame_prediction'], record['molecule_artifact']
+        prediction = record['flame_prediction']
+        return prediction, evaluation_reference(self.directory,prediction)
 
     async def close(self):
         await self.command.aclose()
