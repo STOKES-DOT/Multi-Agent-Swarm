@@ -94,3 +94,42 @@ async def test_unretrieved_evidence_never_reaches_evaluator_and_records_fallback
     assert not calls
     assert len(list((tmp_path/'agent-events/r1').glob('failure-*.json')))==3
     assert read_record(tmp_path/'agent-events/r1/fallback.json')['hypothesis_outcome']['status']=='NOT_TESTED'
+
+
+@pytest.mark.asyncio
+async def test_next_generation_receives_explicit_failures_and_fallback_reflection(tmp_path):
+    from multi_agent_ga.core import OffspringRequest
+    from multi_agent_ga.persistence import read_record
+    class CheckMemory(Runtime):
+        async def run_stage(self, thread, request):
+            if request.stage is AgentStage.HYPOTHESIZING:
+                context=json.loads(request.prompt.split('\nContext:\n')[1])
+                if context['generation']==2:
+                    assert len(context['error_memory']['private_failures'])==3
+                    assert context['error_memory']['private_reflections']
+                    assert context['error_memory']['coding_rules']['add_atom_site']['observed_count']==3
+            return await super().run_stage(thread,request)
+    class FailFirst(Compiler):
+        def __init__(self):
+            self.calls=0
+        async def express(self, program):
+            self.calls+=1
+            if program.genes[0].block=='1':
+                raise ValueError('add_atom requires site roles []')
+            return await super().express(program)
+    wiki=SimpleNamespace(search=lambda _: [SimpleNamespace(to_json=lambda: {'relative_path':'wiki.md','line_start':1,'line_end':2})])
+    async def evaluate(molecule):
+        return {'absorption_nm':500.,'emission_nm':550.,'plqy':.5,'epsilon_m1_cm1':1e4}, {'artifact':'test'}
+    compiler=FailFirst()
+    worker=CodexGeneWorker(runtime=CheckMemory(),wiki=wiki,compiler=compiler,evaluate=evaluate,
+                          objective=SpectralObjective(),directory=tmp_path,skill_text='fixture')
+    founder=Individual('seed',EditProgram(()).encode(),-1.,False,target_distance=100.)
+    def req(g):
+        return OffspringRequest(f'r{g}',g,0,founder,None,True,42,'lineage-1',founder)
+    assert await worker(req(1)) is None
+    assert compiler.calls==3
+    assert await worker(req(1)) is None
+    assert compiler.calls==3
+    assert await worker(req(2)) is not None
+    packet=read_record(tmp_path/'agent-events/r2/experience.json')
+    assert packet['private_failures'] and packet['private_reflections']

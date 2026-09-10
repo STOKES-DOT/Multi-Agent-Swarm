@@ -8,6 +8,7 @@ import random
 from multi_agent_ga.core import Individual
 from multi_agent_ga.persistence import canonical, digest, publish, read_record
 from .genes import EditGene, EditProgram, crossover
+from .error_memory import ErrorMemory
 from .support import AgentStage, StageRequest, WikiQuery
 
 
@@ -72,6 +73,11 @@ Respect allow_genome_change: false means explain and return exactly the supplied
 When feedback reports an invalid program, explicitly revise the gene program; never hide a repair.
 The controller binds/validates chemistry using MoleculeEditor and calculates FLAME reward.
 Wiki evidence inspires hypotheses, not proven mechanisms or promised spectral improvements.
+Read error_memory before proposing edits: apply coding_rules as compiler grammar; use your
+private_failures/private_reflections to avoid repetition. Structural failures are conditional
+examples for the recorded seed/program/sites, not bans on whole operation classes. Model
+outcomes concern numerical predictions, not proven mechanisms. Only current Wiki passage IDs
+belong in evidence_ids; error-memory references are separate execution provenance.
 '''
 
 
@@ -80,6 +86,7 @@ class CodexGeneWorker:
         self.runtime, self.wiki, self.compiler, self.evaluate = runtime, wiki, compiler, evaluate
         self.objective, self.directory, self.skill_text = objective, directory, skill_text
         self.threads = {}
+        self.error_memory = ErrorMemory(directory/'experience', digest(compiler.describe_seed()))
 
     async def _thread(self, lineage):
         if lineage not in self.threads:
@@ -131,19 +138,34 @@ class CodexGeneWorker:
                 program = crossover(program, other, left_cut=rng.choice(program.cuts), right_cut=rng.choice(other.cuts))
             except ValueError as error:
                 # An incompatible recombination is itself a failed trial, never silently repaired.
+                self.error_memory.record_failure(request, -1, f'{type(error).__name__}: {error}', program)
                 return None
         hits = [hit.to_json() for hit in self.wiki.search(WikiQuery(
             'red absorption fluorescence conjugation donor acceptor molecular design', 8,
             score_threshold=.1, snippet_max_chars=1200))]
         hits, proposal_schema = evidence_contract(hits)
+        memory_path = self.directory/'agent-events'/request.request_id/'experience.json'
+        if memory_path.exists():
+            error_memory = read_record(memory_path)
+        else:
+            error_memory = self.error_memory.packet(request)
+            publish(memory_path,error_memory)
         context = {'seed': self.compiler.describe_seed(), 'chromosome': {'genes':[asdict(g) for g in program.genes]},
                    'generation': request.generation, 'worker_lineage_id': request.lineage_id,
                    'parent_phenotype': request.parent.evidence, 'wiki_hits': hits,
                    'allowed_evidence_ids': [hit['evidence_id'] for hit in hits],
                    'allow_genome_change': request.mutate, 'objective': asdict(self.objective),
+                   'error_memory': error_memory,
                    'seed_number': request.seed, 'feedback': None}
         feedback = []
         for attempt in range(3):
+            failure_path = self.directory/'agent-events'/request.request_id/f'failure-{attempt}.json'
+            if failure_path.exists():
+                # Reuse a committed failure verbatim; rerunning the CLI could change
+                # diagnostic paths and invalidate subsequent cached prompts.
+                feedback.append(read_record(failure_path)['error'])
+                continue
+            child_program = None
             try:
                 context['feedback'] = feedback
                 proposal = await self._ask(request, AgentStage.HYPOTHESIZING,
@@ -193,12 +215,15 @@ class CodexGeneWorker:
                         REFLECTION, f'reflection-{attempt}')
                 except Exception as error:
                     evidence['reflection_error'] = f'{type(error).__name__}: {str(error)[:300]}'
+                evidence['experience_reference'] = self.error_memory.record_outcome(
+                    request, attempt, child_program, evidence)
                 return Individual(child_program.identity, child_program.encode(), metrics['fitness'],
                                   metrics['feasible'], json.dumps(evidence), metrics['target_distance'])
             except Exception as error:
                 feedback.append(f'{type(error).__name__}: {str(error)[:800]}')
+                experience_ref = self.error_memory.record_failure(request,attempt,feedback[-1],child_program)
                 publish(self.directory / 'agent-events' / request.request_id / f'failure-{attempt}.json',
-                        {'error': feedback[-1], 'proposal_attempt': attempt+1})
+                        {'error': feedback[-1], 'proposal_attempt': attempt+1, 'experience_reference':experience_ref})
         retained = request.source_individual or request.parent
         fallback = {'reason':'three_proposals_failed', 'optimization_eligible':False,
                     'retained_individual': asdict(retained), 'errors':feedback,
@@ -210,5 +235,6 @@ class CodexGeneWorker:
                 REFLECTION, 'fallback-reflection')
         except Exception as error:
             fallback['reflection_error'] = f'{type(error).__name__}: {str(error)[:300]}'
+        fallback['experience_reference'] = self.error_memory.record_fallback(request,fallback)
         publish(self.directory / 'agent-events' / request.request_id / 'fallback.json', fallback)
         return None
