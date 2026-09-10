@@ -23,8 +23,9 @@ python tools/test_projects.py
 ```
 
 `tools/test_projects.py` 分别运行两个测试集，默认不会启动 Codex 或科学计算。
-分子编辑、量化协议、模型权重和已有评分规则仍在 PSO 子项目维护；GA 的
-真实 Wiki 变异与基因表达服务接线尚待完成，当前提供可测试的接口和算法核心。
+GA 的通用算法、三代死亡机制和断点恢复位于 `GA/src/`；分子编辑基因、Wiki
+变异、Codex 会话与 FLAME 筛选入口位于 [独立例子](GA/examples/molecular_screening/README.md)。
+例子复用 PSO 的工具服务，但不会调用 PSO 的位置、速度或种群更新。
 
 本地迁移保留 `Multi-Agent-PSO → Multi-Agent-Swarm/PSO` 兼容链接，以便历史
 绝对路径和现有 conda editable install 继续工作。历史工件、哈希及任务快照

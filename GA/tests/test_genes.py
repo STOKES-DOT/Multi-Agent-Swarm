@@ -1,8 +1,8 @@
 import pytest
 
 from multi_agent_ga import Individual, OffspringRequest
-from multi_agent_ga.genes import EditGene, EditProgram, crossover
-from multi_agent_ga.molecular import MolecularGeneWorker, WikiMutation, EvaluatedPhenotype
+from molecular_screening.genes import EditGene, EditProgram, crossover
+from molecular_screening.variation import MolecularGeneWorker, WikiMutation, EvaluatedPhenotype
 
 
 def program():

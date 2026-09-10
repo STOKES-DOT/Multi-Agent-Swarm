@@ -27,6 +27,7 @@ class Individual:
     fitness: float
     feasible: bool
     evidence_json: str = '{}'
+    target_distance: float | None = None
 
     def __post_init__(self):
         if not self.identity or not isinstance(self.identity, str) or not self.genome or not isinstance(self.genome, str):
@@ -35,6 +36,11 @@ class Individual:
             raise ValueError('fitness must be finite')
         if type(self.feasible) is not bool:
             raise ValueError('feasible must be boolean')
+        if self.target_distance is not None and (
+            type(self.target_distance) not in (int, float)
+            or not math.isfinite(self.target_distance) or self.target_distance < 0
+        ):
+            raise ValueError('target_distance must be finite and nonnegative')
         evidence = json.loads(self.evidence_json, parse_constant=lambda _: (_ for _ in ()).throw(ValueError('nonfinite evidence')))
         if not isinstance(evidence, dict):
             raise ValueError('evidence must be a JSON object')
@@ -78,6 +84,8 @@ class OffspringRequest:
     donor: Individual | None
     mutate: bool
     seed: int
+    lineage_id: str = ''
+    source_individual: Individual | None = None
 
 
 @dataclass(frozen=True)

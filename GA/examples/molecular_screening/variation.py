@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import json
 import random
 
-from .core import Individual, OffspringRequest
+from multi_agent_ga.core import Individual, OffspringRequest
 from .genes import EditProgram, crossover
 
 
@@ -45,8 +45,8 @@ class MolecularGeneWorker:
         if request.donor is not None:
             donor = EditProgram.decode(request.donor.genome)
             rng = random.Random(request.seed)
-            program = crossover(program, donor, left_cut=rng.randrange(len(program.genes)+1),
-                                right_cut=rng.randrange(len(donor.genes)+1))
+            program = crossover(program, donor, left_cut=rng.choice(program.cuts),
+                                right_cut=rng.choice(donor.cuts))
         mutation = None
         if request.mutate:
             mutation = await self.wiki_mutator(program, request)

@@ -1,0 +1,20 @@
+{
+  "population_size": 20,
+  "generations": 5,
+  "elite_count": 2,
+  "tournament_size": 3,
+  "crossover_probability": 0.6,
+  "mutation_probability": 0.8,
+  "concurrency": 4,
+  "seed": 20260910,
+  "death_window": 3,
+  "death_tolerance_nm": 1.0,
+  "execution_failure_limit": 3,
+  "target_lower_nm": 620.0,
+  "target_upper_nm": 750.0,
+  "model": "gpt-5.6-luna",
+  "seed_smiles": "O=c1c2ccccc2[nH]c2ccccc12",
+  "wiki": "/Users/jiaoyuan/Library/Mobile Documents/com~apple~CloudDocs/Documents/GitHub/ChemAgent/.worktrees/codex-opencode-runtime-base/.openchem/wiki",
+  "skill": "/Users/jiaoyuan/Documents/ChatGPT/MolToGraph/.agents/skills/molecule-editor",
+  "flame_inputs": "../../../PSO/examples/red_absorption/inputs/acridone-flame-unbounded.yaml"
+}

@@ -1,43 +1,52 @@
-# 编辑操作作为基因
+# 分子编辑操作编码
 
-用户确认的定义：基因是 agent 编辑分子的操作编码，Wiki 可以产生变异。
+应用实现位于 `examples/molecular_screening/`。基因是编辑操作，完整分子是表型。
 
-| 对象 | 定义 |
-|---|---|
-| 基因 | 一个编辑操作：操作类型、可重新绑定的化学位点规则、参数 |
-| 染色体 | 有顺序的 `EditGene` 序列 |
-| 表达 | 在协议指定的参考母体上绑定位点，执行完整操作序列 |
-| 表型 | MoleculeEditor 验证得到的实际分子及工件 |
-| 适应度 | 外部评价器计算的分子 reward |
-| 交叉 | 两个父代操作序列之间的片段交换 |
-| 变异 | agent 根据 Wiki 证据/反思提出操作增删、替换、参数或位点变化 |
-
-示例（操作意图，不是已验证的编辑请求）：
+`EditGene` 保存 `operation`、`site_rule`、`parameters_json` 和 `block`。
+生产表达器要求 site_rule 是 JSON 对象，使用冻结母体锚点或前序输出符号。
+自然语言 site_rule 仅可用于设计讨论，不能进入实际表达。
 
 ```json
 {
   "operation": "replace_atom",
-  "site_rule": "carbonyl oxygen",
-  "parameters_json": "{\"atomic_number\":16}"
+  "site_rule": "{\"atom\":\"seed.atom.0\"}",
+  "parameters_json": "{\"atomic_number\":16}",
+  "block": "carbonyl_change"
 }
 ```
 
-`site_rule` 目前是可读的化学位点规则；它还不是自动、唯一的 SMARTS 匹配器。
-后续绑定器需要把规则解析到当前检查图的 AtomId/BondId，记录绑定结果并处理
-歧义。基因参数禁止保存父代专属 AtomId、BondId 和 state_hash。
-取代片段的 SMILES 可以是基因参数，但完整目标分子的 SMILES 属于表型记录。
+`seed.atom.N` 和 `seed.bond.N` 是本次冻结参考母体检查表的零起始索引，
+由控制器绑定到检查后的真实 AtomId/BondId。不能把它们跨不同母体协议解释。
+它们不保护原子；删除某锚点后再引用它会被拒绝。
 
-基因序列可以交换，但交叉后的命令不能直接信任：前一步可能删除后一步需要的
-位点。表达服务必须重新绑定位点并让 MoleculeEditor 校验整个操作序列。
-不允许通过删除元素、键级、位点或谱系检查来提高成功率。
+各操作的 site_rule 键：
 
-Wiki 是变异提案的知识来源。每次 Wiki 变异必须携带假说和检索证据引用；
-证据是否真实检索到由 mutator 实现校验，字符串非空本身不是证据验证。
-Wiki 不修改 reward；假说通过与否由冻结计算协议返回的结果判定。
+| 操作 | 位点角色 |
+|---|---|
+| add_atom | 空对象 |
+| remove_atom / replace_atom | atom |
+| add_bond | begin, end |
+| remove_bond / change_bond | bond |
+| attach_fragment | anchor |
+| detach_fragment / substitute_fragment | bond, retained |
 
-表达协议必须冻结参考母体及绑定/执行方式。同一完整染色体应针对该参考母体
-表达，不能把已经执行过它的子代当作初始母体，再重复应用整个序列。
-如果采用“只执行本代新增编辑”的增量表达，需另外记录前缀及起始工件身份。
-该选择将在真实表达服务实现前固定；当前不声称已具备通用自动交叉表达能力。
+新增原子/键可通过参数 `symbol` 声明输出；后续位点使用 `output.name`。
+绑定器支持同一块内的事务局部引用，并从 CLI 返回映射记录已提交输出的实际 ID。
+片段操作使用 `fragment_smiles`、`fragment_anchor`（检查图的零起始原子索引）
+和 `bond_type`；片段由控制器调用 MoleculeEditor inspect 后装入命令。
 
-本地 mock 测试只验证上述数据流和 GA 更新，不建立任何光谱性能结论。
+相同 block 的相邻基因在同一事务提交。交叉仅发生于块边界，不能把
+`add_atom + add_bond` 的连接依赖拆开。跨块输出依赖重新绑定；缺失、删除或
+冲突的引用会产生无效子代，不能静默换位点。每个中间提交块都必须化学有效。
+
+染色体始终在同一冻结母体上完整表达，不重复以已编辑表型作为全程序起点。
+每次表达记录源状态哈希、编译命令和子状态哈希。没有人为原子数/片段大小限制，
+但保留 JSON 字节预算、有效化学域和有限资源预算。
+
+Wiki 变异返回完整的新操作程序、可证伪假说和本次检索命中编号；控制器验证
+引用确实属于本次检索。假说、证据和反思单独归档，不进入 genotype hash。
+仅交叉请求不允许 agent 顺便改变基因；需要修改必须由 mutation_requested 授权。
+
+正式 JSON 编码仍兼容早期 v1 容器，block 有默认值；自然语言位点的旧原型
+不会被生产绑定器接受。运行身份同时冻结代码与母体，因此不能把旧原型运行
+当成当前表达协议恢复。

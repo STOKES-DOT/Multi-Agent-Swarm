@@ -17,5 +17,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "examples"]
+markers = ["live: invokes local Codex or scientific tools"]
+addopts = "-m 'not live'"
 asyncio_mode = "auto"

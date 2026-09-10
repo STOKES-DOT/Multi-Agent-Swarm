@@ -13,12 +13,15 @@ class EditGene:
     operation: str
     site_rule: str
     parameters_json: str = '{}'
+    block: str = 'default'
 
     def __post_init__(self):
         if self.operation not in OPERATIONS:
             raise ValueError('unsupported edit operation')
         if not isinstance(self.site_rule, str) or not self.site_rule.strip():
             raise ValueError('site_rule must describe a transferable chemical site')
+        if not isinstance(self.block, str) or not self.block:
+            raise ValueError('gene block must be named')
         parameters = json.loads(self.parameters_json)
         if not isinstance(parameters, dict):
             raise ValueError('gene parameters must be an object')
@@ -45,6 +48,13 @@ class EditProgram:
         object.__setattr__(self, 'genes', tuple(self.genes))
         if not all(isinstance(gene, EditGene) for gene in self.genes):
             raise ValueError('program must contain EditGene records')
+        closed, previous = set(), None
+        for gene in self.genes:
+            if gene.block != previous:
+                if gene.block in closed:
+                    raise ValueError('edit blocks must be contiguous')
+                closed.add(gene.block)
+                previous = gene.block
 
     def encode(self) -> str:
         return json.dumps({'schema': 'molecular-edit-genome:v1',
@@ -62,11 +72,18 @@ class EditProgram:
     def identity(self) -> str:
         return hashlib.sha256(self.encode().encode()).hexdigest()
 
+    @property
+    def cuts(self):
+        return (0, *(i for i in range(1, len(self.genes))
+                     if self.genes[i].block != self.genes[i-1].block), len(self.genes))
+
 
 def crossover(left: EditProgram, right: EditProgram, *, left_cut: int, right_cut: int) -> EditProgram:
     """Instruction splice; expression must rebind and validate the sites."""
     if not 0 <= left_cut <= len(left.genes) or not 0 <= right_cut <= len(right.genes):
         raise ValueError('crossover cut is outside chromosome')
+    if left_cut not in left.cuts or right_cut not in right.cuts:
+        raise ValueError('crossover cannot split an atomic edit block')
     return EditProgram(left.genes[:left_cut] + right.genes[right_cut:])
 
 
