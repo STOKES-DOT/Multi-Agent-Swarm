@@ -238,6 +238,16 @@ async def run_flame_search(
     )
     run_id = f"flame-{config_hash[:24]}"
     root = _make_private_run_root(runs_dir)
+    # Check terminal state before authentication, model loading, or preflight.
+    # An external supervisor must not turn a paused run into repeated inference.
+    if not preflight_only and (root / 'runs.sqlite').is_file():
+        existing = SQLiteRunStore(root / 'runs.sqlite').get_latest_committed_snapshot_json(run_id)
+        if existing is not None:
+            status = existing.get('run_status')
+            if status == 'PAUSED_NO_SUCCESS' and resume_config_hash is None:
+                raise RuntimeError('run is PAUSED_NO_SUCCESS; explicit --resume-config-hash is required')
+            if status == 'COMPLETED':
+                raise RuntimeError('run is already COMPLETED; no new calculation was started')
     artifacts = FileArtifactStore(root / "artifacts")
     editor = MoleculeEditorProvider()
     flame = JsonCommandProvider(inputs.flame_argv)

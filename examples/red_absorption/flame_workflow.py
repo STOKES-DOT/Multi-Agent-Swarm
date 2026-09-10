@@ -264,6 +264,43 @@ def flame_input_hash(dye_smiles: str, solvent_smiles: str) -> str:
     ).hexdigest()
 
 
+def _parent_inspection_failure(inspection, graph) -> ToolResult | None:
+    """Separate command failures from actual graph/lineage disagreement."""
+    process = getattr(inspection, 'process', None)
+    process_status = getattr(process, 'status', None)
+    diagnostic = {
+        'processed': inspection.processed,
+        'chemical_status': inspection.chemical_status,
+        'geometry_status': inspection.geometry_status,
+        'process_status': getattr(process_status, 'value', None),
+        'exit_code': getattr(process, 'exit_code', None),
+    }
+    if not inspection.processed:
+        status = ToolStatus.TIMEOUT if process_status is JsonCommandStatus.TIMEOUT else ToolStatus.FAILED
+        detail = _molecule_editor_rejection(inspection).replace(
+            'MoleculeEditor rejected edit', 'MoleculeEditor parent inspection failed', 1
+        )
+        return ToolResult(status, payload={'inspection_diagnostic': diagnostic}, error=detail[:512])
+    live = _plain_json(inspection.candidate)
+    expected = _plain_json(graph)
+    if isinstance(live, dict) and isinstance(expected, dict):
+        # Chemical-only inspection deliberately does not regenerate geometry.
+        live['geometry_status'] = expected.get('geometry_status')
+        differing = sorted(k for k in live.keys() | expected.keys()
+                           if k not in live or k not in expected or live[k] != expected[k])
+    else:
+        differing = ['graph']
+    diagnostic['differing_fields'] = differing
+    if (inspection.chemical_status == 'VALID'
+            and inspection.geometry_status == 'NOT_REQUESTED'
+            and not inspection.ready_for_evaluator
+            and inspection.candidate is not None and not differing):
+        return None
+    detail = ', '.join(differing) if differing else 'inspection status'
+    return ToolResult(ToolStatus.REJECTED, payload={'inspection_diagnostic': diagnostic},
+                      error=f'parent inspection mismatch: {detail}'[:512])
+
+
 def flame_cache_key(inputs: FlameRunInputs, dye_smiles: str) -> FlameCacheKey:
     return (
         flame_input_hash(dye_smiles, inputs.flame_backend.solvent_smiles),
@@ -496,24 +533,9 @@ class FlameWorkflowToolProvider:
                 geometry=None,
                 timeout=self.inputs.flame_backend.timeout_seconds,
             )
-            live_graph = _plain_json(inspection.candidate)
-            expected_graph = _plain_json(graph)
-            if isinstance(live_graph, dict) and isinstance(expected_graph, dict):
-                live_graph["geometry_status"] = expected_graph.get(
-                    "geometry_status"
-                )
-            inspection_matches = (
-                inspection.geometry_status == "NOT_REQUESTED"
-                and not inspection.ready_for_evaluator
-                and live_graph == expected_graph
-            )
-            if (
-                not inspection.processed
-                or inspection.chemical_status != "VALID"
-                or inspection.candidate is None
-                or not inspection_matches
-            ):
-                return ToolResult(ToolStatus.REJECTED, error="parent inspection mismatch")
+            inspection_failure = _parent_inspection_failure(inspection, graph)
+            if inspection_failure is not None:
+                return inspection_failure
             edit = await self.editor.edit(
                 inspection,
                 authoritative["commands"],

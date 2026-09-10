@@ -18,6 +18,32 @@ class FakeRuntime:
         self.close_calls += 1
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('terminal_status', ['PAUSED_NO_SUCCESS', 'COMPLETED'])
+async def test_paused_restart_stops_before_auth_or_external_tools(tmp_path, monkeypatch, terminal_status):
+    from pathlib import Path
+    from tests.orchestration.fakes import make_fake_runner
+    runner = make_fake_runner(tmp_path, delays={}, seed=12, succeed=False)
+    await runner.run(iterations=3)
+    snapshot = runner.store.get_latest_committed_snapshot_json('run-1')
+    snapshot['run_status'] = terminal_status
+    (tmp_path / 'runs.sqlite').touch()
+    task, inputs = flame_contract(particles=20, iterations=5)
+    monkeypatch.setattr(flame_search_module, 'load_task_package', lambda _: task)
+    monkeypatch.setattr(flame_search_module, 'load_run_inputs', lambda *args: SimpleNamespace(value=inputs))
+    monkeypatch.setattr(flame_search_module, '_identity', lambda *args: 'a' * 64)
+    monkeypatch.setattr(flame_search_module, 'SQLiteRunStore', lambda _: SimpleNamespace(
+        get_latest_committed_snapshot_json=lambda _: snapshot))
+    def forbidden(*args, **kwargs):
+        pytest.fail('paused restart must not create scientific tools or probe Codex')
+    monkeypatch.setattr(flame_search_module, 'MoleculeEditorProvider', forbidden)
+    monkeypatch.setattr(flame_search_module, '_default_auth_probe', forbidden)
+    message = 'PAUSED_NO_SUCCESS.*resume-config-hash' if terminal_status == 'PAUSED_NO_SUCCESS' else 'already COMPLETED'
+    with pytest.raises(RuntimeError, match=message):
+        await flame_search_module.run_flame_search(Path('task'), Path('inputs'), tmp_path,
+                                                  confirmed_max_new_evaluations=100)
+
+
 def test_existing_ten_by_one_hundred_contract_remains_compatible() -> None:
     task, inputs = flame_contract(particles=10, iterations=100)
 
