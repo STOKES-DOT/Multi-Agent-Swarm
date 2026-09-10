@@ -34,7 +34,7 @@ class Runtime:
                 'site_rule':'{"atom":"seed.atom.0"}', 'parameters_json':'{"atomic_number":16}',
                 'block':str(ctx['generation'])}]}, 'hypothesis':'May red shift',
                 'mechanism':'test', 'predicted_direction':'red_shift', 'minimum_change_nm':1,
-                'evidence_ids':[0]}
+                'evidence_ids':[ctx['wiki_hits'][0]['evidence_id']]}
         return StageResponse(json.dumps(value), TokenUsage(1,1))
 
 

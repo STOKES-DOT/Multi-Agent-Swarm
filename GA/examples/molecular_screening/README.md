@@ -39,6 +39,10 @@ python GA/examples/molecular_screening/status.py GA/runs/live-check
 谱系不再恢复，新成员第一次请求创建新 thread 和独立目录。agent 在只读
 sandbox 规划基因，所有分子修改和评价由控制器执行。
 
+每次检索片段由控制器赋予 W0、W1 等显式 evidence_id；输出 schema 的 enum
+限定为本次片段编号。同一论文的不同片段使用不同编号，不能填论文号或行号。
+代码仍独立验证返回编号；编号错误会提示合法值并要求只修正引用格式。
+
 最多三次提案（含格式/编辑修正），失败后保留该工作谱系原个体及已知评价，
 记录 fallback/NOT_TESTED 并进行失败反思。失败分子不计作三代性质恶化。
 反思调用失败会记录 reflection_error，不丢弃已经成功的外部评价。

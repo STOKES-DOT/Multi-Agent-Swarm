@@ -1,5 +1,6 @@
 """Codex worker with persistent per-lineage threads and Wiki-backed gene proposals."""
 from dataclasses import asdict
+from copy import deepcopy
 import json
 from pathlib import Path
 import random
@@ -23,15 +24,40 @@ PROGRAM = object_schema({'genes': {'type': 'array', 'items': object_schema({
 PROPOSAL = object_schema({'program': PROGRAM, 'hypothesis': TEXT, 'mechanism': TEXT,
     'predicted_direction': {'type':'string','enum':['red_shift','blue_shift','no_change']},
     'minimum_change_nm': {'type':'number','minimum':0},
-    'evidence_ids': {'type':'array','minItems':1,'items':{'type':'integer','minimum':0}}})
+    'evidence_ids': {'type':'array','minItems':1,'items':{'type':'string'}}})
 REFLECTION = object_schema({'reflection': TEXT,
     'failed_assumptions': {'type':'array','items':TEXT},
     'retained_mechanisms': {'type':'array','items':TEXT}})
+
+
+def evidence_contract(hits):
+    """Bind a fresh output schema to the exact passages in this request."""
+    if not hits:
+        raise ValueError('Wiki has no retrieved evidence for this mutation')
+    annotated = [{**hit, 'evidence_id': f'W{i}'} for i, hit in enumerate(hits)]
+    schema = deepcopy(PROPOSAL)
+    schema['properties']['evidence_ids']['items'] = {
+        'type': 'string', 'enum': [hit['evidence_id'] for hit in annotated]}
+    return annotated, schema
+
+
+def resolve_evidence(refs, hits):
+    by_id = {hit['evidence_id']: hit for hit in hits}
+    if (not isinstance(refs, list) or not refs
+            or any(type(ref) is not str or ref not in by_id for ref in refs)):
+        raise ValueError(
+            f'evidence_ids must use exactly the supplied passage IDs {list(by_id)}; '
+            f'got {repr(refs)[:160]}. These are not paper numbers or line numbers. '
+            'Correct evidence_ids only; this citation-format error does not invalidate the chromosome.')
+    return [by_id[ref] for ref in refs]
 
 INSTRUCTIONS = '''You are a molecular research agent controlled by a genetic algorithm.
 Genes encode editing operations; molecule SMILES is the phenotype, never the chromosome.
 Return only schema-valid JSON. No fitness or evaluation authority belongs to you.
 Every proposal must cite only supplied Wiki evidence_ids and state a falsifiable prediction.
+Each wiki_hits item has an explicit evidence_id such as W0 or W1. Copy these exact strings
+into evidence_ids. They identify the supplied passages, not paper IDs, filename numbers,
+line numbers or one-based indices. Select only from allowed_evidence_ids and the schema enum.
 Express the FULL chromosome on the frozen seed, not on the already edited phenotype.
 site_rule is a JSON object of symbolic roles: atom; bond; begin/end; anchor; bond/retained.
 Use seed.atom.N or seed.bond.N from the supplied seed table. Natural-language site selectors,
@@ -109,11 +135,11 @@ class CodexGeneWorker:
         hits = [hit.to_json() for hit in self.wiki.search(WikiQuery(
             'red absorption fluorescence conjugation donor acceptor molecular design', 8,
             score_threshold=.1, snippet_max_chars=1200))]
-        if not hits:
-            raise ValueError('Wiki has no retrieved evidence for this mutation')
+        hits, proposal_schema = evidence_contract(hits)
         context = {'seed': self.compiler.describe_seed(), 'chromosome': {'genes':[asdict(g) for g in program.genes]},
                    'generation': request.generation, 'worker_lineage_id': request.lineage_id,
                    'parent_phenotype': request.parent.evidence, 'wiki_hits': hits,
+                   'allowed_evidence_ids': [hit['evidence_id'] for hit in hits],
                    'allow_genome_change': request.mutate, 'objective': asdict(self.objective),
                    'seed_number': request.seed, 'feedback': None}
         feedback = []
@@ -122,10 +148,9 @@ class CodexGeneWorker:
                 context['feedback'] = feedback
                 proposal = await self._ask(request, AgentStage.HYPOTHESIZING,
                     INSTRUCTIONS + '\nMoleculeEditor skill:\n' + self.skill_text + '\nContext:\n' + canonical(context).decode(),
-                    PROPOSAL, f'proposal-{attempt}')
+                    proposal_schema, f'proposal-{attempt}')
                 refs = proposal['evidence_ids']
-                if not isinstance(refs, list) or not refs or any(type(i) is not int or not 0 <= i < len(hits) for i in refs):
-                    raise ValueError('evidence reference was not retrieved')
+                evidence_hits = resolve_evidence(refs, hits)
                 if not isinstance(proposal['hypothesis'], str) or not proposal['hypothesis'].strip():
                     raise ValueError('empty hypothesis')
                 if not isinstance(proposal['program'], dict) or set(proposal['program']) != {'genes'}:
@@ -150,7 +175,7 @@ class CodexGeneWorker:
                             'prediction': prediction, 'metrics': metrics,
                             'evaluation_reference': evaluation_ref,
                             'hypothesis': proposal['hypothesis'],
-                            'wiki_evidence': [hits[i] for i in refs],
+                            'wiki_evidence': evidence_hits,
                             'parent_genotype': request.parent.identity,
                             'donor_genotype': request.donor.identity if request.donor else None}
                 expression_ref = self.directory / 'expressions' / f'{request.request_id}-{attempt}.json'
