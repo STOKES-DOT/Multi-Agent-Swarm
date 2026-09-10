@@ -1,0 +1,39 @@
+{
+  "schema_version": "flame-parent-seed:v1",
+  "selected_at": "2026-09-10T09:01:40+08:00",
+  "parent_name": "acridone",
+  "input_smiles": "O=C1c2ccccc2Nc2ccccc21",
+  "canonical_isomeric_smiles": "O=c1c2ccccc2[nH]c2ccccc12",
+  "structure_status": "experiment-seed-not-source-extracted",
+  "selection_basis": "The Wiki identifies an acridone N/carbonyl MR backbone as the relevant scaffold. The exact seed connectivity is a project-defined base acridone graph, not a structure extracted from the cited paper and not paper coordinates.",
+  "wiki_source_id": "source-mr-tadf-066",
+  "wiki_relative_path": "sources/source-mr-tadf-066.md",
+  "wiki_line_range": [17, 21],
+  "wiki_source_sha256": "a3b1aac1b769f6b89c805be973c5f3f4295b15bf5e6f0e64f8d110b2a9fa0787",
+  "molecule_editor": {
+    "version": "0.1.0",
+    "rdkit_version": "2026.03.5",
+    "chemical_status": "VALID",
+    "geometry_status": "READY",
+    "force_field": "MMFF94s",
+    "heavy_atom_count": 15,
+    "chemical_identity_hash": "b92c968ca1d4147a502340a168279f8acc3ccb02c4245ef64be1f4a3df3db5fd",
+    "state_hash": "14b001aa3a0858ea0ec6d2b4b7327866a3f8322d1fb4676a19c50a5bf1e6a82f",
+    "geometry_parameters": {
+      "num_conformers": 1,
+      "random_seed": 42,
+      "max_iterations": 200,
+      "rmsd_threshold_angstrom": 0.2
+    }
+  },
+  "flame_baseline": {
+    "backend": "FLAME/FLSF",
+    "backend_version": "2024.10.a1",
+    "solvent_smiles": "ClCCl",
+    "absorption_nm": 393.29831084021396,
+    "emission_nm": 407.2561665819263,
+    "plqy": 0.07589615047809833,
+    "epsilon_m1_cm1": 28681.114309731907,
+    "model_manifest_hash": "832f2d5c73d06699e74175ca7c91ea9acf042261384e32b69876a6ea29ba68e6"
+  }
+}

@@ -186,7 +186,7 @@ assert task.spec.pso.topology.type == 'similarity'
 assert task.spec.pso.topology.neighbor_count == 3
 assert task.spec.pso.global_social_mix == .15
 assert task.spec.pso.use_realized_position
-assert len(task.plugins.position_space.lower) == 12
+assert len(task.plugins.position_space.lower) == 11
 """,
         ],
         cwd=Path(__file__).resolve().parents[3],
@@ -247,7 +247,7 @@ async def test_v2_full_single_episode_hypothesis_to_evaluation_to_reflection(
     from multi_agent_pso.core import AgentStage, EpisodeStatus
 
     adapter = LargeEditFlameTaskAdapter()
-    target = [0.0, 0.0] + [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] + [0.8]
+    target = [0.0] + [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] + [0.8]
     run_id = next(
         f"fixture-{i}"
         for i in range(100)
@@ -335,8 +335,10 @@ async def test_v2_full_single_episode_hypothesis_to_evaluation_to_reflection(
         capture_candidate_continuation=True,
     )
     episode = await loop.run_particle(run_id, "p0", 0)
-    assert episode.status is EpisodeStatus.COMPLETED
+    assert episode.status is EpisodeStatus.COMPLETED, json.dumps(
+        episode.model_dump(mode="json"), indent=2
+    )
     assert episode.evaluation.provenance["hypothesis_outcome"]["status"] == "SUPPORTED"
     assert episode.evaluation.provenance["reward_delta"] > 0
-    assert len(episode.evaluated_position) == 12
+    assert len(episode.evaluated_position) == 11
     assert episode.continuation_state["canonical_isomeric_smiles"] == "N"

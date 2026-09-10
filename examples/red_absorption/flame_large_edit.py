@@ -20,7 +20,6 @@ from .flame_adapter import FlameRedAbsorptionTaskAdapter
 
 LARGE_EDIT_DIMENSIONS = (
     "edit_scale",
-    "fragment_size",
     "add_atom_weight",
     "remove_atom_weight",
     "replace_atom_weight",
@@ -32,12 +31,7 @@ LARGE_EDIT_DIMENSIONS = (
     "substitute_fragment_weight",
     "parent_similarity_target",
 )
-MIN_FRAGMENT_HEAVY_ATOMS = 10
-MAX_FRAGMENT_HEAVY_ATOMS = 20
-MIN_RADICAL_PARENT_ATOMS_CHANGED = 10
 LOW_SIMILARITY_THRESHOLD = 0.40
-LOW_SIMILARITY_MAX_NET_GROWTH = 2
-PARENT_SIMILARITY_TOLERANCE = 0.15
 OPERATION_EXPLORATION_FLOOR = 0.05
 _OPERATIONS = (
     "add_atom",
@@ -50,36 +44,13 @@ _OPERATIONS = (
     "detach_fragment",
     "substitute_fragment",
 )
-_FRAGMENT_OPERATIONS = {"attach_fragment", "substitute_fragment"}
-
-
-def _fragment_heavy_atoms(commands: object) -> int:
-    if not isinstance(commands, (list, tuple)):
-        return 0
-    total = 0
-    for command in commands:
-        if not isinstance(command, Mapping):
-            continue
-        graph = command.get("fragment_graph")
-        atoms = graph.get("atoms") if isinstance(graph, Mapping) else None
-        if not isinstance(atoms, (list, tuple)):
-            continue
-        total += sum(
-            1
-            for atom in atoms
-            if isinstance(atom, Mapping)
-            and type(atom.get("atomic_number")) is int
-            and atom["atomic_number"] > 1
-        )
-    return total
-
-
 class LargeEditFlameTaskAdapter(FlameRedAbsorptionTaskAdapter):
     """Map PSO coordinates to enforceable atom, bond, and fragment edits."""
 
     dimension_names = LARGE_EDIT_DIMENSIONS
     operation_names = _OPERATIONS
     hypothesis_extra_fields = frozenset({"mechanism", "minimum_change_nm"})
+    enforce_fragment_atom_cap = False
 
     def __init__(self) -> None:
         super().__init__()
@@ -170,10 +141,10 @@ class LargeEditFlameTaskAdapter(FlameRedAbsorptionTaskAdapter):
             required.append("add_bond")
         # Keep the sampled primary. Add a scaffold-removal helper instead of
         # silently converting an atom/bond operation into fragment attachment.
-        if decoded["minimum_parent_heavy_atoms_changed"] >= 10 and selected not in {
-            "detach_fragment",
-            "substitute_fragment",
-        }:
+        if (
+            decoded["parent_similarity_target"] <= LOW_SIMILARITY_THRESHOLD
+            and selected not in {"detach_fragment", "substitute_fragment"}
+        ):
             required.insert(0, "substitute_fragment")
         decoded.update(
             required_primary_operation=selected,
@@ -189,12 +160,12 @@ class LargeEditFlameTaskAdapter(FlameRedAbsorptionTaskAdapter):
 
     def decode_position(self, position: object) -> dict[str, object]:
         raw = np.asarray(position)
-        if raw.shape != (12,) or raw.dtype.kind not in "iuf":
-            raise ValueError("position must have twelve numeric dimensions")
+        if raw.shape != (11,) or raw.dtype.kind not in "iuf":
+            raise ValueError("position must have eleven numeric dimensions")
         values = np.array(raw, dtype=np.float64)
         if not np.all(np.isfinite(values)) or np.any(values < 0) or np.any(values > 1):
             raise ValueError("position must be normalized")
-        raw_operation_weights = values[2:11]
+        raw_operation_weights = values[1:10]
         smoothed_weights = raw_operation_weights + OPERATION_EXPLORATION_FLOOR
         normalized = smoothed_weights / float(smoothed_weights.sum())
         maximum = float(raw_operation_weights.max())
@@ -207,18 +178,10 @@ class LargeEditFlameTaskAdapter(FlameRedAbsorptionTaskAdapter):
         edit_command_target = min(3, 1 + int(values[0] * 3))
         if required_primary_operation == "add_atom":
             edit_command_target = max(2, edit_command_target)
-        fragment_heavy_atom_target = min(
-            MAX_FRAGMENT_HEAVY_ATOMS,
-            MIN_FRAGMENT_HEAVY_ATOMS + int(values[1] * 11),
-        )
-        parent_similarity_target = float(values[11])
-        radical_mode = parent_similarity_target <= LOW_SIMILARITY_THRESHOLD
+        parent_similarity_target = float(values[10])
         return {
             "edit_budget": edit_command_target,
             "edit_command_target": edit_command_target,
-            "fragment_heavy_atom_min": MIN_FRAGMENT_HEAVY_ATOMS,
-            "fragment_heavy_atoms": fragment_heavy_atom_target,
-            "fragment_heavy_atom_target": fragment_heavy_atom_target,
             "operation_weights": {
                 operation: float(normalized[index])
                 for index, operation in enumerate(_OPERATIONS)
@@ -226,15 +189,6 @@ class LargeEditFlameTaskAdapter(FlameRedAbsorptionTaskAdapter):
             "operation_weights_were_zero": False,
             "required_primary_operation": required_primary_operation,
             "parent_similarity_target": parent_similarity_target,
-            "parent_similarity_tolerance": PARENT_SIMILARITY_TOLERANCE,
-            "minimum_parent_heavy_atoms_changed": (
-                MIN_RADICAL_PARENT_ATOMS_CHANGED if radical_mode else 1
-            ),
-            "max_net_heavy_atom_growth": (
-                LOW_SIMILARITY_MAX_NET_GROWTH
-                if radical_mode
-                else MAX_FRAGMENT_HEAVY_ATOMS
-            ),
         }
 
     def _hypothesis(self, value, entry) -> None:
@@ -279,29 +233,11 @@ class LargeEditFlameTaskAdapter(FlameRedAbsorptionTaskAdapter):
             raise ValueError(
                 f"large edit is missing required primary operation {required_operation}"
             )
-        fragment_total = _fragment_heavy_atoms(commands)
-        has_fragment_operation = any(
-            command["operation"] in _FRAGMENT_OPERATIONS for command in commands
-        )
-        if has_fragment_operation and fragment_total < MIN_FRAGMENT_HEAVY_ATOMS:
-            raise ValueError("large edit fragments require at least 10 heavy atoms")
-        fragment_target = decoded["fragment_heavy_atom_target"]
-        if has_fragment_operation and fragment_total != fragment_target:
-            raise ValueError(
-                f"large edit requires exactly {fragment_target} fragment heavy atoms"
-            )
-        payload["fragment_heavy_atom_min"] = MIN_FRAGMENT_HEAVY_ATOMS
         payload.update(
             {
                 "edit_command_target": command_target,
-                "fragment_heavy_atom_target": fragment_target,
                 "required_primary_operation": required_operation,
                 "parent_similarity_target": decoded["parent_similarity_target"],
-                "parent_similarity_tolerance": decoded["parent_similarity_tolerance"],
-                "minimum_parent_heavy_atoms_changed": decoded[
-                    "minimum_parent_heavy_atoms_changed"
-                ],
-                "max_net_heavy_atom_growth": decoded["max_net_heavy_atom_growth"],
             }
         )
         for name in (
@@ -335,23 +271,9 @@ class LargeEditFlameTaskAdapter(FlameRedAbsorptionTaskAdapter):
             counts[name] / total_commands if total_commands else 1.0 / len(_OPERATIONS)
             for name in _OPERATIONS
         ]
-        fragment_total = _fragment_heavy_atoms(commands)
         edit_scale = 0.0 if total_commands <= 1 else 0.5 if total_commands == 2 else 1.0
-        fragment_scale = (
-            min(
-                1.0,
-                max(
-                    0.0,
-                    (fragment_total - MIN_FRAGMENT_HEAVY_ATOMS)
-                    / (MAX_FRAGMENT_HEAVY_ATOMS - MIN_FRAGMENT_HEAVY_ATOMS),
-                ),
-            )
-            if fragment_total
-            else float(target[1])
-        )
         return [
             edit_scale,
-            fragment_scale,
             *weights,
             parent_similarity,
         ]
@@ -359,8 +281,8 @@ class LargeEditFlameTaskAdapter(FlameRedAbsorptionTaskAdapter):
 
 def create_large_edit_position_space() -> ContinuousBoxPositionSpace:
     return ContinuousBoxPositionSpace(
-        [0.0] * 12,
-        [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        [0.0] * 11,
+        [1.0] * 11,
     )
 
 
@@ -370,8 +292,6 @@ def create_large_edit_task_adapter() -> LargeEditFlameTaskAdapter:
 
 __all__ = [
     "LARGE_EDIT_DIMENSIONS",
-    "MAX_FRAGMENT_HEAVY_ATOMS",
-    "MIN_FRAGMENT_HEAVY_ATOMS",
     "LargeEditFlameTaskAdapter",
     "create_large_edit_position_space",
     "create_large_edit_task_adapter",

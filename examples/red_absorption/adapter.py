@@ -170,6 +170,7 @@ class RedAbsorptionTaskAdapter:
     dimension_names = DIMENSION_NAMES
     operation_names = _OPERATIONS
     hypothesis_extra_fields = frozenset()
+    enforce_fragment_atom_cap = True
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -536,6 +537,11 @@ class RedAbsorptionTaskAdapter:
         if not isinstance(commands, list) or not commands or len(commands) > budget:
             raise ValueError("one bounded edit transaction required")
         fragment_total = 0
+        fragment_cap = (
+            decoded["fragment_heavy_atoms"]
+            if self.enforce_fragment_atom_cap
+            else None
+        )
         for command in commands:
             if (
                 not isinstance(command, dict)
@@ -621,22 +627,25 @@ class RedAbsorptionTaskAdapter:
                     and type(atom.get("atomic_number")) is int
                     and atom["atomic_number"] > 1
                 )
-                if heavy < 1 or heavy > decoded["fragment_heavy_atoms"]:
+                if heavy < 1 or (
+                    fragment_cap is not None and heavy > fragment_cap
+                ):
                     raise ValueError("fragment exceeds decoded heavy-atom cap")
                 fragment_total += heavy
-        if fragment_total > decoded["fragment_heavy_atoms"]:
+        if fragment_cap is not None and fragment_total > fragment_cap:
             raise ValueError("transaction fragments exceed decoded cap")
         commands[:] = canonicalize_commands(commands, entry["graph"])
         payload.update(
             {
                 "target_position": entry["target"],
                 "edit_budget": budget,
-                "fragment_heavy_atom_cap": decoded["fragment_heavy_atoms"],
                 "operation_policy": decoded["operation_weights"],
                 "inspected_graph": entry["graph"],
                 "inspected_geometry_hash": entry["inspection_geometry"],
             }
         )
+        if fragment_cap is not None:
+            payload["fragment_heavy_atom_cap"] = fragment_cap
         if entry["inspection_artifact"] is not None:
             payload["inspected_artifact"] = entry["inspection_artifact"]
 

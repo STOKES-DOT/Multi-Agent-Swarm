@@ -37,6 +37,7 @@ _STRUCTURAL_POLICY_KEYS = frozenset(
         "max_net_heavy_atom_growth",
     }
 )
+_STRUCTURAL_POLICY_GATE_KEYS = _STRUCTURAL_POLICY_KEYS - {"parent_similarity_target"}
 _STRUCTURAL_METRIC_KEYS = (
     "parent_heavy_atoms",
     "child_heavy_atoms",
@@ -132,7 +133,7 @@ def _structural_policy_rejection(
     parent_similarity: float,
 ) -> str | None:
     present = _STRUCTURAL_POLICY_KEYS & policy.keys()
-    if not present:
+    if not (_STRUCTURAL_POLICY_GATE_KEYS & present):
         return None
     if present != _STRUCTURAL_POLICY_KEYS:
         return "structural policy is incomplete"
@@ -574,7 +575,7 @@ class FlameWorkflowToolProvider:
                 ToolStatus.FAILED,
                 error=f"parent similarity failed: {type(error).__name__}",
             )
-        if _STRUCTURAL_POLICY_KEYS & authoritative.keys():
+        if _STRUCTURAL_POLICY_GATE_KEYS & authoritative.keys():
             child_graph = (
                 edited_payload.get("graph")
                 if isinstance(edited_payload, Mapping)
